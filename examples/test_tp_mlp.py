@@ -49,6 +49,7 @@ def _raw_metrics(args, iter_times, losses, peak_memory_stats):
         "seq_len": args.dim,
         "seed": args.seed,
         "init": args.init,
+        "stages": args.stages,
         "tp": args.tp,
         "iter_times_s": [float(t) for t in iter_times],
         "losses": [float(l) for l in losses],
@@ -75,7 +76,7 @@ def main(args, pg):
     if args.init == "fixed":
         tp_rank = int(os.environ["PIPER_DP_RANK"])
         param_overrides = shard_weights(
-            global_weights(args.dim, args.hidden, args.seed, dtype),
+            global_weights(args.dim, args.hidden, args.seed, dtype, args.stages),
             tp_rank,
             args.tp,
         )
@@ -91,7 +92,7 @@ def main(args, pg):
 
     piper_setup(
         TPMlp,
-        model_args=(args.dim, args.hidden, args.tp),
+        model_args=(args.dim, args.hidden, args.tp, args.stages),
         optim_fn=torch.optim.Adam,
         example_inputs=[x],
         example_outputs=y,
@@ -163,6 +164,8 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--dtype", choices=sorted(_DTYPES), default="fp32")
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--stages", type=int, default=1,
+                        help="Number of PP-annotated blocks.")
     parser.add_argument(
         "--init", choices=("random", "fixed"), default="fixed",
         help="fixed: identical global weights sliced per rank, so TP degrees "

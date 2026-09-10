@@ -36,6 +36,7 @@ def main(argv=None) -> int:
     ap.add_argument("--dim", type=int, default=512)
     ap.add_argument("--hidden", type=int, default=2048)
     ap.add_argument("--tp", type=int, default=2)
+    ap.add_argument("--stages", type=int, default=1)
     ap.add_argument("--batch-size", type=int, default=32)
     args = ap.parse_args(argv)
 
@@ -47,7 +48,7 @@ def main(argv=None) -> int:
     print(f"schedule: {info}")
 
     with torch.device("meta"):
-        model = TPMlp(args.dim, args.hidden, args.tp).to(torch.float32)
+        model = TPMlp(args.dim, args.hidden, args.tp, args.stages).to(torch.float32)
     x = torch.empty(args.batch_size, args.dim, device="meta")
 
     torch._dynamo.reset()
