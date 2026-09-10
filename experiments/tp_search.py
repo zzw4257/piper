@@ -191,13 +191,18 @@ def ranking_check():
         return 1
     print("OK: the model picks the fastest configuration")
     if pred_order != meas_order:
-        spread = (max(s for s, _, _ in got) / min(s for s, _, _ in got)) - 1.0
+        # Only the configurations it got wrong, i.e. everything but the winner.
+        rest = sorted(got)[1:]
+        pred_spread = max(s for s, _, _ in rest) / min(s for s, _, _ in rest) - 1.0
+        meas_spread = (
+            max(m for _, _, m in rest) / min(m for _, _, m in rest) - 1.0
+        )
         print(
             f"NOTE: the rest of the order is wrong. The model separates the "
-            f"non-winning configurations by {spread * 100:.0f}% while the "
-            f"measurement separates them by more, so it cannot tell TP from PP "
-            f"here -- only that neither beats staying on one GPU. Treat it as a "
-            f"filter, not a ranking."
+            f"non-winning configurations by {pred_spread * 100:.0f}% where the "
+            f"measurement separates them by {meas_spread * 100:.0f}%, so it cannot "
+            f"tell TP from PP here -- only that neither beats staying on one GPU. "
+            f"Treat it as a filter, not a ranking."
         )
     return 0
 
