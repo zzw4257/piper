@@ -75,6 +75,10 @@ def main(argv=None) -> int:
     events.sort(key=lambda e: e["ts"])
 
     which = _split_iterations(events, args.iters, args.gap_us)
+    spans: dict[int, tuple[float, float]] = {}
+    for e, it in zip(events, which):
+        lo, hi = spans.get(it, (e["ts"], e["ts"] + e["dur"]))
+        spans[it] = (min(lo, e["ts"]), max(hi, e["ts"] + e["dur"]))
     per_iter: dict[int, collections.Counter] = collections.defaultdict(collections.Counter)
     kernels: dict[int, collections.Counter] = collections.defaultdict(collections.Counter)
     tasks: dict[str, str] = {}
@@ -94,6 +98,16 @@ def main(argv=None) -> int:
         share = 100.0 * tp / tot if tot else float("nan")
         print(f"iter{i}: GPU {tot:9.1f} us   TP all-reduce {tp:8.1f} us  {share:5.1f}%   "
               f"({sum(kernels[i].values())} events)")
+    # Summed kernel durations do not shrink when work overlaps, so the sum alone
+    # cannot answer "was the collective hidden". Compare it against the wall span
+    # of the iteration's GPU timeline: sum > span means streams ran concurrently.
+    print()
+    for i, tot in zip(iters, totals):
+        lo, hi = spans[i]
+        span = hi - lo
+        print(f"iter{i}: sum {tot:9.1f} us   span {span:9.1f} us   "
+              f"concurrency {tot / span if span else float('nan'):5.2f}x")
+
     print(f"\nper-iteration total spread: {spread:.2f}x")
     if spread > 1.3:
         print("WARNING: iterations differ by more than 30%. On a shared host that is\n"

@@ -29,6 +29,7 @@ Distinguish throughout:
 | **F9** | Piper trained on **zero inputs**, the shipped LLaMA example included | |
 | **F10** | TP=2 equals TP=1 inside Piper to 7.2e-07 once parameters can be supplied | |
 | **F11** | TP comm ~7.1% of GPU time; stream placement buys nothing yet; the first collective measures rank skew, not communication | |
+| **F12** | TP comm hides only past one microbatch (1.00x vs 1.06x concurrency); the IR predicted it | |
 
 ---
 
@@ -492,3 +493,71 @@ cost of the Ray-per-device driver model.
 **Next experiment.** Multi-microbatch TP, which is the first configuration where
 `stream` and `order` can actually do something for TP — and where a real
 `tp_group` becomes necessary.
+
+---
+
+## 2026-09-10 — F12: TP communication hides only with more than one microbatch, and the IR said so before the GPU did
+
+**Tested.** `dim 8192, hidden 32768, bf16, 2xB200 (GPU 3,5, both 0% util —
+first genuinely clean measurement), 10 profiled iterations per configuration`,
+via `experiments/check_tp_overlap.py`.
+
+**Changed.** `experiments/check_tp_overlap.py`, `tp2_mb1.json`, `tp2_mb4.json`,
+and a sum-vs-span concurrency metric in `profile_tp.py`.
+
+**Method.** Summed kernel durations do not shrink when work overlaps, so the sum
+alone cannot answer "was the collective hidden". Compare it against the wall span
+of the iteration's GPU timeline: `sum/span > 1` means two streams ran
+concurrently.
+
+**The prediction came from the IR.** With one microbatch the lowered serial order
+is `s0.seg1 -> tp_all_reduce.0 -> s0.seg2`, so the collective has nothing to
+overlap with and `shard_tensor`'s `stream` field is inert. With four microbatches
+`tp_all_reduce.0` (MB 0) depends only on `s0.seg1` (MB 0) and feeds only
+`s0.seg2` (MB 0), while `s0.seg1.splitMB1` (MB 1) depends on neither — so
+`_insert_tp_all_reduce_comm_nodes` leaves room to hide, and the only
+`TP_COMM -> TP_COMM` edges are the temporal chain within `tp_stream` that a
+single stream requires anyway.
+
+**Result** (concurrency = sum/span, 10 iterations each):
+
+| config | min | median | max | comm share of GPU time |
+|---|---|---|---|---|
+| mb1, batch 1024 | 0.72x | 0.79x | 0.80x | 3.0% |
+| mb1, batch 8192 | 0.99x | 1.00x | 1.00x | 4.2% |
+| mb4, batch 1024 | 0.85x | 1.11x | 1.41x | 5.6% |
+| mb4, batch 8192 | **1.06x** | **1.06x** | 1.28x | 6.4% |
+
+Three things, all confirmed rather than assumed:
+
+1. **One microbatch never overlaps.** `mb1, batch 8192` gives 0.99–1.00x on
+   every one of ten iterations. That is the cleanest control in this log: the GPU
+   timeline is fully saturated *and* has exactly zero concurrency, because the
+   only non-default-stream work in the DAG is two collectives with nothing to run
+   beside them. The IR predicted it; the measurement matched.
+2. **Four microbatches do overlap**, 10/10 iterations above 1.0. TP
+   communication is hidden behind other microbatches' compute with no `order`
+   directive written — microbatch independence after `split` is enough.
+3. **The earlier 0.72–0.80x was Piper's dispatch cost, not a TP property.** At
+   batch 1024 the GPU timeline sat ~20–28% idle; the gaps are per-node Python
+   dispatch in `DagExecutor.run` (33 nodes at mb4), and they vanish once GPU work
+   per node dominates. This is why F11's wall-clock `iter_time` comparisons were
+   useless: at that scale the step was mostly not on the GPU.
+
+**This answers F11's open question and closes Stage E.** `shard_tensor`'s
+`stream` field is a no-op for a single-region, single-microbatch TP schedule, and
+Piper's scheduling language starts paying for TP at two or more microbatches. So
+the interesting TP schedules are exactly the composed ones — which is where a
+real `tp_group` becomes necessary (F4), since `tp_degree` is currently pinned to
+the place-group size.
+
+**Open question.** Overlap here comes free from microbatch independence. Does an
+explicit `order` directive beat it — e.g. deliberately interleaving MB *i*'s
+collective with MB *j*'s backward, DualPipe-style? That is the first experiment
+where TP would actually exercise the part of Piper the paper is about, rather
+than just riding on it.
+
+**Next experiment.** Either the `order` question above, or Stage F. Stage F now
+has its evidence base: F1 (no partitioned-tensor representation), F4 (no third
+parallel axis), F10 (every consumer must restate the sharding rule) are the three
+concrete things a TP-selection search would need the IR to express.
