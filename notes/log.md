@@ -27,6 +27,7 @@ Distinguish throughout:
 | **F7** | TP=2 runs on two B200s; the DAG matches F6's prediction and D1 agrees to 1.5e-08 | |
 | **F8** | The loss was computed for the backward and dropped, in four places | |
 | **F9** | Piper trained on **zero inputs**, the shipped LLaMA example included | |
+| **F10** | TP=2 equals TP=1 inside Piper to 7.2e-07 once parameters can be supplied | |
 
 ---
 
@@ -340,3 +341,58 @@ gathered on zero inputs — plausible for a scheduling benchmark, since shapes a
 therefore timings are unaffected, but it should be stated rather than assumed.
 
 **Next experiment.** Stage D2, then Stage E profiling.
+
+---
+
+## 2026-09-10 — F10: TP=2 equals TP=1 inside Piper, once parameters can be supplied
+
+**Tested.** `experiments/check_tp_equivalence.py` on 2xB200, dim 512, hidden
+2048, fp32, 3 iterations, identical global weights sliced per rank.
+
+**Changed.** Stage D2: `piper_setup(param_overrides=...)` keyed by
+`named_parameters()`, translated by `dynamo_param_placeholder_name`;
+`PiperActor.load_param_overrides` mirroring `load_const_attrs`; `_load_stage`
+prefers an override over `normal_()`. Unmatched keys raise. `tp1.json` baseline,
+`--init fixed` in the example, `global_weights`/`shard_weights` shared with D1.
+
+**Result.**
+
+| | iter 1 | iter 2 | iter 3 |
+|---|---|---|---|
+| TP=1 unsharded | 2.951430 | 1.893224 | 1.588651 |
+| TP=2 rank 0 | 2.951430 | 1.893223 | 1.588651 |
+| TP=2 rank 1 | 2.951430 | 1.893223 | 1.588651 |
+| no directive, rank 0 | 1.902967 | 1.328529 | 1.043335 |
+
+Worst |diff| TP=2 vs TP=1: **7.15e-07**. Negative control: **1.10e+00**. Six
+orders of magnitude apart, so the tolerance (1e-4) is not doing the work.
+
+**Two claims the earlier evidence could not reach.**
+
+1. The two TP ranks now agree *exactly*. That is the forward all-reduce actually
+   replicating the region output — previously masked because per-rank seeding
+   gave the replicated `pre`/`post` segments different weights, so the ranks
+   differed for a reason unrelated to TP.
+2. Agreement holds *across optimizer steps*. This is what implicates the
+   backward all-reduce specifically: TP weight gradients are shard-local and
+   need no collective, but the input gradient is a partial sum. Drop `f` and
+   iteration 1 still matches while iteration 2 diverges. Comparing only the first
+   iteration would not have tested `f` at all.
+
+**IR-runtime assumption discovered.** Overrides have to be *per-rank values*,
+not a global tensor plus a partition spec, because the runtime has nowhere to put
+the partition spec (F1). `shard_weights` therefore lives in the example, next to
+where the model already declares its TP-local shapes. That is consistent, but it
+means **every** consumer of TP has to re-state the sharding rule the model
+already implies — the concrete cost of F1, and the thing an auto-TP search
+(Stage F) would have to fix first.
+
+**Open question.** `dynamo_param_placeholder_name` hard-codes Dynamo's
+lifted-attribute spelling (`l_self_modules_<path>_parameters_<attr>_`). It is
+locked by a test, but it is a private naming convention. Would upstream rather
+key overrides on `(bucket_key, param_index)`, which is stable but opaque, or
+expose the placeholder names so callers can look them up?
+
+**Next experiment.** Stage E — one profiling question: what fraction of step time
+is the two `TP_COMM` all-reduces, and does moving them off `tp_stream` onto
+`default_stream` change it.
