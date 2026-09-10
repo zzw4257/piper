@@ -33,6 +33,7 @@ Distinguish throughout:
 | **F13** | `order` buys nothing for TP on a single stage: 1F1B is 3.7% slower, no bubble to fill | |
 | **F14** | TP composes with PP with no new process group; `order` is mandatory when pp>1 | *narrows F4, corrects F11* |
 | **F15** | TP x PP numerically correct on 4 GPUs to ~1e-6, under a generated 1F1B order | |
+| **F16** | A hardware cost model ranks TP configs **backwards**; rank skew, not bandwidth, is the missing term | |
 
 ---
 
@@ -690,3 +691,109 @@ for TP?
 up, or Stage F, whose evidence base is now F1 (no partitioned-tensor
 representation), F4/F14 (no third axis, so TP x DP is out but TP x PP is in), and
 F10 (every consumer restates the sharding rule).
+
+---
+
+## 2026-09-10 — F16: a hardware cost model ranks Piper's TP configurations backwards; the missing terms are implementation overheads
+
+**Tested.** `experiments/tp_search.py`, calibrated on F11–F13, checked against
+three configurations measured on 2xB200 at `global batch 8192, dim 4096,
+hidden 16384, stages 2, bf16, mb 4`.
+
+### What is even searchable, and why it is this little
+
+Before building anything, the limits this log already recorded fix the space:
+
+- **`tp` is not a schedule-level choice.** Piper's IR has no representation of a
+  partitioned tensor (F1), so TP-local shapes live in the *model*; changing `tp`
+  means rebuilding and retracing it. Any TP search therefore spans model
+  construction, not just directives. This is the concrete, priced cost of F1.
+- **`pp * tp <= gpus` with `tp` = place-group size** (F4), so TP x PP is in the
+  space and TP x DP is out (F14).
+- **Microbatches replicate the DAG, they do not split the batch**
+  (`_apply_split_directive` copies nodes; `load_input` gives every copy the same
+  tensor). Holding the global batch fixed means per-microbatch batch is
+  `global / mb`.
+
+### The pure roofline got the answer backwards
+
+A model over compute, bandwidth, pipeline bubble and per-node dispatch:
+
+| config | predicted | measured (end-to-end) |
+|---|---|---|
+| one GPU, mb 4 | 12494 us | **18720 us** |
+| pp=2, mb 4 | 7846 us | 23364 us |
+| tp=2, mb 4 | 7571 us | 26523 us |
+
+Predicted order `tp=2 < pp=2 < one GPU`. Measured order **exactly reversed**:
+staying on one GPU is 25–42% *faster* than either parallel configuration. A cost
+model that says "parallelize" where the machine says "do not" is worse than no
+model.
+
+### The missing term is not bandwidth, it is rank skew
+
+Per-rank per-iteration GPU kernel totals, which do not depend on iteration
+splitting:
+
+| config | kernel sum | of which communication | payload at 360 GB/s |
+|---|---|---|---|
+| one GPU | 14244 us | 0 | — |
+| tp=2 | 25085 us | **12875 us** | ~745 us |
+
+Communication kernels run **17x longer than their payload justifies**. That is
+F11 at full strength: each device is driven by its own Ray actor,
+`piper_exec_dag` fans out with `ray.get`, iteration start times differ by
+milliseconds, and the first collective absorbs the difference by spinning inside
+the NCCL kernel. So **communication cost is not a function of communication
+volume here** — it is a function of the driver's scheduling jitter.
+
+The compute side, by contrast, is fine: one GPU predicted 12494 against 14244 of
+measured kernel time (1.14x), and F12's calibration holds to 2%.
+
+### Adding two measured implementation terms restores the useful decision
+
+`DRIVER_OVERHEAD_US = 6200` (Ray driver + actor RPC per step, fitted on the
+one-GPU run) and `SKEW_US = 12000` (charged once per step as soon as more than
+one rank exists, from the 17x measurement above):
+
+| config | predicted | measured | ratio |
+|---|---|---|---|
+| one GPU | 18694 us | 18720 us | 1.00x *(in-sample)* |
+| pp=2 | 26046 us | 23364 us | **1.11x** *(out-of-sample)* |
+| tp=2 | 25771 us | 26523 us | 0.97x |
+
+It now picks the fastest configuration. It still **cannot separate TP from PP**:
+it puts them 1% apart where the measurement puts them 13% apart. So it is a
+filter — "does parallelising pay at all" — not a ranking. `--ranking-check` says
+so rather than claiming a win.
+
+### What this means for automatic TP selection
+
+Neither overhead term scales with problem size, so both dominate at small and
+medium scale and decide it wrongly if omitted. Three consequences:
+
+1. **A TP autotuner for Piper must model the runtime, not the hardware.** Every
+   plausible hardware-only model would have chosen wrong here, and would keep
+   choosing wrong until the model is large enough for compute to swamp a ~18 ms
+   fixed cost.
+2. **The highest-value optimization for TP is not a schedule.** It is lowering
+   dispatch and skew — batching node dispatch, or driving all devices from one
+   process instead of one Ray actor each. That would do more for TP at this scale
+   than any choice `shard_tensor`, `stream` or `order` can express, and it also
+   explains F13 (`order` bought nothing) and F11 (the first collective is not a
+   measurement) as the same root cause.
+3. **The searchable space is genuinely small**, and F1 is why: because `tp`
+   cannot be varied without retracing, a search has to drive model construction,
+   so it cannot live inside the scheduling language that Piper's design is
+   otherwise built around.
+
+**Open question.** Is the ~12 ms skew intrinsic to Ray actors, or is it
+`piper_exec_dag`'s fan-out pattern specifically (one `ray.get` over N actors per
+step)? A single-process multi-device driver would answer it, and is a bounded
+experiment. Until it is answered, no performance conclusion about TP in Piper is
+about TP.
+
+**Next experiment.** Measure the skew directly — timestamp iteration entry per
+actor and histogram the differences — rather than inferring it from inflated NCCL
+kernel durations. That is the cheapest way to confirm the root cause, and it needs
+only two GPUs.
