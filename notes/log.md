@@ -36,6 +36,7 @@ Distinguish throughout:
 | **F16** | ~~A hardware cost model ranks TP configs backwards; rank skew is the missing term~~ | **partly retracted by F17** |
 | **F17** | F16's ranking was contention: pp=2 is 27% *faster* than one GPU | *retracts F16; its ~300us guess retracted by F18* |
 | **F18** | At constant work, more microbatches make TP 2.6x worse; TP and PP want opposite microbatch counts | *distinguishes F12; retracts F17's guess* |
+| **F19** | CUDA graphs capture a TP step fine and buy 2%: the cost is NCCL latency, not dispatch | *retracts F18's hypothesis* |
 
 ---
 
@@ -946,3 +947,67 @@ available test, since the DAG's shapes and order are entirely static.
 **Next experiment.** Quantify `comm` properly: interleaved repetitions with a
 minimum, not one run per point. Then the scaling law is worth fitting, and only
 then is it worth attributing.
+
+---
+
+## 2026-09-10 — F19: CUDA graphs capture a Piper-shaped TP step fine, and buy 2%. The cost is NCCL latency, not dispatch
+
+**Tested.** `experiments/probe_cudagraph.py` under `torchrun --nproc_per_node=2`,
+2xB200. Deliberately independent of Piper: it reproduces the *shape* of a TP step
+(compute on the default stream, all-reduce on a second stream, joined by events)
+with no Ray, no DAG executor, no per-step Python bookkeeping. 16 collectives per
+step, batch 512, dim 4096, hidden_local 8192, bf16.
+
+Staged so a failure would localize. All three capture stages passed:
+
+```
+stage 1  captured compute + autograd
+stage 2  captured NCCL all-reduce on one stream
+stage 3  captured two-stream step with events
+stage 4  eager  min 1685.9 us   per collective 105.4 us
+         graph  min 1651.1 us   per collective 103.2 us
+         payload bound 186.4 us  per collective  11.7 us
+         -> graph 1.02x faster; eager 9.0x above payload, graph 8.9x
+```
+
+### The hypothesis is dead
+
+F18 proposed that per-collective cost comes from each rank running its own Python
+dispatch loop, so every collective re-synchronizes two independently drifting
+launch streams. A CUDA graph replaces the entire step with one launch and removes
+that drift completely. It bought **2%**. So dispatch drift is not the cost.
+
+What remains is NCCL itself: a 4.2 MB two-rank all-reduce at ~105 us against an
+11.7 us bandwidth bound is **latency-bound, not bandwidth-bound**, plus whatever
+the other tenants are doing to the interconnect (F11).
+
+Worth stating plainly because it inverts the direction I gave: **Piper's runtime
+overhead is not TP's bottleneck.** Dispatch cost, Ray fan-out and rank skew are
+all real and all measured, and none of them is what makes TP slow here. The cost
+is `number of collectives x NCCL latency`.
+
+### What that changes
+
+- **CUDA graphs are not worth doing for this.** Feasible — which is itself worth
+  knowing, since the DAG is fully static — but the payoff is noise. Recorded so
+  nobody spends a week on it.
+- **The lever is the collective *count*.** F18 already measured that lever
+  end-to-end: at constant total work, 4 collectives beat 16 by 35% (10.46 vs
+  16.15 ms). No new mechanism needed to exploit it on a single stage — just use
+  fewer microbatches.
+- **A fusion pass is therefore premature.** Collectives from different
+  microbatches are independent and could be coalesced, cutting 16 to 4. But that
+  only matters when something *else* forces many microbatches, i.e. filling a
+  pipeline bubble under TP x PP (F13, F18's opposing-preference tension) — and
+  measuring that needs four idle GPUs, which this host has not had. Building it
+  now would be unfalsifiable.
+- **Revised target.** The goal I stated as "make TP cost track communication
+  volume" is unreachable on this machine: NCCL's own latency puts the floor at 9x
+  the payload bound. The reachable goal is "minimize collective count for a given
+  parallel configuration".
+
+**Open question.** Does the 9x latency gap close at larger payloads? At mb=1
+(67 MB per collective) F18 measured 306 us against a 186 us bound — only 1.6x. So
+the gap is a small-message effect, which is exactly what fusion would exploit,
+and it sets the condition under which fusion becomes worth building: enough
+microbatches that per-collective payload falls into the latency-bound regime.
