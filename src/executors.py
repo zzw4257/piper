@@ -31,8 +31,6 @@ def _drain_losses(loss_buffer: list) -> list[float]:
     return losses
 
 
-
-
 @dataclass
 class CommunicationExecutor:
     """Actor-local communication operations used by the DAG dispatcher."""
