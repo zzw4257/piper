@@ -24,6 +24,9 @@ Distinguish throughout:
 | **F4** | The 2-GPU TP placement is expressible with zero launcher changes | |
 | **F5** | Environment works on B200 (torch 2.10+cu128, sm_100); disk blocker was misdiagnosed | |
 | **F6** | TP's conjugate pair is two *outgoing* edges; boundary-only insertion is semantics, not an optimization | |
+| **F7** | TP=2 runs on two B200s; the DAG matches F6's prediction and D1 agrees to 1.5e-08 | |
+| **F8** | The loss was computed for the backward and dropped, in four places | |
+| **F9** | Piper trained on **zero inputs**, the shipped LLaMA example included | |
 
 ---
 
@@ -217,3 +220,123 @@ the same weights and I would rather the user be told.
 **Next experiment.** Stage C — the executor arms and `all_reduce_activation`, then
 the 2-GPU run. Blocked on GPUs: all 7 are held by other users (`haizhonz` on six,
 `shaow` on one), so the code goes in first and the run waits for a free pair.
+
+---
+
+## 2026-09-10 — F7: TP=2 runs end to end on two B200s, and the DAG is what it should be
+
+**Tested.** `experiments/dump_dag.py` (compiler only, no Ray, no GPU) plus a
+2-GPU run of `examples/base-schedules/tp2.json` through
+`test_harness.py --schedule custom`. `--schedule custom` passes a base schedule
+through untouched, so the harness needed no TP-specific change.
+
+**Changed.** Stage C: `all_reduce_activation` on `ep_group`, two dispatch arms,
+`_FWD_BOUNDARY_COMM_TASKS` / `_BWD_BOUNDARY_COMM_TASKS`, plus
+`examples/models/tp_mlp.py`, `tp2.json` and `experiments/dump_dag.py`.
+
+**Result.** The lowered DAG for one device group `(0,1)`:
+
+```
+  0 forward                 COMPUTE  {PP=0}        default_stream  s0.seg0
+  1 forward                 COMPUTE  {PP=0,TP=0}   default_stream  s0.seg1
+  2 forward_tp_all_reduce   TP_COMM  {PP=0,TP=0}   tp_stream       [outgoing idx=0]
+  3 forward                 COMPUTE  {PP=0}        default_stream  s0.seg2
+  4 backward                COMPUTE  {PP=0}        default_stream  s0.seg2.bwd
+  5 backward                COMPUTE  {PP=0,TP=0}   default_stream  s0.seg1.bwd
+  6 backward_tp_all_reduce  TP_COMM  {PP=0,TP=0}   tp_stream       [outgoing idx=0]
+  7 backward                COMPUTE  {PP=0}        default_stream  s0.seg0.bwd
+  8 update                  UPD                    default_stream  upd.0
+```
+
+Exactly two comm nodes, in the two positions F6 predicted, no DP or PP
+collectives, one device group. Loss falls `0.891450 -> 0.814014 -> 0.706653`,
+and two runs of the same schedule agree bit for bit.
+
+Correctness is carried by `test/test_tp_equivalence.py` (Stage D1), out of band
+under `torchrun --nproc_per_node=2`: **TP=2 matches the unsharded MLP to 1.49e-08
+on the output and 2.21e-09 on the input gradient**, and dropping the collectives
+changes the result, so the check is not vacuous.
+
+**Unexpected — the plan's Stage C/D ordering was wrong.** Stage C "runs without
+error" turned out to be nearly worthless as evidence, because two upstream gaps
+(F8, F9) meant *no observable in the system depended on what the model computed*.
+The first honest number required fixing both. Getting the loss to move at all was
+more work than inserting the collective.
+
+**Open question.** `--viz` is unavailable: `graphviz`'s `dot` binary is not
+installed on the host and there is no root. `dump_dag.py` covers the need for
+reading node placement, and it works without a GPU, which `--viz` does not.
+
+**Next experiment.** Stage D2 — weight injection, for numerical equivalence
+inside Piper rather than beside it.
+
+---
+
+## 2026-09-10 — F8: the loss was computed for the backward and then dropped, in four places
+
+**Tested.** `piper_exec_dag` returned `[]` on every run.
+
+**Unexpected.** [code] The loss is live in four places and was stored in none:
+
+1. the `BWD` and `BWD_I` arms build `loss_fn(...)` to drive
+   `torch.autograd.backward`, and never keep the value;
+2. `_update` did `losses = loss_buffer` then `loss_buffer.clear()` — one list,
+   aliased and emptied, so the return was empty regardless;
+3. the `UPD` dispatch arm discarded `_update`'s return value;
+4. `PiperActor.run_dag` returned `None`, so `ray.get` gave the driver nothing.
+
+So `piper_exec_dag`'s documented return value could never be non-empty. Fixed by
+appending a *detached* tensor (calling `.item()` in the dispatch loop would block
+on the GPU mid-DAG and perturb the schedule Piper exists to measure) and
+converting in `_drain_losses` after the synchronize `_update` already performs.
+
+**IR-runtime assumption discovered.** This is why F9 survived. With no observable
+that depends on the model's arithmetic, and examples reporting only iteration
+time, throughput and peak memory, a bug that zeroes the input is invisible.
+
+**Open question.** Is upstream interested? It is a prerequisite for any
+correctness lane on any parallelism dimension, not just TP.
+
+---
+
+## 2026-09-10 — F9: Piper trained on zero inputs, including in the shipped LLaMA example
+
+**Tested.** The TP MLP's MSE loss came out at `0.991093`, and
+`mean(labels**2)` for the same seed is `0.9910929203033447` — agreement to seven
+digits, i.e. the model output contributed less than 1e-7. With no biases in the
+MLP the output was in fact *exactly* zero.
+
+**Unexpected.** [code] `fx.py:_placeholder_is_runtime_input` rejected any
+placeholder carrying `meta["grapharg"]`. On torch 2.10.0 — the pinned version —
+Dynamo attaches that key to **every** placeholder while the backend is running
+and clears it once `torch.compile` returns. Measured inside the backend call:
+
+```
+l_self_modules_pre_parameters_weight_   runtime_input=False  grapharg_in_meta=True  is_Param=True
+l_x_                                    runtime_input=False  grapharg_in_meta=True  is_Param=False
+seg0 tag={'PP': 0}  input_idxs=[]  param_idxs=[0, 1]
+```
+
+The real input `l_x_` was classified as a parameter, so segment 0 had
+`input_idxs=[]`. Nothing downstream objects: `_load_stage` zero-fills any slot
+that is neither a trainable parameter nor a matching const attr, and the FWD arm
+only substitutes real tensors for indices in `input_idxs`, so `load_input`'s data
+was discarded silently.
+
+**This is not specific to TP.** The same measurement on the shipped LLaMA debug
+model gives `l_tokens_ runtime_input=False`. After the fix, `seg0 input_idxs=[0]`
+for both models, and the TP MLP's loss starts moving.
+
+The trap was ordering: the predicate returns `True` when evaluated *after*
+`torch.compile` returns, so a test written the obvious way passes either way.
+`test/test_runtime_inputs.py` asserts inside the backend, and asserts the meta
+key is present there, so the guard fails loudly if a future torch stops
+attaching it.
+
+**Open question.** Is this a regression against a newer Dynamo rather than an
+original bug? Worth checking against the torch version the paper's measurements
+were taken on, because it decides whether published throughput numbers were
+gathered on zero inputs — plausible for a scheduling benchmark, since shapes and
+therefore timings are unaffected, but it should be stated rather than assumed.
+
+**Next experiment.** Stage D2, then Stage E profiling.
