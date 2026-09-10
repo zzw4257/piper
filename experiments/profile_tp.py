@@ -35,7 +35,26 @@ def _task_of(name: str) -> str:
 
 
 def _split_iterations(events: list[dict], n_iters: int | None, gap_us: float) -> list[int]:
-    """Return the iteration index of each event (events must be ts-sorted)."""
+    """Return the iteration index of each event (events must be ts-sorted).
+
+    Anchored on the UPD node, which runs exactly once per iteration and always
+    last: a new iteration starts at the first non-UPD event after a run of UPD
+    events. Gap heuristics are wrong here -- a TP rank waiting on its peer inside
+    the NCCL kernel (notes/log.md F11) produces gaps *within* an iteration that
+    are larger than the gaps between them, which split one iteration into pieces
+    and yields absurd spans like 100us.
+    """
+    upd = [_node_uid(e["name"]).startswith("upd") for e in events]
+    if any(upd):
+        out, cur, prev_was_upd = [], 0, False
+        for i in range(len(events)):
+            if prev_was_upd and not upd[i]:
+                cur += 1
+            out.append(cur)
+            prev_was_upd = upd[i]
+        return out
+
+    # No UPD in the trace: fall back to gaps.
     gaps = [
         (events[i + 1]["ts"] - (events[i]["ts"] + events[i]["dur"]), i + 1)
         for i in range(len(events) - 1)
