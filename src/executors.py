@@ -14,6 +14,18 @@ from .runtime import BufferStore, EventStore, ParamStorage, RuntimeState, StageS
 from .tasks import TaskType
 
 
+def _drain_losses(loss_buffer: list) -> list[float]:
+    """Empty the loss buffer into plain floats. Call only after a synchronize."""
+    losses = [
+        float(item.item() if isinstance(item, torch.Tensor) else item)
+        for item in loss_buffer
+    ]
+    loss_buffer.clear()
+    return losses
+
+
+
+
 @dataclass
 class CommunicationExecutor:
     """Actor-local communication operations used by the DAG dispatcher."""
@@ -539,8 +551,12 @@ class DagExecutor:
         labels: Any,
         loss_buffer: list,
         loss_fn=None,
-    ) -> None:
-        """Run one iteration of the loaded TrainingDAG."""
+    ) -> dict:
+        """Run one iteration of the loaded TrainingDAG.
+
+        Returns ``{"losses": [...]}`` for the microbatches whose backward computed
+        the loss on this rank. Empty when the loss lives on another PP rank.
+        """
         assert dag is not None, "load_training_dag() must be called before run_dag()"
         assert sorted_dag_nodes is not None, "load_training_dag() must initialize sorted node order"
 
@@ -558,6 +574,7 @@ class DagExecutor:
             if stream is not default_stream:
                 stream.wait_event(zero_evt)
         comp_events: dict[Any, torch.cuda.Event] = {}
+        update_results: list[dict] = []
 
         self.buffers.init_refcounts(dag)
         last_comp_event_by_stream: dict[str, torch.cuda.Event] = {}
@@ -760,6 +777,11 @@ class DagExecutor:
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with torch.cuda.stream(node_stream):
                             outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
+                        # Keep the value, not just the graph that consumes it. Detached
+                        # and unsynchronized on purpose: .item() here would block the
+                        # dispatch loop mid-DAG and perturb the schedule being measured.
+                        # _update converts after its existing synchronize().
+                        loss_buffer.append(outputs_or_loss[0].detach())
                         upstream_grads = None
                     elif recv_pred is not None:
                         upstream_grads = self.buffers.task[recv_pred.uid]
@@ -855,6 +877,7 @@ class DagExecutor:
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with torch.cuda.stream(node_stream):
                             stage_outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
+                        loss_buffer.append(stage_outputs_or_loss[0].detach())
                         output_grads = None
                     elif recv_pred is not None:
                         upstream_raw = self.buffers.task[recv_pred.uid]
@@ -956,7 +979,7 @@ class DagExecutor:
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.UPD:
-                    self._update(node_stream, loss_buffer)
+                    update_results.append(self._update(node_stream, loss_buffer))
 
                 case TaskType.ORDER_DUMMY:
                     pass
@@ -964,14 +987,18 @@ class DagExecutor:
             self._rf_exit(rf)
             self.runtime.nvtx_pop()
 
+        return {
+            "losses": [
+                loss for result in update_results for loss in result["losses"]
+            ],
+        }
+
     def _update(self, stream: torch.cuda.Stream, loss_buffer: list):
         self.params.drain_pending_frees()
         if self.params.has_zero_shard_optimizers():
             self.params.step_zero_shard_optimizers(stream, self.events.reduce_scatter)
-            losses = loss_buffer
-            loss_buffer.clear()
             torch.cuda.synchronize()
-            return losses
+            return {"losses": _drain_losses(loss_buffer)}
 
         for ar_evt in self.events.all_reduce.values():
             stream.wait_event(ar_evt)
@@ -986,11 +1013,8 @@ class DagExecutor:
             with torch.cuda.stream(stream):
                 bucket.optimizer.step()
 
-        losses = loss_buffer
-        loss_buffer.clear()
-
         torch.cuda.synchronize()
 
         return {
-            "losses": losses,
+            "losses": _drain_losses(loss_buffer),
         }
