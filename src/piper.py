@@ -122,8 +122,36 @@ def _split_global_training_dag_by_pp_rank(training_dag: TrainingDAG) -> list[Tra
             )
         comp_device_keys.append(next(iter(device_keys)))
     if len(set(comp_device_keys)) != len(comp_device_keys):
+        # The usual cause is a missing `order` directive with pp_degree > 1.
+        # build_training_dag bridges forward to backward only at the *globally*
+        # last forward node, so every non-last stage's forward chain reaches its
+        # own backward chain only through the next stage -- and the P2P cut above
+        # severs exactly that path. `order`'s temporal edges are what reconnect
+        # them, which is why the harness always appends one. Say so, rather than
+        # reporting the symptom.
+        forward_only = [
+            sorted(comp)[:4]
+            for comp, key in zip(components, comp_device_keys)
+            if comp_device_keys.count(key) > 1
+            and not any(
+                training_dag.nodes[uid].compute_subkind in ("BWD", "BWD_I", "BWD_W")
+                for uid in comp
+            )
+        ]
+        hint = ""
+        if forward_only:
+            hint = (
+                f"\n{len(forward_only)} of them contain only forward-pass nodes, e.g. "
+                f"{forward_only[0]}. With pp_degree > 1 this almost always means the "
+                f"schedule has no `order` directive: without one, a non-last stage's "
+                f"forward and backward sub-DAGs are only connected through the next "
+                f"stage, and inserting point-to-point communication disconnects them. "
+                f"Add an `order` directive (the harness generates one for 1f1b, "
+                f"interleaved_1f1b, zerobubble and dualpipev)."
+            )
         raise ValueError(
-            f"expected distinct device sets across split components, got {comp_device_keys}"
+            f"expected distinct device sets across split components, got "
+            f"{comp_device_keys}.{hint}"
         )
 
     # Materialize each component as a standalone TrainingDAG.
