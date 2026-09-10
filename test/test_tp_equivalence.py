@@ -21,11 +21,19 @@ statement of what Piper's two TP_COMM nodes are supposed to do:
   * `_F` at the region entry -- forward identity, backward all-reduce.
 """
 import os
+import sys
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+# examples/ is not a package on sys.path outside the harness, but the weight
+# construction has to be the *same* one the in-Piper run uses -- otherwise
+# "both start from the same weights" is a coincidence between two hand-copied
+# constructions rather than a shared fact.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples"))
+from models.tp_mlp import global_weights, shard_weights  # noqa: E402
 
 DIM = 64
 HIDDEN = 256
@@ -67,18 +75,10 @@ class _F(torch.autograd.Function):
 
 
 def _global_weights(device):
-    """One set of weights, shared by every rank and every TP degree."""
-    g = torch.Generator().manual_seed(SEED)
-
-    def w(out_features, in_features):
-        t = torch.randn(out_features, in_features, generator=g, dtype=DTYPE) * 0.05
-        return t.to(device)
-
+    """The same weights examples/test_tp_mlp.py uses, on this device."""
     return {
-        "pre": w(DIM, DIM),
-        "up": w(HIDDEN, DIM),      # nn.Linear weight is [out, in]
-        "down": w(DIM, HIDDEN),
-        "post": w(DIM, DIM),
+        k.removesuffix(".weight"): v.to(device)
+        for k, v in global_weights(DIM, HIDDEN, SEED, DTYPE).items()
     }
 
 
@@ -90,12 +90,12 @@ def _reference(weights, x):
 
 
 def _sharded(weights, x, rank, tp_degree):
-    local = HIDDEN // tp_degree
-    lo = rank * local
-    # Column-parallel: shard `up`'s output features, i.e. dim 0.
-    up_local = weights["up"][lo:lo + local, :]
-    # Row-parallel: shard `down`'s input features, i.e. dim 1.
-    down_local = weights["down"][:, lo:lo + local]
+    # Same slicing rule as the in-Piper run: shard_weights keys on ".weight".
+    local_w = shard_weights(
+        {f"{k}.weight": v for k, v in weights.items()}, rank, tp_degree
+    )
+    up_local = local_w["up.weight"]
+    down_local = local_w["down.weight"]
 
     z = F.linear(x, weights["pre"])
     z = _F.apply(z)
@@ -144,12 +144,12 @@ def _run() -> None:
     # A guard against the test proving nothing: dropping either collective must
     # actually break the comparison at this scale.
     x = x0.clone().requires_grad_(True)
-    local = HIDDEN // tp_degree
-    lo = rank * local
+    local_w = shard_weights(
+        {f"{k}.weight": v for k, v in weights.items()}, rank, tp_degree
+    )
     z = F.linear(x, weights["pre"])
     h = F.linear(
-        F.gelu(F.linear(z, weights["up"][lo:lo + local, :])),
-        weights["down"][:, lo:lo + local],
+        F.gelu(F.linear(z, local_w["up.weight"])), local_w["down.weight"]
     )
     y_nocomm = F.linear(h, weights["post"])
     y_nocomm.pow(2).sum().backward()

@@ -165,6 +165,12 @@ class PiperActor:
         # instead of zero-initializing.  Keyed by bare attribute name (e.g. "freqs_cis").
         self.model_const_attrs: dict = {}
 
+        # Parameter values pushed from the coordinator, keyed by FX placeholder
+        # name, used by _load_stage in place of random initialization. Empty by
+        # default, which keeps the per-rank-seeded noise behaviour.
+        self.model_param_overrides: dict = {}
+        self.matched_param_overrides: set = set()
+
     def get_and_reset_peak_memory_stats(self) -> tuple:
         """Return (global_rank, max_memory_allocated_bytes) and reset peak stats."""
         max_alloc = torch.cuda.max_memory_allocated()
@@ -231,6 +237,24 @@ class PiperActor:
         the actor's device so ``_load_stage`` can copy them directly.
         """
         self.model_const_attrs = {k: v.to(self.runtime.device) for k, v in const_attrs.items()}
+
+    def load_param_overrides(self, overrides: dict) -> None:
+        """Store parameter values to use instead of random initialization.
+
+        *overrides* maps FX placeholder name -> CPU tensor. Values are moved to
+        this actor's device so ``_load_stage`` can copy them directly, mirroring
+        ``load_const_attrs``. Each rank is sent its own tensors, so a sharded
+        parameter is sliced by the caller, which is the only place that knows how
+        it is partitioned.
+        """
+        self.model_param_overrides = {
+            k: v.to(self.runtime.device) for k, v in overrides.items()
+        }
+        self.matched_param_overrides = set()
+
+    def unmatched_param_overrides(self) -> list:
+        """Override names that never matched a placeholder, for the caller to check."""
+        return sorted(set(self.model_param_overrides) - self.matched_param_overrides)
 
     def get_node_ip_and_free_port(self):
         import socket
@@ -427,7 +451,22 @@ class PiperActor:
                 if arg is None:
                     continue
                 t = torch.empty(arg.shape, dtype=arg.dtype, device=self.runtime.device)
-                if arg.requires_grad:
+                ph_name_t = (
+                    shared_placeholder_names[i]
+                    if i < len(shared_placeholder_names) else ""
+                )
+                override = self.model_param_overrides.get(ph_name_t)
+                if override is not None:
+                    if tuple(override.shape) != tuple(arg.shape):
+                        raise ValueError(
+                            f"param override {ph_name_t!r} has shape "
+                            f"{tuple(override.shape)}, expected {tuple(arg.shape)}"
+                        )
+                    with torch.no_grad():
+                        t.copy_(override)
+                    t.requires_grad_(bool(arg.requires_grad))
+                    self.matched_param_overrides.add(ph_name_t)
+                elif arg.requires_grad:
                     t.requires_grad_(True)
                     torch.nn.init.normal_(t, mean=0.0, std=0.02, generator=g)
                 else:
