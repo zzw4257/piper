@@ -34,7 +34,8 @@ Distinguish throughout:
 | **F14** | TP composes with PP with no new process group; `order` is mandatory when pp>1 | *narrows F4, corrects F11* |
 | **F15** | TP x PP numerically correct on 4 GPUs to ~1e-6, under a generated 1F1B order | |
 | **F16** | ~~A hardware cost model ranks TP configs backwards; rank skew is the missing term~~ | **partly retracted by F17** |
-| **F17** | F16's ranking was contention: pp=2 is 27% *faster* than one GPU; the missing term looks like ~300us per collective | *retracts F16* |
+| **F17** | F16's ranking was contention: pp=2 is 27% *faster* than one GPU | *retracts F16; its ~300us guess retracted by F18* |
+| **F18** | At constant work, more microbatches make TP 2.6x worse; TP and PP want opposite microbatch counts | *distinguishes F12; retracts F17's guess* |
 
 ---
 
@@ -869,3 +870,79 @@ differences from the two ranks' independent dispatch loops.
 
 **Next experiment.** The falsification above: hold compute constant, vary the
 collective count via microbatches, and see whether the gap tracks the count.
+
+---
+
+## 2026-09-10 — F18: at constant total work, more microbatches make TP *worse*, and F12 was answering a different question
+
+**Tested.** Global batch held at 8192 while microbatches vary, so
+`batch = 8192 / mb` and total FLOPs are constant. `dim 4096, hidden 16384,
+stages 2, tp 2, bf16`. Step time from three interleaved repetitions, minimum.
+GPU breakdown from one profiled run each, so it carries F11's caveat.
+
+| mb | collectives | batch | **step (min of 3)** | compute | upd | comm | payload/coll |
+|---|---|---|---|---|---|---|---|
+| 1 | 4 | 8192 | **10.46 ms** | 6826 us | 1069 | 1223 us | 67 MB |
+| 2 | 8 | 4096 | **10.32 ms** | 7680 | 1076 | 7733 | 33.5 MB |
+| 4 | 16 | 2048 | **16.15 ms** | 9082 | 1084 | 9626 | 16.8 MB |
+| 8 | 32 | 1024 | **27.03 ms** | 11028 | 1103 | 32318 | 8.4 MB |
+
+`upd` is flat, as it must be — the parameter count does not change — which is a
+useful internal check that the decomposition is attributing correctly.
+
+### F12 and F18 are not in conflict; they ask different things
+
+This looks like it contradicts F12 ("more microbatches let TP communication
+hide"). It does not, and the difference is Piper's microbatch semantics:
+**`split` replicates the DAG, it does not partition the batch**.
+
+- **F12** held *per-microbatch* batch fixed, so total work grew with `mb`. Question:
+  given a batch, does adding microbatches expose overlap? **Yes** — concurrency
+  1.06x, 10/10 iterations.
+- **F18** holds *total* batch fixed, so work is constant and `mb` only changes
+  granularity. Question: given a total batch, is splitting it finer better?
+  **No, sharply worse** — 10.46 to 27.03 ms, a factor of 2.6.
+
+Both are true. The second is the one a user actually faces, and it is easy to
+read F12 as answering it. Recording the distinction is the point of this entry.
+
+### Two mechanisms, one reliable and one only directional
+
+1. **Kernel efficiency loss, reliable.** Compute rises 6826 -> 11028 us (+62%) at
+   *constant* FLOPs, purely because `batch` falls 8192 -> 1024. Monotone and
+   smooth across all four points.
+2. **Collective count, directional only.** `comm` rises 1223 -> 32318 us while
+   payload per collective *falls* 8x, so cost is clearly driven by the number of
+   collectives rather than the bytes. But per-collective cost comes out at 306,
+   967, 602, 1010 us — **not monotone** — so these single profiled runs cannot
+   give a scaling law. F11's 66x communication variance is larger than the
+   differences here.
+
+**Retracting my own guess from F17.** I proposed ~300 us per collective, then a
+quadratic law from two endpoints (wait ratio 66x against a collective ratio of
+8x). The intermediate points do not fit either. The endpoints agreed with a
+square by coincidence, which is what two points always do.
+
+### The practical consequence, and a real tension for TP x PP
+
+On Piper, TP wants **as few microbatches as possible**: more microbatches
+simultaneously shrink the kernels and multiply the synchronization points. PP
+wants the opposite — microbatches are what fills the pipeline bubble (F13:
+`order` bought nothing precisely because a single stage has no bubble).
+
+So **TP and PP have opposing preferences on the same knob**, and a composed
+TP x PP schedule has to trade them off. That is a genuine scheduling question
+that Piper's language *can* express, and it is the first one this project has
+found where the answer is not obvious from the IR.
+
+**Open question.** Where does the per-collective cost come from? It is not
+payload. Candidates, cheapest to separate first: the two ranks each running an
+independent Python dispatch loop, so every collective re-synchronizes them and
+pays whatever jitter accumulated since the last one; NCCL launch on a fresh
+kernel per node; the cross-stream event waits around each comm node. A CUDA-graph
+capture of the step would remove the first and third at once and is the sharpest
+available test, since the DAG's shapes and order are entirely static.
+
+**Next experiment.** Quantify `comm` properly: interleaved repetitions with a
+minimum, not one run per point. Then the scaling law is worth fitting, and only
+then is it worth attributing.
