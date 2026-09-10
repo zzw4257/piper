@@ -32,6 +32,7 @@ Distinguish throughout:
 | **F12** | TP comm hides only past one microbatch (1.00x vs 1.06x concurrency); the IR predicted it | |
 | **F13** | `order` buys nothing for TP on a single stage: 1F1B is 3.7% slower, no bubble to fill | |
 | **F14** | TP composes with PP with no new process group; `order` is mandatory when pp>1 | *narrows F4, corrects F11* |
+| **F15** | TP x PP numerically correct on 4 GPUs to ~1e-6, under a generated 1F1B order | |
 
 ---
 
@@ -649,3 +650,43 @@ scheduling freedom, so it is a design question for upstream, not an obvious fix.
 **Next experiment.** `pp2_tp2_mb4_1f1b` on four GPUs: numerical equivalence
 against `tp1`/`pp1` baselines, then whether `order` finally beats the default on
 TP once there is a pipeline bubble to fill. Blocked on four idle cards.
+
+---
+
+## 2026-09-10 — F15: TP x PP is numerically correct on four GPUs
+
+**Tested.** `experiments/check_tp_equivalence.py --pp`, `dim 512, hidden 2048,
+batch 32, fp32, stages=2, 4 microbatches`, identical global weights sliced per TP
+rank. Small on purpose: this is a correctness gate, and three of the four cards
+were shared, so nothing timing-related is claimed.
+
+| | iter 1 | iter 2 |
+|---|---|---|
+| baseline: 1 GPU, stages=2, tp=1 | 44.384857 | 23.111019 |
+| TP x PP: 4 GPU, stages=2, tp=2, 1F1B, rank 0 | 44.384819 | 23.111044 |
+| TP x PP: 4 GPU, stages=2, tp=2, 1F1B, rank 1 | 44.384819 | 23.111044 |
+
+Relative difference ~1e-6, fp32 reduction-order noise. Three things hold at once:
+
+- both TP ranks are **identical**, so the forward all-reduce is replicating the
+  region output on every stage, not just the last;
+- agreement survives the optimizer step, so the backward all-reduce is right
+  under pipelining too;
+- it matches a baseline with **no** TP, **no** PP and **no** P2P communication,
+  so `shard_tensor` composes with `place`, `split` and `order` without any of
+  them corrupting the others.
+
+`shard_tensor` therefore works in the configuration that matters: composed with
+Piper's pipeline scheduling, four microbatches deep, under a generated 1F1B
+order. That is the target the plan set for Stage C/D, reached one axis further
+than planned.
+
+**Open question.** Only performance is left unanswered here, and it needs four
+idle cards. The specific question is F13's, re-asked where it can be answered:
+with a pipeline bubble to fill, does `order` finally beat the default schedule
+for TP?
+
+**Next experiment.** Either the four-GPU `order` measurement when the box frees
+up, or Stage F, whose evidence base is now F1 (no partitioned-tensor
+representation), F4/F14 (no third axis, so TP x DP is out but TP x PP is in), and
+F10 (every consumer restates the sharding rule).

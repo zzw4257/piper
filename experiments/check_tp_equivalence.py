@@ -52,6 +52,10 @@ def main() -> int:
     ap.add_argument("--repo", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ap.add_argument("--skip-negative-control", action="store_true",
                     help="Skip the third run that proves the comparison can fail.")
+    ap.add_argument("--pp", action="store_true",
+                    help="Also check TP x PP on four GPUs against a one-GPU, "
+                         "two-stage, TP=1 baseline. Needs CUDA_VISIBLE_DEVICES to "
+                         "name four devices.")
     args = ap.parse_args()
 
     tp2 = _run("tp2", [], args.repo)
@@ -101,6 +105,34 @@ def main() -> int:
             f"{ctl_err:.3e}, so this comparison would pass with no communication "
             f"at all and proves nothing"
         )
+
+    if args.pp:
+        # TP borrows the dp dimension and PP uses the stage dimension, so this
+        # composes with no new process group (notes/log.md F14). The baseline puts
+        # both stages on one device, which makes pp_degree 1 and avoids the P2P
+        # cut, so it needs no `order` directive.
+        small = ["--dim", "512", "--hidden", "2048", "--batch-size", "32",
+                 "--dtype", "fp32", "--warmup", "1", "--iters", "2", "--stages", "2"]
+        ref = _run("pp1_tp1_mb4", small + ["--tp", "1"], args.repo)
+        got = _run("pp2_tp2_mb4_1f1b", small + ["--tp", "2"], args.repo)
+        r = ref["metrics"][0]["losses"]
+        gs = [m["losses"] for m in got["metrics"]]
+        print(f"\nTP x PP baseline (1 GPU, stages=2, tp=1): {[round(x, 6) for x in r]}")
+        for m, losses in zip(got["metrics"], gs):
+            print(f"TP x PP rank{m['dp_rank']} (4 GPU, stages=2, tp=2, 1f1b): "
+                  f"{[round(x, 6) for x in losses]}")
+        assert len(gs) == 2, f"expected two TP ranks, got {len(gs)}"
+        for i, (a, b) in enumerate(zip(*gs)):
+            assert abs(a - b) <= ATOL + RTOL * abs(b), (
+                f"TP x PP iteration {i}: TP ranks disagree ({a} vs {b})")
+        pp_worst = 0.0
+        for i, (sharded, refv) in enumerate(zip(gs[0], r)):
+            err = abs(sharded - refv)
+            pp_worst = max(pp_worst, err)
+            assert err <= ATOL + RTOL * abs(refv), (
+                f"TP x PP iteration {i}: {sharded} differs from the unsharded "
+                f"single-stage baseline {refv} by {err:.3e}")
+        print(f"PASS  TP x PP matches the baseline (worst |diff| {pp_worst:.2e})")
 
     print(f"\nPASS  TP=2 matches TP=1 across {len(l1)} iterations "
           f"(worst |diff| {worst:.2e}), both TP ranks agree, and removing the "
