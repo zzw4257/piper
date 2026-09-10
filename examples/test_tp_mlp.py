@@ -26,7 +26,7 @@ from src.compile import piper_setup
 from src.piper import piper_exec_dag
 from src.state import LOG_LEVEL, create_logger, piper_metadata
 
-from models.tp_mlp import TPMlp
+from models.tp_mlp import TPMlp, global_weights, shard_weights
 
 logger = create_logger("test_tp_mlp", LOG_LEVEL)
 
@@ -48,6 +48,8 @@ def _raw_metrics(args, iter_times, losses, peak_memory_stats):
         "num_microbatches": int(info.get("num_microbatches", 1)),
         "seq_len": args.dim,
         "seed": args.seed,
+        "init": args.init,
+        "tp": args.tp,
         "iter_times_s": [float(t) for t in iter_times],
         "losses": [float(l) for l in losses],
         "peak_memory_by_rank": {
@@ -63,6 +65,20 @@ def main(args, pg):
     dtype = _DTYPES[args.dtype]
 
     loss_fn = lambda output, labels: (output.float() - labels.float()).pow(2).mean()
+
+    # With --init fixed, every rank and every TP degree starts from the same
+    # global weights, sliced for this rank. That is what makes a TP=2 run
+    # comparable to the TP=1 baseline; Piper's default per-rank seeding
+    # (manual_seed(1000 * global_rank + stage_id)) makes any such comparison
+    # meaningless (notes/log.md F3).
+    param_overrides = None
+    if args.init == "fixed":
+        tp_rank = int(os.environ["PIPER_DP_RANK"])
+        param_overrides = shard_weights(
+            global_weights(args.dim, args.hidden, args.seed, dtype),
+            tp_rank,
+            args.tp,
+        )
 
     # Seed the data. Piper seeds parameters per rank already
     # (manual_seed(1000 * global_rank + stage_id)), so with a fixed data seed a
@@ -82,6 +98,7 @@ def main(args, pg):
         model_dtype=dtype,
         pg=pg,
         temp_dir=args.temp_dir,
+        param_overrides=param_overrides,
         visualize_dag=args.viz,
         use_inductor=args.use_inductor,
         pp_outer=args.pp_outer,
@@ -146,6 +163,11 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--dtype", choices=sorted(_DTYPES), default="fp32")
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--init", choices=("random", "fixed"), default="fixed",
+        help="fixed: identical global weights sliced per rank, so TP degrees "
+             "are comparable. random: Piper's per-rank seeded noise.",
+    )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--viz", action="store_true", default=False)
