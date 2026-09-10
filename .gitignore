@@ -6,3 +6,10 @@ out/
 .vscode/
 .codex
 ec2-trust-policy.json
+
+# Piper-TP
+results/
+logs/
+*.nsys-rep
+*.sqlite
+.venv*
