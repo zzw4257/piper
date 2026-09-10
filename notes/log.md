@@ -30,6 +30,8 @@ Distinguish throughout:
 | **F10** | TP=2 equals TP=1 inside Piper to 7.2e-07 once parameters can be supplied | |
 | **F11** | TP comm ~7.1% of GPU time; stream placement buys nothing yet; the first collective measures rank skew, not communication | |
 | **F12** | TP comm hides only past one microbatch (1.00x vs 1.06x concurrency); the IR predicted it | |
+| **F13** | `order` buys nothing for TP on a single stage: 1F1B is 3.7% slower, no bubble to fill | |
+| **F14** | TP composes with PP with no new process group; `order` is mandatory when pp>1 | *narrows F4, corrects F11* |
 
 ---
 
@@ -561,3 +563,89 @@ than just riding on it.
 has its evidence base: F1 (no partitioned-tensor representation), F4 (no third
 parallel axis), F10 (every consumer must restate the sharding rule) are the three
 concrete things a TP-selection search would need the IR to express.
+
+---
+
+## 2026-09-10 — F13: `order` buys nothing for TP on a single stage, and the reason is structural
+
+**Tested.** Three interleaved repetitions per arm (A/B/A/B/A/B, to blunt time
+drift on a shared box), `dim 8192, hidden 32768, batch 8192, bf16, 2xB200`,
+10 profiled iterations each, minimum span per run.
+
+| arm | span min (us) | concurrency max |
+|---|---|---|
+| default order | 60059 / 57651 / **57063** | 1.09–1.17x |
+| hand-written 1F1B `order` | 59610 / **59152** / 60770 | 1.03–1.05x |
+
+1F1B is **~3.7% slower** and overlaps *less*. Explicable, not surprising:
+
+- With one stage there is **no pipeline bubble to fill**, which is what 1F1B
+  exists for. It has no upside to deliver here.
+- The directive adds four `ORDER_DUMMY` nodes and temporal edges that only
+  **constrain** `_resolve_default_stream_order`, which was already free to order
+  same-level compute by downstream count.
+- The default order was already good: `_serial_topological_order` gives
+  critical-path comm (including `TP_COMM`) priority 1 against compute's 3, so at
+  equal topological level the collective is issued first and lands beside another
+  microbatch's compute. That is where F12's free 1.06x came from.
+
+So the overlap TP gets today is not something `order` improved on. `order` should
+pay for TP where it pays for anything — **across pipeline stages**.
+
+---
+
+## 2026-09-10 — F14: TP composes with PP without a third axis, but `order` is mandatory there
+
+**Tested.** `examples/base-schedules/pp2_tp2_mb4_1f1b.json`, compiled on CPU via
+`experiments/dump_dag.py`. No GPU run yet: `cmu-gpu pick --count 4` reports zero
+idle cards.
+
+**Changed.** `TPMlp(…, n_stages)` wraps each block in its own PP scope with the
+TP region nested inside; weight keys moved under `blocks.<i>.`; `dump_dag.py` and
+the driver gained `--stages`.
+
+**Result — it composes, and needs no new process group.** TP borrows the dp
+dimension while PP uses the stage dimension:
+
+```
+2 per-PP-rank DAGs, 41 nodes each, devices (0,2) and (1,3)
+rank 0: 12 forward, 12 backward, 4 SEND, 4 RECV,
+        4 forward_tp_all_reduce, 4 backward_tp_all_reduce, 1 UPD
+```
+
+**This corrects F11.** I had guessed TP x PP would also need a `tp_group`. It
+does not — only **TP x DP** needs the third axis Piper lacks, because there TP
+and DP would both want the same dimension. So the useful composed TP schedules
+are reachable today, and F4's limitation is narrower than recorded.
+
+**Unexpected — with `pp_degree > 1`, `order` is not optional.** The same schedule
+without an `order` directive fails:
+
+```
+ValueError: expected distinct device sets across split components,
+got [(0, 2), (1, 3), (0, 2), (0, 2), (0, 2), (0, 2)]
+```
+
+Four of the six components are PP=0 forward-only chains, one per microbatch:
+`s0.seg0 -> s0.seg1 -> tp_all_reduce.0 -> s0.seg2 -> send.0`. The cause is in
+`build_training_dag`: it bridges forward to backward only at the **globally**
+last forward node, which belongs to the last stage. So a non-last stage's forward
+chain reaches its own backward chain only *through* the next stage, and
+`_insert_send_recv_comm_nodes` severs precisely that path (SEND and RECV are
+deliberately unconnected). `order`'s temporal edges are the only thing that
+reconnects them — which is why the harness always appends one and why every
+shipped base schedule is run with `--schedule 1f1b` or similar.
+
+This is a real precondition that nothing states: `--schedule custom` will happily
+accept a `pp_degree > 1` base schedule with no `order` and fail with a message
+about device sets. `src/piper.py` now detects the signature (components sharing a
+device set, some forward-only), names one, and says what to add.
+
+**Open question.** Does the fwd->bwd bridge belong per stage rather than only at
+the globally last forward? That would make each PP rank's sub-DAG connected on
+its own and remove the hidden dependency on `order`. It would also change
+scheduling freedom, so it is a design question for upstream, not an obvious fix.
+
+**Next experiment.** `pp2_tp2_mb4_1f1b` on four GPUs: numerical equivalence
+against `tp1`/`pp1` baselines, then whether `order` finally beats the default on
+TP once there is a pipeline bubble to fill. Blocked on four idle cards.

@@ -21,7 +21,8 @@ import torch.nn.functional as F
 from src.piper import annotate
 
 
-def global_weights(dim: int, hidden: int, seed: int, dtype=torch.float32) -> dict:
+def global_weights(dim: int, hidden: int, seed: int, dtype=torch.float32,
+                   n_stages: int = 1) -> dict:
     """One set of unsharded weights, independent of the TP degree.
 
     Shared by `examples/test_tp_mlp.py` and `test/test_tp_equivalence.py` so the
@@ -34,12 +35,13 @@ def global_weights(dim: int, hidden: int, seed: int, dtype=torch.float32) -> dic
     def w(out_features, in_features):
         return torch.randn(out_features, in_features, generator=g, dtype=torch.float32).mul_(0.05).to(dtype)
 
-    return {
-        "pre.weight": w(dim, dim),
-        "up.weight": w(hidden, dim),
-        "down.weight": w(dim, hidden),
-        "post.weight": w(dim, dim),
-    }
+    out = {}
+    for i in range(n_stages):
+        out[f"blocks.{i}.pre.weight"] = w(dim, dim)
+        out[f"blocks.{i}.up.weight"] = w(hidden, dim)
+        out[f"blocks.{i}.down.weight"] = w(dim, hidden)
+        out[f"blocks.{i}.post.weight"] = w(dim, dim)
+    return out
 
 
 def shard_weights(weights: dict, tp_rank: int, tp_degree: int) -> dict:
@@ -49,26 +51,26 @@ def shard_weights(weights: dict, tp_rank: int, tp_degree: int) -> dict:
     is row-parallel, so its input features (dim 1) are. Piper's IR carries no
     partition information, so this has to happen caller-side.
     """
-    hidden = weights["up.weight"].shape[0]
-    local = hidden // tp_degree
-    lo = tp_rank * local
     out = dict(weights)
-    out["up.weight"] = weights["up.weight"][lo:lo + local, :].contiguous()
-    out["down.weight"] = weights["down.weight"][:, lo:lo + local].contiguous()
+    for key in weights:
+        if key.endswith("up.weight"):
+            hidden = weights[key].shape[0]
+            local = hidden // tp_degree
+            lo = tp_rank * local
+            out[key] = weights[key][lo:lo + local, :].contiguous()
+        elif key.endswith("down.weight"):
+            hidden = weights[key].shape[1]
+            local = hidden // tp_degree
+            lo = tp_rank * local
+            out[key] = weights[key][:, lo:lo + local].contiguous()
     return out
 
 
-class TPMlp(nn.Module):
-    def __init__(self, dim: int, hidden: int, tp_degree: int):
+class TPBlock(nn.Module):
+    """pre (replicated) -> [up -> gelu -> down] (TP) -> post (replicated)."""
+
+    def __init__(self, dim: int, hidden_local: int):
         super().__init__()
-        if hidden % tp_degree:
-            raise ValueError(f"hidden={hidden} must divide by tp_degree={tp_degree}")
-        hidden_local = hidden // tp_degree
-
-        self.dim = dim
-        self.hidden = hidden
-        self.tp_degree = tp_degree
-
         self.pre = nn.Linear(dim, dim, bias=False)
         # Column-parallel: output features are sharded, so dim 0 of the weight.
         self.up = nn.Linear(dim, hidden_local, bias=False)
@@ -78,10 +80,33 @@ class TPMlp(nn.Module):
         self.post = nn.Linear(dim, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # One outer PP scope keeps all three segments on stage 0, so the whole
-        # model sits on a single device group and pp_degree stays 1.
-        with annotate("PP"):
-            x = self.pre(x)
-            with annotate("TP"):
-                x = self.down(F.gelu(self.up(x)))
-            return self.post(x)
+        x = self.pre(x)
+        with annotate("TP"):
+            x = self.down(F.gelu(self.up(x)))
+        return self.post(x)
+
+
+class TPMlp(nn.Module):
+    def __init__(self, dim: int, hidden: int, tp_degree: int, n_stages: int = 1):
+        super().__init__()
+        if hidden % tp_degree:
+            raise ValueError(f"hidden={hidden} must divide by tp_degree={tp_degree}")
+
+        self.dim = dim
+        self.hidden = hidden
+        self.tp_degree = tp_degree
+        self.n_stages = n_stages
+        self.blocks = nn.ModuleList(
+            TPBlock(dim, hidden // tp_degree) for _ in range(n_stages)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # One PP scope per block. With n_stages=1 the whole model sits on one
+        # device group and pp_degree stays 1; with n_stages=2 the two blocks can
+        # be placed on different device groups, and each group is still TP=2
+        # internally -- so TP x PP composes without a third parallel axis, which
+        # TP x DP would need (notes/log.md F4).
+        for block in self.blocks:
+            with annotate("PP"):
+                x = block(x)
+        return x

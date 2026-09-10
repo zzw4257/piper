@@ -1,0 +1,176 @@
+[
+  {
+    "op": "place",
+    "filter": {
+      "PP": 0
+    },
+    "devices": [
+      0,
+      2
+    ],
+    "stream": "pp_stream"
+  },
+  {
+    "op": "place",
+    "filter": {
+      "PP": 1
+    },
+    "devices": [
+      1,
+      3
+    ],
+    "stream": "pp_stream"
+  },
+  {
+    "op": "shard_tensor",
+    "filter": {
+      "PP": 0,
+      "TP": "*"
+    },
+    "devices": [
+      0,
+      2
+    ],
+    "stream": "tp_stream"
+  },
+  {
+    "op": "shard_tensor",
+    "filter": {
+      "PP": 1,
+      "TP": "*"
+    },
+    "devices": [
+      1,
+      3
+    ],
+    "stream": "tp_stream"
+  },
+  {
+    "op": "split",
+    "filter": {},
+    "dim_name": "MB",
+    "num_microbatches": 4
+  },
+  {
+    "op": "order",
+    "filters": [
+      [
+        {
+          "PP": 0,
+          "MB": 0,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 0,
+          "MB": 1,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 0,
+          "MB": 0,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "PP": 0,
+          "MB": 2,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 0,
+          "MB": 1,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "PP": 0,
+          "MB": 3,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 0,
+          "MB": 2,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "PP": 0,
+          "MB": 3,
+          "PASS": "B"
+        }
+      ]
+    ]
+  },
+  {
+    "op": "order",
+    "filters": [
+      [
+        {
+          "PP": 1,
+          "MB": 0,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 1,
+          "MB": 0,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "PP": 1,
+          "MB": 1,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 1,
+          "MB": 1,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "PP": 1,
+          "MB": 2,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 1,
+          "MB": 2,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "PP": 1,
+          "MB": 3,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 1,
+          "MB": 3,
+          "PASS": "B"
+        }
+      ]
+    ]
+  }
+]
