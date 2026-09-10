@@ -33,7 +33,8 @@ Distinguish throughout:
 | **F13** | `order` buys nothing for TP on a single stage: 1F1B is 3.7% slower, no bubble to fill | |
 | **F14** | TP composes with PP with no new process group; `order` is mandatory when pp>1 | *narrows F4, corrects F11* |
 | **F15** | TP x PP numerically correct on 4 GPUs to ~1e-6, under a generated 1F1B order | |
-| **F16** | A hardware cost model ranks TP configs **backwards**; rank skew, not bandwidth, is the missing term | |
+| **F16** | ~~A hardware cost model ranks TP configs backwards; rank skew is the missing term~~ | **partly retracted by F17** |
+| **F17** | F16's ranking was contention: pp=2 is 27% *faster* than one GPU; the missing term looks like ~300us per collective | *retracts F16* |
 
 ---
 
@@ -797,3 +798,74 @@ about TP.
 actor and histogram the differences — rather than inferring it from inflated NCCL
 kernel durations. That is the cheapest way to confirm the root cause, and it needs
 only two GPUs.
+
+---
+
+## 2026-09-10 — F17: **F16's ranking was contention, not a result.** Retracting it, and a better hypothesis
+
+**Tested.** The same three configurations as F16, but interleaved A/B/C three
+times and reduced by **minimum** rather than reported from one run each.
+`dim 4096, hidden 16384, batch 2048/microbatch, stages 2, tp per config, bf16,
+12 iterations`. Machine state identical at start and end (GPUs 0/1/2/4 at 100%
+under other users, 3/5/6 idle).
+
+| config | rep1 | rep2 | rep3 | **min** | F16 reported |
+|---|---|---|---|---|---|
+| pp=2 | 11.96 | 21.74 | 12.20 | **11.96 ms** | 23.36 ms |
+| one GPU | 16.49 | 17.64 | 17.68 | **16.49 ms** | 18.72 ms |
+| tp=2 | 17.83 | 16.62 | 27.15 | **16.62 ms** | 26.52 ms |
+
+### Retraction
+
+**F16's headline — "staying on one GPU is 25–42% faster than either parallel
+configuration" — is withdrawn.** With interleaving and a minimum, `pp=2` is
+**27% faster** than one GPU, not 25% slower. F16 took one sample per
+configuration, and the samples that involved NVLink were the ones that drift by
+a factor of two. Single-GPU numbers barely moved (16.49 against 18.72) because
+they use no interconnect; `pp=2` moved by 2x and `tp=2` by 1.6x.
+
+This is my own methodology finding (F11: report the minimum, never the mean)
+applied everywhere except the place it mattered most. The `SKEW_US = 12000`
+constant that "restored" the ranking was fitted to a contaminated sample, so it
+was fitting the machine's other users.
+
+### What survives
+
+- The **compute** side of the model still holds: one GPU predicted 12494us
+  against 16.49ms measured wall clock, and F12's GPU-side calibration is still
+  2%.
+- **Direct measurement** replaces the inference: median entry spread is
+  **157–2831us**, not 12000us. Ranks do not enter steps 12ms apart.
+- Communication kernels really do inflate — 12875us per rank per iteration
+  against ~745us of payload — but that inflation is **contention plus arrival
+  differences at each collective**, not a per-step constant.
+
+### The better hypothesis, and it is testable
+
+`tp=2` is 39% slower than `pp=2` (16.62 against 11.96 ms) where the compute model
+separates them by only 4% (7497 against 6247us). The gap is 4.66 ms. Count the
+synchronizing operations per step:
+
+| config | collectives per step per rank | 4.66 ms / count |
+|---|---|---|
+| tp=2 | 16 all-reduces (4 mb x 2 stages x 2 passes) | **291 us** |
+| pp=2 | 8 P2P send/recv (4 mb x 2), which are pairwise, not group-wide | — |
+
+So the missing term looks like a **fixed cost of ~300us per collective**, not a
+per-step skew. That also explains why TP loses to PP despite similar FLOPs: TP
+inserts a group-wide synchronization point per region per pass per microbatch,
+and PP inserts only pairwise transfers.
+
+**Prediction to falsify it:** the cost should scale with the *number* of
+collectives, so `tp=2, mb=1` (4 all-reduces) should sit about 3.5 ms below
+`tp=2, mb=4` (16 all-reduces) once compute is held constant. If instead the two
+differ by the compute ratio alone, the per-collective model is wrong too.
+
+**Open question.** If ~300us per collective is real, where does it come from?
+Candidates, in order of how cheaply they can be separated: the per-step
+`torch.cuda.synchronize()` in `_update`; cross-stream event waits around each
+comm node; NCCL launch cost on a fresh kernel each time; genuine arrival
+differences from the two ranks' independent dispatch loops.
+
+**Next experiment.** The falsification above: hold compute constant, vary the
+collective count via microbatches, and see whether the gap tracks the count.
