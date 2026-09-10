@@ -28,6 +28,7 @@ Distinguish throughout:
 | **F8** | The loss was computed for the backward and dropped, in four places | |
 | **F9** | Piper trained on **zero inputs**, the shipped LLaMA example included | |
 | **F10** | TP=2 equals TP=1 inside Piper to 7.2e-07 once parameters can be supplied | |
+| **F11** | TP comm ~7.1% of GPU time; stream placement buys nothing yet; the first collective measures rank skew, not communication | |
 
 ---
 
@@ -396,3 +397,98 @@ expose the placeholder names so callers can look them up?
 **Next experiment.** Stage E — one profiling question: what fraction of step time
 is the two `TP_COMM` all-reduces, and does moving them off `tp_stream` onto
 `default_stream` change it.
+
+---
+
+## 2026-09-10 — F11: TP communication is ~7% here, stream placement buys nothing yet, and the first collective of an iteration is not a measurement
+
+**Tested.** `dim 4096, hidden 16384, batch 4096, bf16, 2xB200 (GPU 3,5), 20
+profiled iterations`, via `--pytorch-profiler` and `experiments/profile_tp.py`.
+The box was shared throughout; GPUs 0/1/2/4/6 were at 100% util under other
+users, and GPU 5 went from 0% to 100% mid-experiment.
+
+**Changed.** `experiments/profile_tp.py` (per-DAG-node GPU time attribution),
+`experiments/summarize_runs.py`, `examples/base-schedules/tp2_default_stream.json`.
+
+### The number
+
+Piper labels every GPU event with the DAG node that issued it, so the trace
+aggregates per node uid rather than per kernel name:
+
+| node | task | min (us) | max/min |
+|---|---|---|---|
+| `s0.seg1.bwd` | backward | 764.4 | 1.01x |
+| `upd.0` | update | 531.8 | 1.02x |
+| `s0.seg2.bwd` | backward | 455.8 | 1.02x |
+| `s0.seg1` | forward | 401.5 | 1.02x |
+| `s0.seg0` | forward | 96.4 | 1.02x |
+| `s0.seg2` | forward | 92.0 | 1.06x |
+| `s0.seg0.bwd` | backward | 87.5 | 1.09x |
+| `tp_all_reduce.1` | backward all-reduce | **93.0** | 26.6x |
+| `tp_all_reduce.0` | forward all-reduce | 458.2 | 66.5x |
+
+One all-reduce costs **~93 us** for a 32 MiB bf16 payload, i.e. ~360 GB/s
+effective over NVLink. Two of them against 2435 us of compute:
+
+> **TP communication is ~7.1% of GPU time** in this configuration.
+
+That is an upper-confidence *lower bound*: nothing on a contended machine makes a
+kernel faster than its uncontended time, so the minimum converges to the truth
+from above.
+
+### Stream placement buys nothing here, as the IR predicts
+
+`shard_tensor` takes a `stream`. Compare `tp_stream` against `default_stream`:
+
+| | compute min-sum | backward all-reduce min |
+|---|---|---|
+| `tp_stream` | 2434.7 us | 93.0 us |
+| `default_stream` | 2448.6 us | 90.6 us |
+
+Compute agrees to 0.6% and the collective to 2.6% — no effect. This was
+predictable from the lowered DAG without running anything: the serial order is
+`s0.seg1 -> tp_all_reduce.0 -> s0.seg2`, so with one region and one microbatch
+**the collective has nothing to overlap with**, and a separate stream only adds
+event synchronization.
+
+So Piper's stream programmability — the thing the paper is about — cannot pay for
+itself on TP until there is concurrent work: several microbatches, several TP
+regions, or TP composed with PP/DP. That is the natural next experiment, and it
+is also the first place TP will need a real `tp_group` (F4).
+
+### Three methodology findings, all load-bearing
+
+1. **Report the minimum, never the mean.** Communication varied up to 66x across
+   iterations while compute stayed within 1.1%. A mean tracks whoever else is
+   using the machine.
+2. **Owning your GPUs is not enough to measure TP.** Compute was rock-steady on
+   two 0%-util cards, yet the collectives were squeezed anyway: SMs are per-GPU
+   and can be held exclusively, but **NVLink/NVSwitch is machine-wide**. Any TP
+   communication number needs the whole box quiet, not two free cards.
+3. **The first collective of an iteration is not a communication measurement.**
+   Same payload, same code path, but per rank:
+
+   | | rank 0 | rank 1 |
+   |---|---|---|
+   | `tp_all_reduce.0` (forward) | min 458, values 2858–30485 | min **93.8**, values ~94 |
+   | `tp_all_reduce.1` (backward) | min 93.0 | min 93.6 |
+
+   Perfectly complementary: rank 0 arrives early and spins inside the NCCL
+   kernel waiting for rank 1. Each device is driven by its own Ray actor and
+   `piper_exec_dag` fans out with `ray.get`, so iteration start times differ by
+   milliseconds and **the first collective absorbs the skew**. The backward
+   all-reduce is clean because the forward one already synchronized the ranks.
+
+   `profile_tp.py` now detects this and says so. It matters beyond TP: any
+   overlap analysis on Piper that reads the first collective's duration as
+   communication cost will overstate it, which is exactly the quantity a
+   DualPipe-style schedule claims to hide.
+
+**Open question.** Does the skew shrink with more microbatches (the first
+collective absorbs it once per iteration, so its relative cost should fall), or
+is it per-collective? That decides whether it is a measurement artifact or a real
+cost of the Ray-per-device driver model.
+
+**Next experiment.** Multi-microbatch TP, which is the first configuration where
+`stream` and `order` can actually do something for TP — and where a real
+`tp_group` becomes necessary.
