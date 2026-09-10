@@ -1,0 +1,152 @@
+# Piper-TP research log
+
+Append-only. One entry per validation-ladder rung or per surprise. Entries are
+dated and numbered `F<n>`. Retractions are marked in place, never deleted.
+
+Headings per entry: **Tested / Changed / Unexpected / IR-runtime assumption
+discovered / Open question / Next experiment.** Omit a heading only when it has
+nothing in it.
+
+Distinguish throughout:
+- **[code]** verified by reading or running the code, with `file:line`;
+- **[intent]** what the paper or issue #15 says should happen;
+- **[proposed]** our own extension.
+
+---
+
+## Index
+
+| | entry | |
+|---|---|---|
+| **F1** | Piper has no partitioned-tensor representation; `shard` is EP-only and partitions nothing | |
+| **F2** | `REDUCE_COMM` is a parameter-gradient collective, not an activation collective | |
+| **F3** | Per-rank random weight init makes numerical comparison impossible as shipped | |
+| **F4** | The 2-GPU TP placement is expressible with zero launcher changes | |
+| **F5** | Environment works on B200 (torch 2.10+cu128, sm_100); disk blocker was misdiagnosed | |
+
+---
+
+## 2026-09-10 — F1: Piper has no representation of a partitioned tensor; `shard` is EP-only and partitions nothing
+
+**Tested.** Read all of `src/` at `upstream/main@439e960b`. No execution yet.
+
+**IR-runtime assumption discovered.** [code] Three facts that together fix the
+shape of any TP design here:
+
+1. Parameters enter the IR as **meta tensors** — `fx.py:_meta_tensor_like` builds
+   `torch.empty(example.shape, dtype, device="meta")`, stored in
+   `AnnotationSegment.graphargs`. The IR therefore carries shape and dtype and
+   nothing else; there is no tensor identity and no partition attribute.
+2. `TrainingDAGNode.device` (`dag.py:44`) is a **device group**, not one GPU. The
+   same logical sub-DAG is executed SPMD by every member. Physical binding is not
+   read from the directive at all: `actor.py:_join_process_groups` sets
+   `cuda:{global_rank % device_count}`.
+3. Consequently **none of the three placement verbs partitions a parameter**:
+   - `replicate` does not copy nodes; it only inserts `REDUCE_COMM` after `BWD_W`
+     (`directives.py:_insert_reduce_comm_nodes`), or `ALL_GATHER_COMM` /
+     `REDUCE_SCATTER_COMM` for ZeRO-2/3.
+   - `shard` (used only for EP) sets `apply_zero=False`, deletes DP sync comms on
+     the matched nodes, and inserts `A2A_COMM` on the incoming and outgoing
+     activation edges at `a2a_boundary_after.tensor_idx`
+     (`directives.py:_insert_shard_a2a_comm_nodes`). Every rank runs the *same*
+     serialized GraphModule with *identical* shapes. Distinct expert weights arise
+     **only** from per-rank random init (see F3).
+
+So parallelism in Piper today is entirely "which collective is inserted where".
+No node or edge carries a dim, mesh, or placement type.
+
+**Unexpected.** `shard`'s name suggests a general sharding verb; it is
+specifically a token-routing all-to-all insertion. That is why we propose a
+distinct `shard_tensor` op rather than a `collective` field on `shard`.
+
+**Open question.** [intent] Issue #15 asks the runtime to "manage the necessary
+sharding and collectives". That is strictly more than the current code does. Is
+the intended direction a placement type on IR edges (SPMD/GSPMD-style), or
+directive-stated collectives with the model authored in local-shard shapes (what
+EP does today)? This is the question to put to Stephanie.
+
+**Next experiment.** Stage B — insert `TP_COMM` nodes and assert the IR
+transformation on CPU, before spending GPU time.
+
+---
+
+## 2026-09-10 — F2: `REDUCE_COMM` is a parameter-gradient collective, not an activation collective
+
+**Tested.** Read `executors.py:CommunicationExecutor` and `DagExecutor.run`.
+
+**IR-runtime assumption discovered.** [code] `all_reduce_grads`
+(`executors.py:74`) iterates `bucket.trainable_param_idxs` and all-reduces
+`param.grad` on `dp_group`. It never touches an activation. So TP cannot reuse
+`REDUCE_COMM`: TP needs an all-reduce on a **boundary activation** in forward and
+on an **input gradient** in backward — a different payload at a different
+insertion point.
+
+What *is* reusable is `A2A_COMM`. Autograd is cut at every segment boundary:
+forward outputs are detached and the DAG moves gradients explicitly. `FWD_A2A`
+mutates `detached_outs[tensor_idx]` and re-attaches `requires_grad_(True)`;
+`BWD_A2A` mutates `inp_grads[tensor_idx]`. That is structurally *exactly*
+Megatron's `f`/`g` conjugate pair with `all_to_all_single` swapped for
+`all_reduce`. TP's comm node is therefore a near-copy of an existing pattern, not
+a new mechanism.
+
+**Next experiment.** Stage C — `all_reduce_activation` on `ep_group` plus two
+`match` arms mirroring `FWD_A2A`/`BWD_A2A`.
+
+---
+
+## 2026-09-10 — F3: per-rank random weight init makes numerical comparison impossible as shipped
+
+**Tested.** Read `actor.py:_load_stage`.
+
+**Unexpected.** [code] `_load_stage` seeds with
+`g.manual_seed(1000 * self.runtime.global_rank + stage_id)` and fills every
+trainable slot with `torch.nn.init.normal_(t, mean=0.0, std=0.02, generator=g)`.
+Weights are therefore **different on every rank** — DP replicas are not even
+mutually consistent. There is no checkpoint-loading path.
+
+This is coherent with Piper's purpose: the shipped examples report iteration time,
+throughput and peak memory (`results.csv`), never loss agreement. But it means a
+"correctness vs unsharded baseline" comparison is **not possible end-to-end today**
+for any parallelism dimension, TP included.
+
+Non-trainable slots *do* have a push path: `actor.py:load_const_attrs` sends
+CPU tensors that `_load_stage` matches by placeholder name (after stripping
+Dynamo's `l_self_` prefix) before falling back to `zero_()`. Extending that same
+mechanism to trainable slots is the minimal fix and is what Stage D2 will do.
+
+**Open question.** Does upstream want a weight-injection path? It would also
+unblock any numerical testing of PP/DP/EP and is adjacent to issue #13.
+
+**Next experiment.** Stage D1 — validate the TP math out-of-band with a
+`torchrun --nproc_per_node=2` test whose weights are sliced from one global seed,
+so the collective placement is proven before the Ray/DAG stack is involved.
+
+---
+
+## 2026-09-10 — F4: the 2-GPU TP placement is expressible with zero launcher changes
+
+**Tested.** Traced the launch path by hand through `schedule.py`,
+`coordinator.py`, `compile.py`, `actor.py`. Not yet executed.
+
+**IR-runtime assumption discovered.** [code] `derive_schedule_info` defines
+`pp_degree` = number of distinct device-sets across `place` directives and
+`dp_degree` = the size of each. `world_size = dp_degree * pp_degree` — there is
+**no third axis**. For `place PP=0 devices=[0,1]`:
+
+- `pp_degree=1`, `dp_degree=2`, `world_size=2`;
+- placement group `[{"CPU":1,"GPU":1}] * 2`; `_create_actors(num_actors=1)` per driver;
+- `global_rank = pp_rank + dp_rank*pp_degree = dp_rank` → `cuda:0`, `cuda:1`;
+- `_join_dp_process_group`: `num_dp_groups = 2//2 = 1`, `group_ranks = [0,1]`, and it
+  builds **two** NCCL communicators over that pair — `dp_group` and `ep_group` —
+  deliberately, so all-reduce and all-to-all get separate NCCL proxy streams.
+
+With no `replicate` directive on the TP region, `dp_group` goes unused and
+`ep_group` is idle. Stage C binds `TP_COMM` to `ep_group`.
+
+**Open question.** This shortcut holds only while `tp_degree` equals the place-group
+size, i.e. **TP cannot compose with DP**. A real `tp_group` and a third degree in
+`derive_schedule_info` are needed for that, and that is the first place TP forces a
+change to Piper's world-shape assumption rather than just adding a pass.
+
+**Next experiment.** Stage A — run the shipped 4-GPU PP×DP×EP example first, to
+confirm the environment and read the rendered DAGs.
