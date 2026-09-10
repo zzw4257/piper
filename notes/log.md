@@ -23,6 +23,7 @@ Distinguish throughout:
 | **F3** | Per-rank random weight init makes numerical comparison impossible as shipped | |
 | **F4** | The 2-GPU TP placement is expressible with zero launcher changes | |
 | **F5** | Environment works on B200 (torch 2.10+cu128, sm_100); disk blocker was misdiagnosed | |
+| **F6** | TP's conjugate pair is two *outgoing* edges; boundary-only insertion is semantics, not an optimization | |
 
 ---
 
@@ -150,3 +151,69 @@ change to Piper's world-shape assumption rather than just adding a pass.
 
 **Next experiment.** Stage A — run the shipped 4-GPU PP×DP×EP example first, to
 confirm the environment and read the rendered DAGs.
+
+---
+
+## 2026-09-10 — F6: TP's conjugate pair is two *outgoing* edges, and the rewrite is smaller than planned
+
+**Tested.** `pytest -m "not gpu" test` → **30 passed** (18 upstream + 12 new in
+`test/test_tp_directive.py`). CPU only; nothing executed on a GPU yet.
+
+**Changed.** Stage B. New `shard_tensor` directive and `TP_COMM` node kind:
+
+| file | change |
+|---|---|
+| `src/directives.py` | `_insert_tp_all_reduce_comm_nodes`; lifted `_boundary_info_for_edge` out of `_insert_shard_a2a_comm_nodes`; accept the op; dispatch it |
+| `src/tasks.py` | `FWD_TP_ALL_REDUCE` / `BWD_TP_ALL_REDUCE` + mapping keyed on `tag["PASS"]` |
+| `src/schedule.py` | accept `shard_tensor` in `_validate_directive_shape` |
+| `src/dag.py`, `src/ordering.py`, `src/visualization.py` | register `TP_COMM` (docstring, critical-path comm set, node label) |
+
+**Unexpected — the design got simpler.** [code] I expected TP to need insertion on
+both sides of the region, as `shard` does for EP. It does not. Megatron's `f`/`g`
+pair maps onto **two outgoing edges**:
+
+- `g` (region exit, forward): the output is a partial sum → all-reduce the FWD
+  edge leaving the region;
+- `f` (region entry, backward): the gradient w.r.t. the region's input is a partial
+  sum, and backward edges are reversed in this IR (`FWD: u→v` becomes `BWD: v'→u'`),
+  so it is *also* an edge leaving the region.
+
+So `_insert_tp_all_reduce_comm_nodes` only ever walks outgoing edges — half the
+cases `_insert_shard_a2a_comm_nodes` handles. EP needs both sides because each
+expert segment is independently sharded; TP needs one because the region is a unit.
+
+Two further consequences fell out:
+
+1. **Boundary-only insertion is required, not an optimization.** A TP region
+   spanning two segments (column-parallel `up` feeding row-parallel `down`) has an
+   internal edge carrying a tensor that is sharded *on purpose*. Reducing it would
+   be wrong. `shard` inserts on every matched node's edges, which is right for EP
+   and would be a silent correctness bug for TP. The pass therefore skips edges
+   whose destination is inside the matched set — locked by
+   `test_shard_tensor_does_not_reduce_edges_internal_to_the_region`.
+2. **`_boundary_info_for_edge` already does exactly what TP needs.** For a backward
+   edge it resolves the tensor index via the edge *destination's* `fwd_uid`, which
+   is precisely the region's input-tensor slot, i.e. the right index into
+   `inp_grads`. So TP reuses EP's resolver unchanged rather than re-deriving the
+   rule. It was a closure inside the EP pass; lifting it to module scope is the only
+   change to existing code, and it is locked by a test that drives it through both
+   passes including the backward branch.
+
+**IR-runtime assumption discovered.** A TP region with **no upstream segment gets
+no backward all-reduce**, correctly — there is no consumer for the input gradient.
+This settles plan uncertainty (4) and constrains the Stage C model: the minimal
+example must keep a replicated segment on *each* side of the TP region, or half the
+conjugate pair is never exercised. Locked by
+`test_shard_tensor_inserts_nothing_without_a_downstream_consumer`.
+
+**Open question.** `shard_tensor` **rejects** composition with `replicate` on the
+same region, where `shard` silently deletes the DP sync comms it finds
+(`_insert_shard_a2a_comm_nodes`, "shard replaces replicate-style grad/param sync
+comms"). Refusing surfaces the limitation; deleting hides it. Which does upstream
+want? Silent deletion is convenient for EP because an expert region genuinely has
+no DP counterpart, but for TP the two directives express contradictory intents about
+the same weights and I would rather the user be told.
+
+**Next experiment.** Stage C — the executor arms and `all_reduce_activation`, then
+the 2-GPU run. Blocked on GPUs: all 7 are held by other users (`haizhonz` on six,
+`shaow` on one), so the code goes in first and the run waits for a free pair.
