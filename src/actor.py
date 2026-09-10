@@ -2,6 +2,7 @@ import ray
 import torch
 import os
 import re
+import time
 from typing import Any
 import gc
 from torch.autograd.graph import set_warn_on_accumulate_grad_stream_mismatch
@@ -170,6 +171,17 @@ class PiperActor:
         # default, which keeps the per-rank-seeded noise behaviour.
         self.model_param_overrides: dict = {}
         self.matched_param_overrides: set = set()
+
+        # (iter, enter_ns, exit_ns) per step, on the *wall* clock so that samples
+        # from actors in different driver processes are comparable. Rank arrival
+        # skew has so far only been inferred from inflated NCCL kernel durations
+        # (notes/log.md F11, F16); this measures it.
+        self.step_timestamps: list = []
+
+        # Loss function, pushed once. It used to travel as an argument on every
+        # run_dag call, which meant cloudpickling a closure per step per actor,
+        # serialized on the driver -- a per-step cost that grows with rank count.
+        self.loss_fn = None
 
     def get_and_reset_peak_memory_stats(self) -> tuple:
         """Return (global_rank, max_memory_allocated_bytes) and reset peak stats."""
@@ -770,10 +782,22 @@ class PiperActor:
             training_dag.nodes[uid] for uid in _serial_topological_order(training_dag)
         ]
 
+    def load_loss_fn(self, loss_fn) -> None:
+        """Install the loss function so steps need not carry it."""
+        self.loss_fn = loss_fn
+
+    def get_step_timestamps(self) -> tuple:
+        """Return (global_rank, [(iter, enter_ns, exit_ns), ...])."""
+        return self.runtime.global_rank, list(self.step_timestamps)
+
+    def reset_step_timestamps(self) -> None:
+        self.step_timestamps = []
+
     def run_dag(self, loss_fn=None):
         # Mark the entire iteration boundary for the NVTX timeline.
         iter_idx = getattr(self, "_iter_counter", 0)
         self._iter_counter = iter_idx + 1
+        enter_ns = time.time_ns()
         self._nvtx_push(f"iter_{iter_idx}_rank_{self.runtime.global_rank}")
         result = self.dag_executor.run(
             self.dag,
@@ -781,7 +805,8 @@ class PiperActor:
             self.inputs,
             self.labels,
             self.loss,
-            loss_fn=loss_fn,
+            loss_fn=loss_fn if loss_fn is not None else self.loss_fn,
         )
         self._nvtx_pop()
+        self.step_timestamps.append((iter_idx, enter_ns, time.time_ns()))
         return result

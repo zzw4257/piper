@@ -112,6 +112,7 @@ def main(args, pg):
         piper_exec_dag(loss_fn, log_stats=True)
 
     ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
+    ray.get([actor.reset_step_timestamps.remote() for actor in actors.values()])
     logger.info(f"Running {args.iters} timed iterations")
     iter_times, losses = [], []
     for _ in range(args.iters):
@@ -123,7 +124,16 @@ def main(args, pg):
     peak_memory_stats = ray.get(
         [actor.get_and_reset_peak_memory_stats.remote() for actor in actors.values()]
     )
+    step_timestamps = ray.get(
+        [actor.get_step_timestamps.remote() for actor in actors.values()]
+    )
     metrics = _raw_metrics(args, iter_times, losses, peak_memory_stats)
+    # Wall-clock, so samples from other driver processes line up: TP peers live
+    # in different processes (one per dp_rank), so skew can only be seen by
+    # joining these across the per-dp_rank artifacts.
+    metrics["step_timestamps"] = {
+        str(rank): [list(t) for t in ts] for rank, ts in step_timestamps
+    }
     # The harness CSV drops per-iteration losses, and Ray can truncate driver
     # logs at exit, so write our own artifact next to the generated schedule.
     artifact = os.path.join(
