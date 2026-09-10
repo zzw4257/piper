@@ -1667,6 +1667,49 @@ def _apply_order_directive(
                 _add_temporal_order_edge(dag, u, v, directive_idx=directive_idx)
 
 
+_BOUNDARY_COMM_OPS = ("shard", "shard_tensor")
+
+
+def _reject_overlapping_boundary_comm_directives(
+    dag: TrainingDAG,
+    directives: list[Any],
+) -> None:
+    """Refuse two boundary-comm directives claiming the same compute node.
+
+    `shard` and `shard_tensor` both rewrite a matched node's activation edges to
+    route through a comm node. Whichever runs second then finds the edge already
+    pointing at a comm node rather than at compute, and skips it -- silently. The
+    outcome depends on the order the directives appear in the JSON:
+
+        shard then shard_tensor  ->  4 A2A_COMM, 0 TP_COMM  (TP dropped entirely)
+        shard_tensor then shard  ->  2 A2A_COMM, 2 TP_COMM  (both incomplete)
+
+    Neither is what the schedule asked for, and the first is wrong arithmetic with
+    no diagnostic. Checked once, before either pass runs, so it does not depend on
+    directive order itself.
+    """
+    claimed: dict[str, tuple[int, str]] = {}
+    for idx, raw in enumerate(directives):
+        if not isinstance(raw, dict) or raw.get("op") not in _BOUNDARY_COMM_OPS:
+            continue
+        op, filters, *_rest = _normalize_filter_devices_directive(raw)
+        for uid, node in dag.nodes.items():
+            if node.node_kind != "COMPUTE":
+                continue
+            if not any(_match_filter(node.tag, flt) for flt in filters):
+                continue
+            prev = claimed.get(uid)
+            if prev is not None:
+                raise ValueError(
+                    f"directives[{prev[0]}] ({prev[1]}) and directives[{idx}] ({op}) "
+                    f"both match compute node {uid} with tag {node.tag}. Both rewrite "
+                    f"the node's activation edges, so the one applied second is "
+                    f"silently dropped and the result depends on directive order. "
+                    f"Narrow one of the filters so each region is claimed once."
+                )
+            claimed[uid] = (idx, op)
+
+
 def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] | None) -> None:
     if not directives:
         return
@@ -1714,6 +1757,7 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
         place_stream = None
     _replicate_update_nodes_by_device(training_dag)
     _insert_send_recv_comm_nodes(training_dag, comm_stream=place_stream)
+    _reject_overlapping_boundary_comm_directives(training_dag, directives)
 
     for i, raw in enumerate(directives):
         if isinstance(raw, dict) and raw.get("op") in ("place", "split", "order"):

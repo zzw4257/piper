@@ -37,6 +37,7 @@ Distinguish throughout:
 | **F17** | F16's ranking was contention: pp=2 is 27% *faster* than one GPU | *retracts F16; its ~300us guess retracted by F18* |
 | **F18** | At constant work, more microbatches make TP 2.6x worse; TP and PP want opposite microbatch counts | *distinguishes F12; retracts F17's guess* |
 | **F19** | CUDA graphs capture a TP step fine and buy 2%: the cost is NCCL latency, not dispatch | *retracts F18's hypothesis* |
+| **F20** | EP+TP on one region silently drops one of them, order-dependent; the directive layer has no model of composition | |
 
 ---
 
@@ -1011,3 +1012,55 @@ is `number of collectives x NCCL latency`.
 the gap is a small-message effect, which is exactly what fusion would exploit,
 and it sets the condition under which fusion becomes worth building: enough
 microbatches that per-collective payload falls into the latency-bound regime.
+
+---
+
+## 2026-09-20 — F20: two boundary-comm directives on one region silently drop one of them
+
+**Tested.** `shard` (EP) and `shard_tensor` (TP) applied to a region matched by
+both, on CPU.
+
+| directive order | result |
+|---|---|
+| `shard` then `shard_tensor` | 4 `A2A_COMM`, **0 `TP_COMM`** — TP dropped entirely |
+| `shard_tensor` then `shard` | 2 `A2A_COMM`, 2 `TP_COMM` — both incomplete |
+
+Both passes rewrite a matched node's activation edges to route through their own
+comm node. Whichever runs second finds `dst` is a comm node rather than compute,
+fails its own boundary predicate, and inserts nothing — silently. **The semantics
+depend on the order the directives appear in the JSON, and one order is simply
+wrong arithmetic with no diagnostic.**
+
+My own gap: `shard_tensor` already refuses to compose with `replicate` (F6), and
+I never checked `shard`. Fixed with one check that runs *before* either pass, so
+it cannot itself be order-dependent, plus a test for both orders and one that
+disjoint regions still compose.
+
+### Why this is more interesting than the bug
+
+This is the second silent, order-dependent failure in the directive layer, after
+F14 (a `pp>1` schedule without `order` fails with a message about device sets).
+Both have the same shape: **the directive language has no model of how directives
+interact.** Each pass validates its own preconditions against the DAG, and
+nothing validates the composition. The failure mode is silence, because a pass
+that finds no matching edge does nothing rather than complaining.
+
+That is a real risk for a system whose thesis is user-programmable scheduling —
+and the checks that would catch it are static properties of the lowered DAG:
+
+- every activation edge crossing a stream boundary has a consumer arm that waits
+  on the producer's event (I hit the functional version of this in Stage C: the
+  consumer arms match on exact `task_type`, so an unregistered comm kind is
+  skipped and the node silently reads the wrong inputs);
+- every compute region is claimed by at most one boundary-comm directive (this
+  entry);
+- every non-last pipeline stage's forward reaches its own backward (F14);
+- no buffer is released before its last reader.
+
+**Open question / next direction.** Is a static checker over the lowered
+`TrainingDAG` worth building? It needs no GPU, which matters given this host, and
+it targets exactly the class of bug this project kept finding by accident. The
+first three items above are each a few lines over `dag.nodes`/`dag.edges`; the
+interesting one is the first, because it requires a machine-readable statement of
+which `task_type`s each executor arm waits on — i.e. the executor's
+happens-before contract would have to be declared rather than implied.
