@@ -133,7 +133,10 @@ is unchecked, so the failure mode is wrong arithmetic with no diagnostic.
    iterations while compute stays within 1.1%.
 2. **Owning your GPUs is not enough.** SMs are per-GPU and can be held
    exclusively; NVLink/NVSwitch is machine-wide. Compute was rock-steady on two
-   0%-util cards while the collectives were squeezed anyway.
+   0%-util cards while the collectives were squeezed anyway. Check a window
+   before trusting it: **`comm median / comm min`** was 1.55 in a usable window
+   and 4.46 in one where the median could not separate a 32-collective schedule
+   from a 4-collective one (F36).
 3. **The first collective of a step is not a measurement** — it absorbs rank
    arrival skew. rank 0 showed 2858–30485 µs where rank 1 showed ~94 µs for the
    identical payload. Use a later collective.

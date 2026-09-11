@@ -53,6 +53,7 @@ Distinguish throughout:
 | **F33** | The fixed cost is synchronization *between* collectives, not NCCL per-call; fusion is 1.1-2.4x and competes with 1F1B, not with nothing | *corrects F32's mechanism* |
 | **F34** | `fuse_collectives` shipped: bit-identical, 12-19% where comm matters, and it does *not* cost overlap | *corrects my own hypothesis* |
 | **F35** | `GPipe+fusion` ties with `1F1B`; fusion's home is single-stage TP, where `order` buys nothing | *answers F33* |
+| **F36** | Idle cards are not a quiet machine; `comm median/min` tells you how contaminated a window is | *makes F11 checkable* |
 
 ---
 
@@ -1787,3 +1788,51 @@ sharply.
 
 That is a coherent recommendation and it fell out of two directives interacting,
 which is the thing Piper's scheduling language is for.
+
+---
+
+## 2026-09-11 — F36: "three cards with no processes" is not a quiet machine, and `median/min` on communication says how contaminated a window is
+
+**Tested.** Repeated F34's fusion measurement on GPUs 1 and 2 at a moment when
+they, and GPU 6, held **no processes at all** — the cleanest the host had been in
+this project. Nine interleaved repetitions per arm.
+
+| arm | n | min | p25 | median | max | comm-min | comm-med |
+|---|---|---|---|---|---|---|---|
+| unfused | 9 | 14.60 | 18.54 | 21.69 | 25.13 | 4750 us | 7379 us |
+| fused | 9 | 13.40 | 17.44 | 19.22 | 20.90 | **1654** | **7351** |
+
+**This window was worse than F34's**, not better: unfused median 21.69 ms against
+F34's 19.95 ms. During the run the other four cards all went to ~100%.
+
+### The diagnostic
+
+Look at communication. The **minimum** separates the arms by 2.87x, consistent
+with F34's 2.35x. The **median** does not separate them at all — 7379 against
+7351 us, a 0.4% difference between a schedule with 32 collectives and one with 4.
+A median that cannot tell those apart is not measuring the schedule.
+
+That gives a cheap, per-window contamination check: **`comm median / comm min`**.
+
+| arm | median/min | reading |
+|---|---|---|
+| unfused | 1.55 | tolerable |
+| fused | **4.46** | the window is dominated by other traffic |
+
+When that ratio is large, only the minimum carries signal, and any statistic that
+averages is reporting the machine's other users. This is F11's rule ("report the
+minimum") turned into something checkable *before* trusting a number, rather than
+a principle to remember.
+
+### Why owning the SMs did not help
+
+F11 established it and this is the concrete instance: SMs are per-GPU and were
+exclusively mine; NVLink/NVSwitch is machine-wide and four other cards were
+saturating it. For a TP measurement the interconnect is the contended resource,
+so "no processes on my cards" is the wrong thing to wait for. The waiter in
+`experiments/` polls exactly that wrong condition — it is the best signal
+available from `nvidia-smi` without inspecting other users' traffic, and its
+limitation is now recorded rather than implied.
+
+**F34's numbers stand**, measured in a better window. Substituting this window's
+would be choosing the data that suits the conclusion; both are in the log.
