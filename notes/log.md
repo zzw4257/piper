@@ -40,6 +40,7 @@ Distinguish throughout:
 | **F20** | EP+TP on one region silently drops one of them, order-dependent; the directive layer has no model of composition | |
 | **F21** | CP's correctness fits Piper; ring attention's multi-tensor boundary and intra-region overlap do not | |
 | **F22** | Executor happens-before contract made explicit; a general checker deliberately not built | |
+| **F23** | A two-output TP region is silently half-reduced (now rejected); split backward composes fine | *same root as F21* |
 
 ---
 
@@ -1163,3 +1164,48 @@ flow. That is a refactor of `DagExecutor.run` — turning each arm's predecessor
 lookup into a table the arm consumes — and it would make the happens-before
 relation of a schedule machine-checkable against the DAG. Worth doing if the set
 of comm kinds grows (CP would add at least one, F21), not before.
+
+---
+
+## 2026-09-20 — F23: a TP region with two outputs is silently half-reduced; split backward is fine
+
+Two combinations `shard_tensor` had never been run against, both checked on CPU.
+
+**Split backward composes correctly.** Zero-bubble and DualPipeV schedules split
+`BWD` into `BWD_I` and `BWD_W`, and that happens *before* `shard_tensor` in
+`apply_schedule_directives`, so the TP pass sees the split nodes. It does the
+right thing: 4 `TP_COMM` for 2 microbatches, the backward ones anchored on
+`BWD_I` (which carries the activation gradient) and none on `BWD_W` (weight
+gradients only, shard-local under TP, no collective needed). Locked by a test;
+no change required.
+
+**A multi-output TP region is a real hole.** Traced a region emitting two tensors
+— a row-parallel partial sum and a replicated side output:
+
+```
+seg1 tag={'PP': 0, 'TP': 0}  n_outputs=2  boundary_tensor_idx=0
+```
+
+`a2a_boundary_after` records **one** index, chosen by
+`_select_boundary_tensor_idx`'s heuristic (floating point +2, requires_grad +1,
+highest score wins). So exactly one of the two gets all-reduced, and which one
+depends on the score. Either the replicated tensor is summed across ranks or the
+partial sum is never reduced — wrong numerics, no diagnostic, and the choice can
+change when the model does.
+
+Refused rather than guessed, following F20's precedent: `shard_tensor` now rejects
+a matched region whose boundary carries more than one tensor, and says to split
+the region so the tensor needing the collective leaves alone.
+
+**This is the same root as F21.** The boundary abstraction assumes *one
+interesting tensor per region boundary*. That held for EP (the token tensor) and
+for TP as I built it (the region output). It fails for a TP region with a side
+output, and it fails for CP, which must move K and V every ring step. Three
+directives now depend on a single-tensor assumption that nothing states.
+
+**Open question.** Making `tensor_idx` a list is mechanical in `fx.py`, but every
+insertion pass reads it as a scalar and each has a different notion of what to do
+with several — EP would all-to-all each, TP would need to know *which* are partial
+sums, CP would pair them. So the list is not the hard part; the hard part is that
+"which tensors need a collective" is model knowledge the IR cannot represent
+(F1 again).
