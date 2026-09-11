@@ -23,6 +23,8 @@ Verified:
 | TP x PP=2 on 4 GPUs under a generated 1F1B order | ~1e-6 vs a 1-GPU 2-stage baseline (`--pp`) |
 | the IR rewrite is right | 12 CPU tests; 39 pass total, CI-safe (`-m "not gpu"`) |
 | dropping the collectives breaks all of the above | negative control in each check |
+| TP composes with PP, ZeRO-3, and split backward | TP x PP verified on 4 GPUs; ZeRO-3 on a separate region lowers cleanly; zero-bubble's BWD_I/BWD_W split anchors the backward collective correctly (F15, F23, F25) |
+| **EP is unchanged by my refactor** | the shipped Qwen MoE example lowers byte-identically against a worktree of `upstream/main` (F28) |
 
 `src/` diff is ~410 lines across 12 files. TP needed **no new node kind
 mechanics, no new process group, and no launcher change**: it reuses the
@@ -75,6 +77,7 @@ user-programmable scheduling.
 | every comm kind feeding COMPUTE is awaited by the consumer | `DagExecutor.run` matches predecessors on exact `task_type`; an unregistered kind is skipped and the consumer reads the wrong inputs. `TP_COMM` was in that state mid-project (F22) | tested |
 | `pp>1` needs an `order` directive | the fwd→bwd bridge exists only at the globally last forward, so the P2P cut disconnects every other stage. The error named device sets, not the cause (F14) | diagnosed |
 | `devices` is a symbolic group, not GPU ids | `devices=[41, 99]` compiles on a 7-GPU box; only the count and set-equality are ever read (F24) | documented |
+| a sharding group needs at least two devices | `devices=[0]` was accepted and would call `dist.all_reduce` on an uninitialized group, failing deep in the executor. Same hole upstream for `shard` (F29) | rejected |
 
 The common mechanism: each pass validates its own preconditions against the DAG,
 and a pass that matches nothing does nothing rather than complaining. Composition
