@@ -50,6 +50,7 @@ Distinguish throughout:
 | **F30** | Both shipped examples still run, on real inputs for the first time | *closes the regression question* |
 | **F31** | TP=2→4 is 30% faster; compute matches the roofline. ~~bandwidth-bound at 67MB~~ | *bandwidth reading retracted by F32* |
 | **F32** | A TP all-reduce costs ~250us almost regardless of payload (32x payload -> 2.3x time); fusion is now worth building | *retracts F31's reading; revises F19* |
+| **F33** | The fixed cost is synchronization *between* collectives, not NCCL per-call; fusion is 1.1-2.4x and competes with 1F1B, not with nothing | *corrects F32's mechanism* |
 
 ---
 
@@ -1591,3 +1592,70 @@ before writing the pass rather than after.
 non-monotone, and this host is shared. The robust claim is the one that survives
 the noise: **time does not scale with payload over a 32x range.** A tighter
 constant would need an idle machine.
+
+---
+
+## 2026-09-11 — F33: fusion helps, but F32's mechanism was wrong — the fixed cost is *synchronization between* collectives, not NCCL per-call cost
+
+**Tested.** `experiments/probe_collective_fusion.py`, `torchrun
+--nproc_per_node=2` on two idle cards. Outside Piper on purpose (no Ray, no DAG,
+no dispatch loop), same method as F19's CUDA-graph probe.
+
+| K | payload/coll | separate | fused | fused+copy | speedup | bound |
+|---|---|---|---|---|---|---|
+| 4 | 16 MB | 228 us | 162 | 207 | 1.10x | 186 |
+| 8 | 16 MB | 450 | 292 | 387 | 1.16x | 373 |
+| 16 | 8 MB | 713 | 291 | 406 | 1.75x | 373 |
+| 8 | 4 MB | 312 | 95 | 128 | 2.43x | 93 |
+
+### The number that matters is in the `separate` column
+
+F32 measured an *isolated* TP all-reduce in Piper's DAG at **220–320 us**
+regardless of payload, and inferred a per-collective fixed cost. But four
+back-to-back all-reduces of 16 MB here total **228 us — 57 us each**, four to five
+times cheaper than the same collective measured inside the DAG.
+
+**So the fixed cost is not NCCL's.** Back-to-back collectives do not pay it. What
+differs inside Piper is that the collectives have *compute between them*, and the
+two ranks' compute does not finish in lockstep — so every collective re-pays an
+arrival difference, which is exactly what F11 measured at step granularity and
+what F16 wrongly generalized into a per-step constant. It is per-*collective*,
+and it exists because of what sits between them.
+
+Fifth correction to this model: F16→F17, F17→F19, F18→F19, F31→F32, F32→here.
+
+### Fusion helps, less than F32 predicted, and the probe is a lower bound
+
+F32 predicted `(K-1) x ~250 us`. Measured is **1.10x–2.43x**, growing with K and
+with *smaller* payloads — the shape a fixed-cost model predicts, but with a much
+smaller constant, because this probe removed the very thing that creates the cost.
+
+That cuts both ways: **the probe underestimates fusion's value in Piper.** In the
+real DAG each fused collective also removes a re-synchronization point, which the
+probe cannot show. The honest statement is that fusion is worth between 1.1x on
+the collectives alone and something larger in situ, and only a pass in Piper
+would measure the difference.
+
+Two practical numbers for whoever writes it:
+
+- **the copies are not free**: `cat` + scatter-back costs 45 us at K=4 and 115 us
+  at K=16, i.e. 20–30% of the fused collective. A real pass should reduce into a
+  pre-allocated flat buffer that the compute writes into directly, not cat after
+  the fact.
+- **360 GB/s (F11) is an underestimate**: fused times come in *below* the bound
+  computed from it (162 us against 186 us at K=4), so F11's figure was depressed
+  by contention. Any bandwidth-derived bound in this log is conservative.
+
+### And fusion conflicts with `order`
+
+Fusing microbatches' collectives forces all of them to reach the region before
+any collective runs. That is compatible with GPipe and **incompatible with
+1F1B**, which interleaves microbatch *i*'s backward with *i+1*'s forward — and
+F26 measured 1F1B beating GPipe by 16%. So fusion's real competitor is not "no
+fusion", it is 1F1B, and the comparison to run is `GPipe + fusion` against
+`1F1B`, not `fusion` against `no fusion`.
+
+**Next experiment.** That comparison, which needs the pass. With F26's 13.85 ms
+for GPipe and 11.60 ms for 1F1B, fusion has to find ~2.3 ms in GPipe's 16
+collectives to break even — plausible at 1.1x–2.4x on ~4 ms of collectives, but
+not obviously so. Worth writing the pass to find out; not worth assuming.
