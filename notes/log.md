@@ -51,6 +51,7 @@ Distinguish throughout:
 | **F31** | TP=2→4 is 30% faster; compute matches the roofline. ~~bandwidth-bound at 67MB~~ | *bandwidth reading retracted by F32* |
 | **F32** | A TP all-reduce costs ~250us almost regardless of payload (32x payload -> 2.3x time); fusion is now worth building | *retracts F31's reading; revises F19* |
 | **F33** | The fixed cost is synchronization *between* collectives, not NCCL per-call; fusion is 1.1-2.4x and competes with 1F1B, not with nothing | *corrects F32's mechanism* |
+| **F34** | `fuse_collectives` shipped: bit-identical, 12-19% where comm matters, and it does *not* cost overlap | *corrects my own hypothesis* |
 
 ---
 
@@ -1659,3 +1660,75 @@ fusion", it is 1F1B, and the comparison to run is `GPipe + fusion` against
 for GPipe and 11.60 ms for 1F1B, fusion has to find ~2.3 ms in GPipe's 16
 collectives to break even — plausible at 1.1x–2.4x on ~4 ms of collectives, but
 not obviously so. Worth writing the pass to find out; not worth assuming.
+
+---
+
+## 2026-09-11 — F34: `fuse_collectives` works, is worth 12–19% where communication matters, and does *not* cost overlap
+
+**Design, as specified:** an independent directive, and **`order` wins**.
+
+```json
+{ "op": "fuse_collectives", "filter": {"TP": "*"} }
+```
+
+**Implementation note.** The nodes are *not* merged into one. Each microbatch's
+`TP_COMM` keeps its own successors, because they consume different microbatches'
+activations; merging them would hand every successor the same buffer. Instead one
+member of each group is the **leader** that issues the combined collective, and
+the others read their slice of the result. The DAG keeps its shape; only the
+runtime behaviour changes.
+
+**`order` priority** is enforced by running the pass *after* `order` and refusing
+any group whose fusion edges would contradict an existing path. 1F1B interleaves
+microbatch *i*'s backward with *i+2*'s forward, which contradicts making every
+member's producer complete before any member runs — so under 1F1B **nothing
+fuses**, verified by test rather than asserted.
+
+### Correctness
+
+Fused and unfused produce **bit-identical losses** across three optimizer steps,
+both ranks: `5.467978 / 2.951428 / 1.893221`.
+
+### Gain, and where it comes from
+
+| config | comm share | events/iter | comm (min) | iter (min) | iter (median) |
+|---|---|---|---|---|---|
+| mb=4, batch 2048 (16 MB/coll) | ~14% | 16 → 4 | 1125 → 874 us (1.29x) | 8.06 → 7.53 | — |
+| mb=8, batch 1024 (8 MB/coll) | ~75% | 32 → 4 | **790 → 336 us (2.35x)** | **13.93 → 12.28** | **19.95 → 16.15** |
+
+At mb=8, seven interleaved repetitions each: **12% faster at the minimum, 19% at
+the median**, with communication 2.35x cheaper. At mb=4 the collective gain is
+real but the step gain is inside the noise, because communication is only ~14% of
+the step there. Both match F33's prediction that fusion pays more as
+per-collective payload shrinks.
+
+### My overlap hypothesis was wrong
+
+I expected fusion to cost overlap: it forces every microbatch's producer to
+finish before any collective runs, which should undo F12's microbatch-level
+hiding. Measured concurrency (kernel-sum / wall-span) says otherwise — **0.47x
+unfused against 0.53x fused**, i.e. slightly *better*.
+
+Both are well below 1.0, and that is the explanation: at batch 1024 the GPU
+timeline is ~50% idle (F12 found the same at this size, and attributed it to
+per-node dispatch). There was no overlap to lose, because communication was not
+being hidden behind compute in the first place — it was waiting, as F33's
+arrival-difference mechanism says. Removing synchronization points helps and
+costs nothing here.
+
+**The hypothesis is not refuted in general**, only at this size. Where the GPU is
+saturated and F12's 1.06x concurrency is real (batch 8192, mb=4), fusion should
+trade against genuine overlap, and that configuration has ~14% communication
+share where the gain is smallest. So the honest scope is: **fusion pays when
+communication share is high, which is exactly when the GPU is least saturated and
+overlap is least available.** The two effects do not compete as directly as I
+assumed.
+
+Sixth correction in this log (F16→F17, F17→F19, F18→F19, F31→F32, F32→F33, and
+this one).
+
+### Still open
+
+`GPipe + fusion` against `1F1B`, which F33 named as the real comparison, needs
+four GPUs and the pipeline schedules; fusion cannot combine with 1F1B by
+construction, so that is the choice a user actually faces.

@@ -23,6 +23,7 @@ Verified:
 | TP x PP=2 on 4 GPUs under a generated 1F1B order | ~1e-6 vs a 1-GPU 2-stage baseline (`--pp`) |
 | the IR rewrite is right | 12 CPU tests; 39 pass total, CI-safe (`-m "not gpu"`) |
 | dropping the collectives breaks all of the above | negative control in each check |
+| `fuse_collectives` merges a group's collectives into one call | bit-identical losses; 12-19% faster where communication is ~75% of the step; `order` takes priority, so 1F1B blocks it (F34) |
 | TP composes with PP, ZeRO-3, and split backward | TP x PP verified on 4 GPUs; ZeRO-3 on a separate region lowers cleanly; zero-bubble's BWD_I/BWD_W split anchors the backward collective correctly (F15, F23, F25) |
 | **EP is unchanged by my refactor** | the shipped Qwen MoE example lowers byte-identically against a worktree of `upstream/main` (F28) |
 | both shipped examples still run | Qwen MoE (EP+ZeRO+PP x DP) and LLaMA (PP x DP) on 4 GPUs, the first run on real inputs since the zero-input fix (F30) |
