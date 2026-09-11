@@ -52,6 +52,7 @@ Distinguish throughout:
 | **F32** | A TP all-reduce costs ~250us almost regardless of payload (32x payload -> 2.3x time); fusion is now worth building | *retracts F31's reading; revises F19* |
 | **F33** | The fixed cost is synchronization *between* collectives, not NCCL per-call; fusion is 1.1-2.4x and competes with 1F1B, not with nothing | *corrects F32's mechanism* |
 | **F34** | `fuse_collectives` shipped: bit-identical, 12-19% where comm matters, and it does *not* cost overlap | *corrects my own hypothesis* |
+| **F35** | `GPipe+fusion` ties with `1F1B`; fusion's home is single-stage TP, where `order` buys nothing | *answers F33* |
 
 ---
 
@@ -1732,3 +1733,57 @@ this one).
 `GPipe + fusion` against `1F1B`, which F33 named as the real comparison, needs
 four GPUs and the pipeline schedules; fusion cannot combine with 1F1B by
 construction, so that is the choice a user actually faces.
+
+---
+
+## 2026-09-11 — F35: `GPipe + fusion` and `1F1B` are indistinguishable. Fusion helps GPipe; it does not decide the schedule
+
+**The question**, from F33: fusion cannot combine with 1F1B by construction
+(`order` wins, F34), so a user picks between them. Does `GPipe + fusion` beat
+`1F1B`?
+
+**Criterion declared before the data.** Nine interleaved repetitions per arm, TP x
+PP=2 on four idle cards, `dim 4096, hidden 16384, batch 2048/microbatch, stages 2,
+mb 4, bf16`. If the ranges overlap, the verdict is *indistinguishable* — not
+"pick the better minimum".
+
+| arm | n | min | p25 | median | max |
+|---|---|---|---|---|---|
+| 1F1B | 9 | 10.46 | 13.15 | 13.75 | 14.82 |
+| GPipe | 9 | 13.07 | 13.34 | 13.76 | 15.06 |
+| GPipe + fusion | 9 | 11.25 | **12.82** | **13.07** | 14.57 |
+
+**Verdict: indistinguishable.** `1F1B` spans 10.46–14.82 and `GPipe + fusion`
+spans 11.25–14.57; the ranges overlap almost entirely.
+
+**What *is* visible:** fusion improves GPipe on all three order statistics —
+min 13.07→11.25, p25 13.34→12.82, median 13.76→13.07, about 5%. That is
+consistent with F34's mechanism and with fusion's 2.35x on the collectives
+themselves; it is simply not enough to separate the schedules.
+
+### The process matters more than the number here
+
+The first three repetitions gave **GPipe faster than 1F1B**, the opposite of
+F26's 16% the other way. Stopping there and reporting it would have been
+reporting the window, not the effect. Running to nine and declaring the criterion
+first is what turns that into a real answer, and the answer is a tie.
+
+F26's result stands in its own window — there the ranges genuinely did not
+overlap (1F1B 11.60–12.34 against GPipe 13.85–14.95). Both are true: the
+schedules differ by more than noise on a quiet machine and by less than noise on
+a busy one, which is F27's "timings compare only within one window" stated
+sharply.
+
+### What this settles
+
+- **Fusion is worth having** — 2.35x on collectives (F34), 12–19% end to end
+  where communication dominates (F34), ~5% on GPipe here.
+- **Fusion is not a reason to abandon 1F1B.** Its cost is being locked out of
+  interleaved schedules, and it does not buy back enough to make that worthwhile
+  at this size.
+- **The useful configuration is therefore `1F1B` without fusion, or fusion
+  wherever `order` is not filling a bubble** — i.e. single-stage TP, where F34
+  measured the 12–19%, and where F13 already showed `order` buys nothing.
+
+That is a coherent recommendation and it fell out of two directives interacting,
+which is the thing Piper's scheduling language is for.
