@@ -1214,6 +1214,17 @@ def _insert_tp_all_reduce_comm_nodes(
     region is rejected rather than silently resolved.
     """
     expected = sorted(int(d) for d in devices)
+    if len(set(expected)) < 2:
+        # dp_degree and pp_degree are both 1 for a single-device group, so
+        # _join_process_groups never calls init_process_group and ep_group stays
+        # None. The all-reduce would then run on an uninitialized default group
+        # and fail deep in the executor with a torch.distributed error that says
+        # nothing about the schedule.
+        raise ValueError(
+            f"shard_tensor needs at least two distinct devices, got {devices}. "
+            f"A single-device tensor-parallel group has nothing to all-reduce; "
+            f"remove the directive to run the region unsharded."
+        )
     tp_idx = sum(1 for n in dag.nodes.values() if n.node_kind == "TP_COMM")
 
     matched = {

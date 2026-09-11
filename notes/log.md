@@ -46,6 +46,7 @@ Distinguish throughout:
 | **F26** | With a pipeline bubble, `order` pays: 1F1B beats GPipe by 16% under TP x PP | *closes F13* |
 | **F27** | zerobubble does not beat 1F1B at pp=2/mb=4; F26's win is interleaving F and B at all | *scopes F26* |
 | **F28** | EP's lowering is byte-identical to upstream after my refactor, on the shipped Qwen MoE example | |
+| **F29** | A single-device `shard_tensor` was accepted and would crash in the executor; same hole upstream for `shard` | |
 
 ---
 
@@ -1402,3 +1403,30 @@ boundary machinery.
 been run on GPUs here, so if `A2A_COMM` were mis-executed the comparison would
 not see it — but that code I did not touch. The refactor's blast radius is the
 lowering, and the lowering is unchanged.
+
+---
+
+## 2026-09-20 — F29: a single-device `shard_tensor` was accepted and would crash in the executor
+
+`shard_tensor` with `devices: [0]` — the obvious thing to write when debugging on
+one GPU — was accepted and inserted two `TP_COMM` nodes. At runtime a one-device
+group leaves `dp_degree` and `pp_degree` both at 1, so
+`actor.py:_join_process_groups` skips `init_process_group` entirely and
+`runtime.ep_group` stays `None`. `all_reduce_activation` would then call
+`dist.all_reduce` on an uninitialized default group and fail deep inside the
+dispatch loop, with a `torch.distributed` message that says nothing about the
+schedule.
+
+Rejected at compile time now, pointing at the fix (remove the directive to run
+the region unsharded). Repeated ids (`[0, 0]`) are rejected too, since that is
+two entries but one device.
+
+**The same hole exists upstream for `shard`.** `shard` with `devices: [0]` would
+insert `A2A_COMM` nodes and hit the identical `ep_group is None` path. Not patched
+here — it is upstream's directive and outside what a TP branch should touch — but
+it is the same one-line check and worth mentioning alongside the `shard_tensor`
+work.
+
+This is the fourth silent-failure-made-loud in this branch (F14, F20, F23, F29),
+all the same shape: a precondition the code depends on, checked nowhere, failing
+somewhere that does not name it.
