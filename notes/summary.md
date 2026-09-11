@@ -100,6 +100,12 @@ is unchecked, so the failure mode is wrong arithmetic with no diagnostic.
   `order`'s value is proportional to the bubble it can fill, and TP alone creates
   none. This is the only measurement where TP and programmable scheduling produce
   value together. (F26)
+- **TP=2 → TP=4 is 30% faster** (4.85 vs 6.92 ms), with compute matching the
+  roofline to 1.44x against a predicted 1.50x. Collectives are **bandwidth-bound
+  at 67 MB payload** (2.9x above the bound, growing 1.69x against ring's predicted
+  1.5x) and **latency-bound at 4.2 MB** (9x above it) — which is the condition
+  under which collective fusion would pay, and the reason it would not pay here.
+  (F31, answering F19)
 - **At constant total work, more microbatches make TP 2.6x worse.** So TP wants
   few microbatches while PP wants many — opposing preferences on one knob, and the
   first genuine scheduling question here that the IR does not already answer. (F18)
