@@ -38,6 +38,7 @@ Distinguish throughout:
 | **F18** | At constant work, more microbatches make TP 2.6x worse; TP and PP want opposite microbatch counts | *distinguishes F12; retracts F17's guess* |
 | **F19** | CUDA graphs capture a TP step fine and buy 2%: the cost is NCCL latency, not dispatch | *retracts F18's hypothesis* |
 | **F20** | EP+TP on one region silently drops one of them, order-dependent; the directive layer has no model of composition | |
+| **F21** | CP's correctness fits Piper; ring attention's multi-tensor boundary and intra-region overlap do not | |
 
 ---
 
@@ -1064,3 +1065,58 @@ first three items above are each a few lines over `dag.nodes`/`dag.edges`; the
 interesting one is the first, because it requires a machine-readable statement of
 which `task_type`s each executor arm waits on — i.e. the executor's
 happens-before contract would have to be declared rather than implied.
+
+---
+
+## 2026-09-20 — F21: CP's correctness fits Piper; ring attention's two key properties do not
+
+**Tested.** Traced a ring-attention-shaped module (`cp_degree=2`, one
+`annotate("CP")` per ring step) and read the segmentation. CPU only.
+
+```
+3 segments (2 ring steps + output)
+  seg0 tag={'CP': 0}  inputs=3  boundary_after=tensor_idx=3
+  seg1 tag={'CP': 1}  inputs=4  boundary_after=tensor_idx=0
+  seg2 tag={'CP': 2}  inputs=1  boundary_after=None
+```
+
+**Structurally CP does fit.** Writing each ring step as its own annotated region
+puts the K/V exchange on a *region boundary*, which is exactly where Piper can
+insert communication — the same property that let TP in (F6). So the
+boundary-comm machinery `shard_tensor` established is reusable; CP would need a
+new collective kind (an intra-group P2P ring, which is neither `all_reduce` nor
+`all_to_all` nor the existing cross-device-set `SEND`/`RECV`), not a new
+mechanism.
+
+**Two things do not fit, and one of them is architectural.**
+
+1. **A boundary carries exactly one tensor.** `a2a_boundary_after` is
+   `{"tensor_idx": <int>}`, chosen by `_select_boundary_tensor_idx`'s heuristic
+   (floating-point +2, requires_grad +1, take the best). Every existing insertion
+   reads that single index — `_insert_shard_a2a_comm_nodes` does, and so does my
+   `_insert_tp_all_reduce_comm_nodes`. Ring attention must move **K and V**, two
+   tensors, every step. TP needs one (the region output) and EP needs one (the
+   token tensor), so the assumption held until now. **Fixable**: make it a list.
+2. **Communication between regions cannot overlap the region it belongs to.** A
+   boundary comm node sits `seg_i -> comm -> seg_{i+1}`, so it cannot start until
+   `seg_i` finishes. Ring attention's whole point is sending block *i+1* while
+   computing block *i*. In Piper that overlap is only available across
+   *microbatches* (F12), never within a region. **Architectural**: the region is
+   the smallest schedulable unit, so intra-region overlap has no expressible form.
+
+So Piper could run CP correctly and would lose the optimization that motivates
+ring attention. That is a sharper statement of the limit than TP produced: TP was
+*fully* expressible once the collectives were in place (F10, F15), CP is not.
+
+**Also found:** an `order` filter group may not span device sets — its
+`ORDER_DUMMY` would have no single device to sit on, so
+`_validate_order_edge` rejects it. That is why `build_1f1b_schedule` emits one
+`order` directive *per pipeline rank* rather than one global ordering, and why a
+hand-written GPipe order has to be written per stage too.
+
+**Open question for #15.** Is (2) worth changing? Allowing a comm node to be
+scheduled *concurrently with* the region that produces its input would mean the
+region is no longer atomic to the scheduler — a real change to what a
+`TrainingDAG` node means. The cheaper alternative is to accept region-granular
+overlap and write ring steps finely enough that it suffices, which is what the
+probe above does, and to measure whether that recovers most of the benefit.
