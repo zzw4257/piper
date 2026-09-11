@@ -105,10 +105,13 @@ is unchecked, so the failure mode is wrong arithmetic with no diagnostic.
   **almost independent of payload**: sweeping 2 → 64 MB (32x) moves the cost only
   138 → 322 us (2.3x), so it is fixed-cost dominated everywhere tested. Not
   dispatch (CUDA graphs bought 2%, F19) and not bandwidth (this sweep) — what is
-  left is NCCL's per-collective cost and the ranks' arrival difference at each
-  one. **This makes collective fusion worth building**: merging K collectives
-  saves (K-1) x ~250 us at any size, ~3 ms out of a 16 ms step at mb=4.
-  (F31, F32; F32 retracts F31's bandwidth reading)
+  left is the two ranks' **arrival difference at each collective**, caused by the
+  compute between them: four back-to-back all-reduces cost 57 us each against
+  220-320 us for the same collective with compute in between. Fusion measures
+  1.1x-2.4x out of context and is a lower bound in situ, but it forces all
+  microbatches to arrive before any collective runs, so it is **incompatible with
+  1F1B** and must beat it rather than beat nothing.
+  (F31-F33; F32 retracts F31's reading, F33 corrects F32's mechanism)
 - **At constant total work, more microbatches make TP 2.6x worse.** So TP wants
   few microbatches while PP wants many — opposing preferences on one knob, and the
   first genuine scheduling question here that the IR does not already answer. (F18)
