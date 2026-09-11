@@ -61,6 +61,25 @@ device-group SPMD model, the boundary-comm node pattern, and the otherwise-idle
   misread, and it makes two different questions about microbatches look like one.
   (F18)
 
+## Unstated invariants (the pattern worth reporting)
+
+Five findings turned out to be one shape: **the IR has invariants nothing
+declares, and violating them fails silently.** Each is now an explicit check or
+test, but the pattern is the interesting part for a system whose thesis is
+user-programmable scheduling.
+
+| invariant | how it failed | status |
+|---|---|---|
+| one boundary-comm directive per region | `shard`+`shard_tensor` on one region: whichever ran second found the edge already rewritten and inserted nothing. Order in the JSON decided the semantics; one order dropped TP entirely (F20) | rejected |
+| a region boundary carries one interesting tensor | a TP region with a partial sum *and* a replicated side output gets exactly one of them all-reduced, chosen by a scoring heuristic (F23). Same assumption blocks CP, which must move K and V (F21) | rejected |
+| every comm kind feeding COMPUTE is awaited by the consumer | `DagExecutor.run` matches predecessors on exact `task_type`; an unregistered kind is skipped and the consumer reads the wrong inputs. `TP_COMM` was in that state mid-project (F22) | tested |
+| `pp>1` needs an `order` directive | the fwd→bwd bridge exists only at the globally last forward, so the P2P cut disconnects every other stage. The error named device sets, not the cause (F14) | diagnosed |
+| `devices` is a symbolic group, not GPU ids | `devices=[41, 99]` compiles on a 7-GPU box; only the count and set-equality are ever read (F24) | documented |
+
+The common mechanism: each pass validates its own preconditions against the DAG,
+and a pass that matches nothing does nothing rather than complaining. Composition
+is unchecked, so the failure mode is wrong arithmetic with no diagnostic.
+
 ## Performance, and two retractions
 
 - TP communication is **~4–6% of GPU kernel time** at dim 8192 / hidden 32768 /

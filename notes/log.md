@@ -41,6 +41,7 @@ Distinguish throughout:
 | **F21** | CP's correctness fits Piper; ring attention's multi-tensor boundary and intra-region overlap do not | |
 | **F22** | Executor happens-before contract made explicit; a general checker deliberately not built | |
 | **F23** | A two-output TP region is silently half-reduced (now rejected); split backward composes fine | *same root as F21* |
+| **F24** | `devices` is symbolic, not GPU ids: topology-aware placement cannot be expressed | |
 
 ---
 
@@ -1209,3 +1210,48 @@ with several — EP would all-to-all each, TP would need to know *which* are par
 sums, CP would pair them. So the list is not the hard part; the hard part is that
 "which tensors need a collective" is model knowledge the IR cannot represent
 (F1 again).
+
+---
+
+## 2026-09-20 — F24: `devices` is symbolic; topology-aware placement cannot be expressed
+
+**Tested.** A schedule naming GPUs 41 and 99 on a 7-GPU box compiles cleanly:
+
+```
+place  filter={"PP": 0}  devices=[41, 99]
+-> schedule: pp_degree=1 dp_degree=2   rank 0 devices=[(41, 99)]   2 comm nodes
+```
+
+The runtime binds with `cuda:{global_rank % torch.cuda.device_count()}`
+(`actor.py:285`) and nothing anywhere validates a device id against the machine —
+`len(devices)` is the only part ever read (`schedule.py:59`).
+
+So the integers in `devices` carry exactly two pieces of meaning:
+
+1. **how many** there are → `dp_degree`, i.e. the size of the SPMD group;
+2. **whether two `place` directives name the same set** → `pp_degree`, and hence
+   where `_insert_send_recv_comm_nodes` cuts.
+
+The values themselves never reach a GPU. Actual placement comes from
+`CUDA_VISIBLE_DEVICES` and Ray's placement group. The README describes the field
+as "Non-empty list of CUDA device IDs for the placement group", which reads as
+physical and is not.
+
+**Why this matters rather than being a doc nit.** F11 measured that interconnect
+topology dominates TP communication: SMs can be held exclusively but
+NVLink/NVSwitch is machine-wide, and on this host GPUs 0–3 and 4–6 sit on
+different NUMA nodes. "Put this TP group on cards that share a NUMA node" is
+exactly the kind of decision a placement language should express, and it is the
+one decision with a measured effect on TP. Piper's placement language looks like
+it expresses it and does not.
+
+**Two honest fixes, and they point opposite ways.** Either make `devices`
+physical — bind `cuda:{devices[dp_rank]}` instead of `global_rank % count`, which
+gives the language real placement power — or rename the field to something
+symbolic (`group`, `mesh`) and document that topology is the launcher's job. The
+first is a small change with a real behavioural consequence; the second is honest
+about what the IR currently models, which is a device *group*, never a device
+(F1's shape again).
+
+Not changed here: this is upstream's design call, not a bug to patch under a TP
+branch.
