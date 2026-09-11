@@ -113,6 +113,21 @@ def _artifact_dir_for_schedule(schedule_directives_file: str) -> str:
     return str(parent if str(parent) else Path("out"))
 
 
+def _reset_run_state() -> None:
+    """Clear per-run state so a second piper_setup cannot inherit the first's.
+
+    ``installed_loss_fn`` is the subtle one: piper_exec_dag pushes the loss
+    function to the actors once and skips the push while the cached object is
+    identical. A second setup in the same process builds *new* actors, so without
+    this the new actors never receive it and the loss node fails on a None
+    callable.
+    """
+    piper_metadata.training_dag = None
+    piper_metadata.per_pp_training_dags = None
+    piper_metadata.compiled_data_store = None
+    piper_metadata.installed_loss_fn = None
+
+
 def dynamo_param_placeholder_name(param_name: str) -> str:
     """Map a ``named_parameters()`` key to the FX placeholder Dynamo lifts it to.
 
@@ -191,11 +206,7 @@ def piper_setup(
     piper_metadata.schedule_directives_file = schedule_directives_file
     piper_metadata.schedule_info = dict(schedule_info)
 
-    # Reset DAG/compile fields so stale data from a prior run never leaks into
-    # this run if the backend is somehow not re-invoked.
-    piper_metadata.training_dag = None
-    piper_metadata.per_pp_training_dags = None
-    piper_metadata.compiled_data_store = None
+    _reset_run_state()
 
     pp_degree = int(schedule_info["pp_degree"])
 
