@@ -1169,6 +1169,25 @@ def _insert_shard_a2a_comm_nodes(
             dag.add_edge(TrainingDAGEdge(src_uid=comm_uid, dst_uid=e.dst_uid, dep_kind="data", tensor_name=e.tensor_name))
 
 
+def _is_boundary_activation_edge_static(
+    dag: TrainingDAG,
+    e: TrainingDAGEdge,
+    node: TrainingDAGNode,
+    matched: set[str],
+) -> bool:
+    """Does this edge leave `node` for compute outside the matched region?"""
+    if e.dep_kind != "data" or e.src_uid != node.uid or e.dst_uid in matched:
+        return False
+    dst = dag.nodes[e.dst_uid]
+    if dst.node_kind != "COMPUTE":
+        return False
+    if node.compute_subkind == "FWD":
+        return dst.compute_subkind == "FWD"
+    if _is_backward_activation_subkind(node.compute_subkind):
+        return _is_backward_activation_subkind(dst.compute_subkind)
+    return False
+
+
 def _insert_tp_all_reduce_comm_nodes(
     dag: TrainingDAG,
     filters: list[dict[str, Any]],
@@ -1221,6 +1240,29 @@ def _insert_tp_all_reduce_comm_nodes(
                     f"attached. TP weight gradients are shard-local and must not be reduced "
                     f"across the TP group."
                 )
+
+    # A boundary records one tensor index (_select_boundary_tensor_idx picks the
+    # best-scoring tensor), so exactly one of a region's outputs gets reduced. That
+    # is right for a TP region whose single output is a partial sum, and silently
+    # wrong for a region that also emits something replicated -- the replicated
+    # tensor would be summed across ranks, or the partial sum left unreduced,
+    # depending on which one scored higher. Refuse instead of guessing.
+    for uid in sorted(matched):
+        node = dag.nodes[uid]
+        if node.compute_subkind != "FWD":
+            continue
+        out_names = node.node_meta.get("output_names") or []
+        if len(out_names) > 1 and any(
+            _is_boundary_activation_edge_static(dag, e, node, matched)
+            for e in dag.edges
+        ):
+            raise ValueError(
+                f"shard_tensor matched node {uid}, whose region emits "
+                f"{len(out_names)} tensors {out_names[:4]} across its boundary, but a "
+                f"boundary carries a single tensor index so only one would be "
+                f"all-reduced. Split the region so the tensor needing the collective "
+                f"leaves it alone."
+            )
 
     def _is_boundary_activation_edge(e: TrainingDAGEdge, node: TrainingDAGNode) -> bool:
         if e.dep_kind != "data" or e.src_uid != node.uid or e.dst_uid in matched:
