@@ -48,7 +48,8 @@ Distinguish throughout:
 | **F28** | EP's lowering is byte-identical to upstream after my refactor, on the shipped Qwen MoE example | |
 | **F29** | A single-device `shard_tensor` was accepted and would crash in the executor; same hole upstream for `shard` | |
 | **F30** | Both shipped examples still run, on real inputs for the first time | *closes the regression question* |
-| **F31** | TP=2→4 is 30% faster; collectives are bandwidth-bound at 67MB and latency-bound at 4.2MB | *answers F19* |
+| **F31** | TP=2→4 is 30% faster; compute matches the roofline. ~~bandwidth-bound at 67MB~~ | *bandwidth reading retracted by F32* |
+| **F32** | A TP all-reduce costs ~250us almost regardless of payload (32x payload -> 2.3x time); fusion is now worth building | *retracts F31's reading; revises F19* |
 
 ---
 
@@ -1529,3 +1530,64 @@ Second positive performance result in the project, after F26. Both came from
 running on cards that were actually idle and reducing three interleaved
 repetitions by minimum; every earlier attempt that skipped either step produced
 a number I later had to retract (F16 → F17).
+
+---
+
+## 2026-09-11 — F32: the cost of a TP all-reduce barely depends on its payload. **F31's "bandwidth-bound" reading is wrong**
+
+**Tested.** TP=2 on two idle cards (`0,3`), `dim 4096, hidden 16384, stages 1,
+mb 1, bf16`, batch swept 256→8192 so the per-collective payload sweeps 2→64 MB.
+Three interleaved repetitions, minimum. Bound computed at the 360 GB/s measured
+in F11.
+
+| batch | payload | bound/coll | **measured/coll** | ratio |
+|---|---|---|---|---|
+| 256 | 2.0 MB | 5.8 us | **138.6 us** | 23.8x |
+| 512 | 4.0 MB | 11.7 | **313.1** | 26.9x |
+| 1024 | 8.0 MB | 23.3 | **227.1** | 9.7x |
+| 2048 | 16.0 MB | 46.6 | **223.1** | 4.8x |
+| 4096 | 32.0 MB | 93.2 | **284.5** | 3.1x |
+| 8192 | 64.0 MB | 186.4 | **322.0** | 1.7x |
+
+### Retraction
+
+**F31 concluded that a 67 MB collective is bandwidth-bound.** Read the measured
+column: a **32x** increase in payload produces a **2.3x** increase in time
+(138.6 → 322.0 us, non-monotone in between). The cost is close to a **constant
+~220–320 us regardless of payload** over the whole range tested. The ratio falling
+from 23.8x to 1.7x is the *denominator* growing while the numerator barely moves —
+not the collective entering a bandwidth-bound regime.
+
+I read a falling ratio as a change of regime. It is arithmetic. The regime never
+changed: it is fixed-cost-dominated everywhere from 2 MB to 64 MB, and 64 MB is
+merely where the bandwidth bound finally catches up with the fixed cost.
+
+F31's other results stand — compute scaling at 1.44x against a predicted 1.50x,
+and TP=4 being 30% faster than TP=2. Only the bandwidth interpretation is
+withdrawn. (Fourth self-correction: F16→F17, F17→F19, F18→F19, F31→here.)
+
+### What the fixed cost is not, and what follows
+
+Not dispatch: F19 captured the whole step in a CUDA graph and gained 2%. Not
+bandwidth: this sweep. What is left is NCCL's own per-collective cost — kernel
+launch, the ring's per-step synchronization, and the two ranks' arrival
+difference at each collective, which F11 measured directly at the step level and
+which recurs at every collective.
+
+**This makes collective fusion worth building, where F19 judged it premature.**
+If cost is ~constant per collective, merging K collectives into one saves
+`(K-1) x ~250 us` at *any* payload, not only in a latency-bound corner. Against
+F18's numbers that is large: at mb=4 with 2 stages there are 16 collectives per
+step, so fusing across microbatches could remove on the order of 3 ms from a
+~16 ms step.
+
+The trade-off F18 and F12 identified is unchanged and now quantifiable: fusing
+across microbatches forces the later microbatches' compute to wait, so it trades
+overlap (worth 1.06x concurrency, F12) against fixed cost (worth ~250 us per
+collective removed). Those are now both measured, so the comparison can be made
+before writing the pass rather than after.
+
+**Caveat.** The sweep is noisy — 313 us at 4 MB against 227 us at 8 MB is
+non-monotone, and this host is shared. The robust claim is the one that survives
+the noise: **time does not scale with payload over a 32x range.** A tighter
+constant would need an idle machine.
