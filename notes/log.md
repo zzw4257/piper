@@ -39,6 +39,7 @@ Distinguish throughout:
 | **F19** | CUDA graphs capture a TP step fine and buy 2%: the cost is NCCL latency, not dispatch | *retracts F18's hypothesis* |
 | **F20** | EP+TP on one region silently drops one of them, order-dependent; the directive layer has no model of composition | |
 | **F21** | CP's correctness fits Piper; ring attention's multi-tensor boundary and intra-region overlap do not | |
+| **F22** | Executor happens-before contract made explicit; a general checker deliberately not built | |
 
 ---
 
@@ -1120,3 +1121,45 @@ region is no longer atomic to the scheduler — a real change to what a
 `TrainingDAG` node means. The cheaper alternative is to accept region-granular
 overlap and write ring steps finely enough that it suffices, which is what the
 probe above does, and to measure whether that recovers most of the benefit.
+
+---
+
+## 2026-09-20 — F22: the executor's happens-before contract, stated rather than checked
+
+**Decision, with the reasoning, because the scope shrank deliberately.**
+
+F20 listed four static properties of a lowered `TrainingDAG` worth checking. On
+inspection three already have a mechanism:
+
+| property | status |
+|---|---|
+| one boundary-comm directive per region | enforced, F20 |
+| non-last stage's forward reaches its backward | diagnosed in the error, F14 |
+| no buffer released before its last reader | `BufferStore.refcounts` counts `data_succs` and the dispatch order is topological, so a consumer cannot run after the release |
+| cross-stream edges are awaited | **this entry** |
+
+The fourth is the one that bit this project: `DagExecutor.run` dispatches on exact
+`task_type` *and finds predecessors the same way*, so a comm kind that has a
+dispatch arm but is missing from the four predecessor lookups is skipped in
+silence and the consumer takes its fallback branch — reading the wrong inputs with
+no error. `TP_COMM` was in exactly that state mid-Stage-C.
+
+**I did not build a general checker.** A generic "every cross-stream edge is
+awaited" pass would have to recover the contract from the `match` arms, which
+means either AST analysis of the executor or a hand-written table that silently
+rots when the executor changes. Both are more machinery than the problem
+justifies: new comm kinds arrive roughly once per parallelism dimension (EP,
+ZeRO, TP — three times in the project's life).
+
+Instead `test/test_executor_contract.py` makes the contract **explicit and
+non-defaultable**. Every `TaskType` must be classified as feeding COMPUTE or not;
+everything that feeds COMPUTE must appear in the consumer lookups; every type must
+have a dispatch arm. Adding a kind fails these until it is classified and wired.
+Three assertions, no framework, and it catches the exact bug that occurred.
+
+**What a real checker would need**, if someone wants one later: the executor's
+wait-set per task type has to be declared data rather than expressed as control
+flow. That is a refactor of `DagExecutor.run` — turning each arm's predecessor
+lookup into a table the arm consumes — and it would make the happens-before
+relation of a schedule machine-checkable against the DAG. Worth doing if the set
+of comm kinds grows (CP would add at least one, F21), not before.
