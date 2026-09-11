@@ -44,6 +44,8 @@ Distinguish throughout:
 | **F24** | `devices` is symbolic, not GPU ids: topology-aware placement cannot be expressed | |
 | **F25** | TP composes with ZeRO-3 on separate regions; the dp/TP overload *enables* it | *positive side of F4* |
 | **F26** | With a pipeline bubble, `order` pays: 1F1B beats GPipe by 16% under TP x PP | *closes F13* |
+| **F27** | zerobubble does not beat 1F1B at pp=2/mb=4; F26's win is interleaving F and B at all | *scopes F26* |
+| **F28** | EP's lowering is byte-identical to upstream after my refactor, on the shipped Qwen MoE example | |
 
 ---
 
@@ -1348,3 +1350,55 @@ not against an optimum. It says the ordering choice is worth 16% here, not that
 1F1B is the best available ordering. `zerobubble` and `dualpipev` are also
 generatable and untested under TP — and F23 confirmed the split-backward path
 those need does compose with `shard_tensor` correctly, so they are runnable.
+
+---
+
+## 2026-09-20 — F27: zerobubble does not beat 1F1B at this size
+
+**Tested.** Same four-GPU window as F26 (cards `0,1,5,6`), TP x PP=2, mb=4,
+three interleaved repetitions.
+
+| | rep1 | rep2 | rep3 | min |
+|---|---|---|---|---|
+| 1F1B | 13.49 | 13.27 | 15.73 | **13.27 ms** |
+| zerobubble | 13.40 | 37.58 | 14.70 | **13.40 ms** |
+
+**No difference** — 1% apart at the minimum, well inside this host's noise. The
+37.58 ms sample is contention, not the schedule.
+
+Expected, on reflection: zerobubble's gain comes from deferring `BWD_W` to fill
+bubble that 1F1B leaves, and at `pp=2, mb=4` there is little such bubble. It also
+costs more nodes (53 per rank against 1F1B's 45, the extra being `BWD_W`), so at
+this size the split-backward machinery is pure overhead.
+
+So F26's 16% is specifically **1F1B over GPipe**, not "any better order wins".
+The ordering choice that matters here is interleaving forward and backward at
+all; refining *how* they interleave does nothing yet. Note also that F26's 1F1B
+was 11.60 ms and this window's was 13.27 ms — **timings are only comparable
+within one waiter window**, never across.
+
+---
+
+## 2026-09-20 — F28: my refactor did not change EP's lowering, verified byte-for-byte
+
+Lifting `_boundary_info_for_edge` out of `_insert_shard_a2a_comm_nodes` (so the
+TP pass could reuse the backward-producer rule instead of re-deriving it) touched
+the only code path EP's collectives go through. EP has **no GPU test upstream**,
+and the shipped Qwen MoE example had never been run in this project, so the
+refactor was unverified against the thing it could break.
+
+`experiments/compare_ep_lowering.py` lowers the shipped Qwen MoE example
+(`create_qwen3_config("9M")`, `pp2_dp2_ep2.json` plus a 2-microbatch split)
+through the full `apply_schedule_directives` pipeline and prints the DAG's shape.
+Run in a `git worktree` of `upstream/main` and in this branch, the outputs are
+**identical**: same segment count, node and edge counts, node-kind histogram, and
+all 16 `A2A_COMM` nodes with the same direction, `tensor_idx` and anchor.
+
+It uses only APIs that exist on `upstream/main`, which is what lets the same
+script run in both checkouts — worth keeping for any future change to the shared
+boundary machinery.
+
+**What this does not cover.** It is the lowered DAG, not execution. EP has never
+been run on GPUs here, so if `A2A_COMM` were mis-executed the comparison would
+not see it — but that code I did not touch. The refactor's blast radius is the
+lowering, and the lowering is unchanged.
