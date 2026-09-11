@@ -42,6 +42,7 @@ Distinguish throughout:
 | **F22** | Executor happens-before contract made explicit; a general checker deliberately not built | |
 | **F23** | A two-output TP region is silently half-reduced (now rejected); split backward composes fine | *same root as F21* |
 | **F24** | `devices` is symbolic, not GPU ids: topology-aware placement cannot be expressed | |
+| **F25** | TP composes with ZeRO-3 on separate regions; the dp/TP overload *enables* it | *positive side of F4* |
 
 ---
 
@@ -1255,3 +1256,46 @@ about what the IR currently models, which is a device *group*, never a device
 
 Not changed here: this is upstream's design call, not a bug to patch under a TP
 branch.
+
+---
+
+## 2026-09-20 — F25: TP composes with ZeRO-3 on separate regions, and the dp/TP overload is an asset there
+
+**First, a bug I introduced.** Pushing the loss function once (S1, F17) caches it
+on `piper_metadata.installed_loss_fn` and skips the push while the cached object
+is identical. `piper_setup` never cleared it, so a second setup in the same
+process builds new actors that never receive it and the loss node gets `None`.
+Not hit in practice — the harness runs each configuration in a fresh process —
+but it is a state leak of my own making. The per-run reset is now
+`_reset_run_state()`, with a test.
+
+**TP + ZeRO-3 on different regions works.** `replicate(shard_params=True)` on
+`PP=0` and `shard_tensor` on a `TP`-tagged region under `PP=1`:
+
+```
+ALL_GATHER_COMM 2   REDUCE_SCATTER_COMM 1   (PP=0, the ZeRO region)
+TP_COMM 2                                    (PP=1/TP=0, the TP region)
+zero metadata only on s0.seg0 / s0.seg0.bwd
+```
+
+No cross-contamination: the ZeRO lifetime flags land only on the ZeRO region's
+nodes, and `_derive_dag_bucket_modes` classifies buckets by the presence of
+AG/RS nodes, so the TP bucket is correctly not zero-managed.
+
+**The interesting part is why this is meaningful rather than merely non-broken.**
+ZeRO shards parameters across `dp_degree` members, and `dp_degree` here *is* the
+TP group size — the overload F4 recorded as a limitation. But for a region that
+is **replicated** across the TP group, every member holds the same logical
+parameters, so sharding them across that group is exactly what ZeRO is for. The
+composition is Megatron's distributed optimizer applied along the TP axis, and
+Piper gets it for free precisely because it does not distinguish the axes.
+
+So the same overload that blocks TP x DP (F4, F14) *enables* TP + ZeRO. Worth
+recording because I had been treating it purely as a limitation.
+
+**Caveat, untested.** This is a CPU check of the lowered DAG only. Whether the
+ZeRO all-gather on `dp_group` and the TP all-reduce on `ep_group` interleave
+correctly at runtime — they are separate communicators over the same ranks, which
+is deliberate (`_join_dp_process_group` makes two so the op types do not share a
+proxy stream) — has not been run. It needs two idle GPUs and belongs with the
+other pending measurements.
