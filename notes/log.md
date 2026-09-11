@@ -48,6 +48,7 @@ Distinguish throughout:
 | **F28** | EP's lowering is byte-identical to upstream after my refactor, on the shipped Qwen MoE example | |
 | **F29** | A single-device `shard_tensor` was accepted and would crash in the executor; same hole upstream for `shard` | |
 | **F30** | Both shipped examples still run, on real inputs for the first time | *closes the regression question* |
+| **F31** | TP=2→4 is 30% faster; collectives are bandwidth-bound at 67MB and latency-bound at 4.2MB | *answers F19* |
 
 ---
 
@@ -1468,3 +1469,63 @@ no numerical reference for either example, and building one would need the
 parameter-override path (F10) extended to their model constructors. For TP that
 comparison exists (F10, F15); for the shipped examples it does not, upstream or
 here.
+
+---
+
+## 2026-09-11 — F31: TP scales 2→4 (30% faster), and the latency/bandwidth crossover is real
+
+**Tested.** Four cards at 0% utilization (`0,3,4,6`, other users' processes
+resident but idle), `dim 4096, hidden 16384, global batch 8192, stages 1, mb 1,
+bf16`, three interleaved repetitions, minimum. Constant global batch and constant
+total hidden: TP only changes how much of the MLP each card owns, and the
+all-reduce payload is `[batch, dim]` = 67 MB either way.
+
+| tp | min iter | compute | comm (min) | collectives/iter |
+|---|---|---|---|---|
+| 2 | 6.92 ms | 4247 us | 545 us | 4 |
+| 4 | **4.85 ms** | 2957 us | 920 us | 4 |
+| ratio | **1.43x** | 1.44x | 1.69x | — |
+
+### Compute matches the roofline
+
+`pre` and `post` are replicated and `up`/`down` are sharded, so the predicted
+ratio is `(2·4096² + 2·4096·8192) / (2·4096² + 2·4096·4096)` = **1.50x**, against
+**1.44x** measured. The small shortfall is the smaller per-card kernels. The
+compute half of F16's model, which survived every retraction, holds again here.
+
+### Communication is bandwidth-bound at this payload, which answers F19
+
+Ring all-reduce moves `2(N-1)/N · S`: **1.0S** at N=2 and **1.5S** at N=4, so the
+predicted growth is **1.5x** against **1.69x** measured. Close — growth tracks the
+*bandwidth* term, not a per-collective latency that would scale with the number of
+ring steps.
+
+F19 left this open: it measured a 105 us collective against an 11.7 us bandwidth
+bound — **9x** — on a 4.2 MB payload, and asked whether the gap closes at larger
+payloads. It does. At 67 MB the collective sits at 545 us against a 186 us bound,
+**2.9x**, and its growth with group size follows the ring model. So the two
+measurements are one picture:
+
+| payload | measured / bandwidth bound | regime |
+|---|---|---|
+| 4.2 MB (F19) | 9.0x | latency-bound |
+| 16.8 MB (F18, mb=4) | ~3.6x | crossing |
+| 67 MB (here, F18 mb=1) | 2.9x | bandwidth-bound |
+
+**This is the quantitative condition F19 asked for.** Collective fusion — merging
+several microbatches' all-reduces into one — only pays in the latency-bound
+regime, i.e. when per-collective payload is small enough. At 67 MB there is
+nothing to win; at 4.2 MB there is 9x of overhead that fusion would attack. And
+F18 already showed the practical route to the bandwidth-bound regime: use fewer
+microbatches.
+
+### TP is worth scaling here
+
+TP=4 is **30% faster** than TP=2 end to end. Compute saves 1290 us while
+communication costs 375 us more, so the collective is not eating the gain — at
+this size TP scales close to how the compute does.
+
+Second positive performance result in the project, after F26. Both came from
+running on cards that were actually idle and reducing three interleaved
+repetitions by minimum; every earlier attempt that skipped either step produced
+a number I later had to retract (F16 → F17).
