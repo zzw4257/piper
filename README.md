@@ -72,6 +72,20 @@ Within each device group, Piper replicates non-expert regions for DP and shards 
 This example expects four visible CUDA devices.
 The harness appends DualPipeV `split` and `order` directives for two physical pipeline ranks and four microbatches.
 
+Run the tensor-parallel MLP example on two GPUs:
+
+```bash
+python examples/test_harness.py \
+  --test-file examples/test_tp_mlp.py \
+  --base-schedule examples/base-schedules/tp2.json \
+  --schedule custom
+```
+
+The base schedule `tp2.json` places one region group on devices `[0, 1]` and
+applies `shard_tensor` to the `TP`-annotated region, so the two devices form a
+tensor-parallel group. `--schedule custom` passes the base schedule through
+untouched, since it already carries its own `split` directive.
+
 Run the Qwen example with PP x ZeRO-3 1F1B schedule:
 
 ```bash
@@ -136,6 +150,31 @@ Supported directives:
   * `filter`: Selects the model regions to shard.
   * `devices`: Non-empty list of CUDA device IDs across which the region is sharded.
   * `stream`: Optional logical stream name for inserted all-to-all collective communication.
+* `shard_tensor` marks matched regions as tensor-parallel and inserts the activation all-reduces at the region boundary.
+  * `op`: `"shard_tensor"`
+  * `filter`: Selects the tensor-parallel model regions.
+  * `devices`: Non-empty list of CUDA device IDs forming the tensor-parallel group.
+  * `stream`: Optional logical stream name for the inserted all-reduce collectives.
+
+  Two collectives are inserted per matched region, both on edges leaving it: the
+  region's forward output is a partial sum and is all-reduced, and the gradient
+  w.r.t. its input is a partial sum and is all-reduced on the reversed backward
+  edge. This is Megatron's `f`/`g` conjugate pair. Edges internal to the region
+  are left alone, since a column-parallel output feeding a row-parallel input is
+  sharded on purpose.
+
+  No parameter-gradient collective is inserted: under tensor parallelism the
+  weight gradients are already shard-local. For the same reason `shard_tensor`
+  refuses to compose with `replicate` on the same region, and refuses to share a
+  region with `shard`, since both rewrite the same activation edges.
+
+  The model declares tensor-parallel *local* parameter shapes, as expert regions
+  already do for `shard`: the DAG IR represents device groups and collectives,
+  not partitioned tensors, so changing the tensor-parallel degree means rebuilding
+  the model rather than editing the schedule. A matched region must also carry a
+  single tensor across its boundary; a region emitting both a partial sum and a
+  replicated tensor is rejected rather than half-reduced.
+
 * `split` duplicates the matched DAG by a named microbatch dimension.
   * `op`: `"split"`
   * `filter`: Selects the sub-DAG to duplicate.
