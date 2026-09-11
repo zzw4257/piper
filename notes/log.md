@@ -47,6 +47,7 @@ Distinguish throughout:
 | **F27** | zerobubble does not beat 1F1B at pp=2/mb=4; F26's win is interleaving F and B at all | *scopes F26* |
 | **F28** | EP's lowering is byte-identical to upstream after my refactor, on the shipped Qwen MoE example | |
 | **F29** | A single-device `shard_tensor` was accepted and would crash in the executor; same hole upstream for `shard` | |
+| **F30** | Both shipped examples still run, on real inputs for the first time | *closes the regression question* |
 
 ---
 
@@ -1430,3 +1431,40 @@ work.
 This is the fourth silent-failure-made-loud in this branch (F14, F20, F23, F29),
 all the same shape: a precondition the code depends on, checked nowhere, failing
 somewhere that does not name it.
+
+---
+
+## 2026-09-20 — F30: both shipped examples still run, on real inputs for the first time
+
+**Tested.** Four GPUs (`0,1,3,4`), `--schedule 1f1b --ranks 2 --mbs 4`, via a
+waiter that polls for idle cards.
+
+| example | configuration | result |
+|---|---|---|
+| `test_qwen.py` + `pp2_dp2_ep2.json` | MoE, EP, ZeRO, PP x DP | **OK**, 54.99 ms/iter |
+| `test_llama.py` + `llama_pp2_dp2.json` | dense, PP x DP | **OK**, 37.13 ms/iter |
+
+This closes the regression question this branch has been carrying. The changes
+that could plausibly have broken them:
+
+- **the zero-input fix (F9)** changed *every* example's behaviour — until now they
+  consumed zeros, and nothing here had run since. If anything downstream depended
+  on zero activations, or if real data produced overflow that zeros hid, this is
+  where it would surface. Neither happened.
+- **the loss plumbing (F8)** added an append per loss-computing backward and
+  changed `_update`'s return shape on both paths.
+- **the `_boundary_info_for_edge` extraction** touched EP's only code path;
+  F28 already showed the lowering is byte-identical, and this shows it executes.
+- **four new compile-time rejections** (F20, F23, F29, and the `replicate`
+  refusal from F6) could have rejected a legitimate shipped schedule. They did
+  not.
+
+The LLaMA schedule is new — `test_llama.py` defaults to `pp2.json`, which does
+not exist in the repository — so `llama_pp2_dp2.json` is added: PP x DP with
+`replicate` per stage and no EP tag, which is what a dense model needs.
+
+**Caveat.** "Runs" is what is verified, not "computes the right thing". There is
+no numerical reference for either example, and building one would need the
+parameter-override path (F10) extended to their model constructors. For TP that
+comparison exists (F10, F15); for the shipped examples it does not, upstream or
+here.

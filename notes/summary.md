@@ -25,6 +25,7 @@ Verified:
 | dropping the collectives breaks all of the above | negative control in each check |
 | TP composes with PP, ZeRO-3, and split backward | TP x PP verified on 4 GPUs; ZeRO-3 on a separate region lowers cleanly; zero-bubble's BWD_I/BWD_W split anchors the backward collective correctly (F15, F23, F25) |
 | **EP is unchanged by my refactor** | the shipped Qwen MoE example lowers byte-identically against a worktree of `upstream/main` (F28) |
+| both shipped examples still run | Qwen MoE (EP+ZeRO+PP x DP) and LLaMA (PP x DP) on 4 GPUs, the first run on real inputs since the zero-input fix (F30) |
 
 `src/` diff is ~410 lines across 12 files. TP needed **no new node kind
 mechanics, no new process group, and no launcher change**: it reuses the
