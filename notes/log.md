@@ -43,6 +43,7 @@ Distinguish throughout:
 | **F23** | A two-output TP region is silently half-reduced (now rejected); split backward composes fine | *same root as F21* |
 | **F24** | `devices` is symbolic, not GPU ids: topology-aware placement cannot be expressed | |
 | **F25** | TP composes with ZeRO-3 on separate regions; the dp/TP overload *enables* it | *positive side of F4* |
+| **F26** | With a pipeline bubble, `order` pays: 1F1B beats GPipe by 16% under TP x PP | *closes F13* |
 
 ---
 
@@ -1299,3 +1300,51 @@ correctly at runtime — they are separate communicators over the same ranks, wh
 is deliberate (`_join_dp_process_group` makes two so the op types do not share a
 proxy stream) — has not been run. It needs two idle GPUs and belongs with the
 other pending measurements.
+
+---
+
+## 2026-09-20 — F26: with a pipeline bubble to fill, `order` finally pays — 1F1B beats GPipe by 16% under TP
+
+**Tested.** TP x PP=2 on four GPUs (`0,1,3,5`, claimed by a waiter that polls for
+idle cards and preempts nobody), `dim 4096, hidden 16384, batch 2048/microbatch,
+stages 2, tp 2, 4 microbatches, bf16, 12 iterations`, three interleaved
+repetitions. Same base schedule, same collectives, **only the `order` directive
+differs**.
+
+| | rep1 | rep2 | rep3 | min |
+|---|---|---|---|---|
+| 1F1B (harness-generated) | 12.34 | 12.20 | 11.60 | **11.60 ms** |
+| GPipe (all forwards, then all backwards) | 13.85 | 14.95 | 14.42 | **13.85 ms** |
+
+**1F1B is 16% faster**, 3/3 repetitions, and the two ranges do not overlap
+(11.60–12.34 against 13.85–14.95) — the signal is larger than this host's noise
+even though the claimed cards were merely idle rather than exclusive.
+
+### This closes F13's question, and confirms its reasoning
+
+F13 found `order` bought *nothing* on a single stage — a hand-written 1F1B was
+3.7% **slower** than the default ordering, because with one stage there is no
+pipeline bubble to fill and the directive only constrains an ordering that was
+already good. The inference was that `order` should pay where it pays for
+anything: across pipeline stages. With a bubble present, it does.
+
+So the two results are one statement: **`order`'s value is proportional to the
+bubble it can fill, and TP alone creates none.** A TP-only schedule gets nothing
+from Piper's scheduling language beyond what the default topological order
+already does (F12, F13); a TP x PP schedule gets 16%.
+
+### Why it matters for the project's thesis
+
+This is the first measurement where TP and Piper's central claim — programmable
+scheduling — produce value *together* rather than TP merely riding along. Every
+prior performance result was negative or retracted: `stream` is inert at one
+microbatch (F12), `order` hurts on one stage (F13), the cost model ranked
+backwards (F16, retracted in F17), more microbatches hurt at constant work (F18),
+CUDA graphs buy 2% (F19). This one is positive, reproducible, and attributable to
+exactly one directive.
+
+**Caveat.** The comparison is 1F1B against GPipe, both hand-or-harness-generated,
+not against an optimum. It says the ordering choice is worth 16% here, not that
+1F1B is the best available ordering. `zerobubble` and `dualpipev` are also
+generatable and untested under TP — and F23 confirmed the split-backward path
+those need does compose with `shard_tensor` correctly, so they are runnable.

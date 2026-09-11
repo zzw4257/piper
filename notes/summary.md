@@ -90,6 +90,12 @@ is unchecked, so the failure mode is wrong arithmetic with no diagnostic.
   written. (F12)
 - **`order` bought nothing on a single stage**: 1F1B is 3.7% *slower*. No bubble
   to fill, and it only constrains an ordering that was already good. (F13)
+- **With a bubble, `order` pays: 1F1B beats GPipe by 16%** under TP x PP=2 on four
+  GPUs, 3/3 repetitions, ranges not overlapping — same schedule, same collectives,
+  only the `order` directive differs. The two results are one statement:
+  `order`'s value is proportional to the bubble it can fill, and TP alone creates
+  none. This is the only measurement where TP and programmable scheduling produce
+  value together. (F26)
 - **At constant total work, more microbatches make TP 2.6x worse.** So TP wants
   few microbatches while PP wants many — opposing preferences on one knob, and the
   first genuine scheduling question here that the IR does not already answer. (F18)
