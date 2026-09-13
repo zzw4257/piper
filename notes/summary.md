@@ -258,7 +258,11 @@ behaviour.
   mechanism. An issue budget is a DAG edge *and* a runtime allocation policy;
   Piper has neither and the first without the second is nothing. **The policy
   is now built (F44): a bounded buffer pool reused on the stream-side free
-  event, no host wait — with the edge, slope 2.01; alone, 3.01; both predicted.**
+  event, no host wait — with the edge, slope 2.01; alone, 3.01; both predicted.
+  Replicated on H200 (F47), the three race-free arms reproduce to two decimals
+  (4.00 / 2.01 / 3.01) and the two racing arms do not (3.61→3.06, 3.99→2.85) —
+  so without the pool, ZeRO-3's peak memory is a property of the machine, not
+  of the program, and the two schedules even swap places.**
 - *G-2 numerics* — **done (F40, F41).** torchrun: out 4.2e-07, dQ 1.2e-06,
   dK 2.9e-06, dV 1.9e-06, both controls broke. In Piper: CP=2 mean-over-ranks
   equals dense CP=1 to 1.7e-06 across three optimizer steps; dropping the ring
