@@ -3067,3 +3067,70 @@ under-count relative to Piper by roughly the segment-count ratio; the 1.8x
 remainder is an upper bound on Piper-specific machinery and would shrink if the
 probe matched the node count. The direction and the ordering are what the
 two-machine agreement supports, not the third decimal.
+
+## 2026-09-14 — F54: F53's decomposition retracted — Piper runs codegen'd GraphModules, not an Interpreter, and with the variants interleaved only the segmentation term is resolvable
+
+### Two errors in F53, found by checking the code and then the method
+
+**It measured the wrong thing.** F53's variant C ran each segment through
+`torch.fx.Interpreter` on the stated ground that this "is how Piper executes a
+segment's GraphModule". It is not. `actor.py:385` calls `module.recompile()`
+and `bucket.forward_fn` is a closure that calls the module directly, so Piper
+runs the **codegen'd** `GraphModule.forward` — ordinary generated Python, not a
+node-by-node interpreter. The gap between those two is roughly the whole term
+F53 attributed to FX.
+
+**It was measured in blocks.** Re-running variant by variant put B (detached)
+*above* C (detached + GraphModule) on B200 — 4.87 against 3.17 ms — which is
+impossible by construction, C being B plus work. That is the signature of
+drift, and the project has had a rule for it since F11: interleave, and take
+the minimum of each arm. That rule had been applied to every GPU timing in this
+project and to none of the host timings.
+
+### Re-measured, interleaved, 25 rounds, with the spread reported
+
+| variant | B200 min | vs A | H200 min | vs A |
+|---|---|---|---|---|
+| A straight | 2.05 ms | 1.00x | 2.99 ms | 1.00x |
+| B detached | 4.19 | **2.05x** | 4.43 | **1.48x** |
+| C detached + codegen'd gm | 3.74 | 1.83x | 4.53 | 1.51x |
+| D + name-keyed arg marshalling | 3.97 | 1.94x | 4.36 | 1.46x |
+
+min-to-median spread: B200 0.28 / 0.75 / 1.06 / 0.90 ms; H200 0.70 / 1.58 /
+1.32 / 1.12 ms.
+
+**A against the rest is resolvable** — a 1.4–2.1 ms gap with A's own spread at
+0.28 and 0.70. **B, C and D are not**: they differ by 0.2–0.45 ms against
+spreads of 0.9–1.6 ms, and their order is not even consistent between the two
+machines.
+
+### What survives
+
+> Cutting autograd at every segment boundary — `detach().clone().requires_grad_()`
+> on the way in and `torch.autograd.grad` per segment instead of one backward —
+> costs **1.5–2.0x** the host launch time of the same arithmetic written
+> straight. Running the segment as a codegen'd GraphModule, and marshalling its
+> arguments by placeholder name, are below the noise floor of this measurement
+> and are not separately priced.
+
+F53's three-component table is withdrawn. The one term that was load-bearing
+for the argument is the one that survives: the boundary cost is the price of
+the IR itself, since cutting autograd at boundaries is what makes boundary
+collectives expressible at all. F53's remark that `--use-inductor` addresses
+the FX term also goes, since there is no measured FX term; what Inductor would
+address is the kernel count inside each segment, which is a different claim and
+untested (it fails on both hosts for this model, F52).
+
+Piper's compute nodes cost 3.8x the straight arithmetic (F52). Segmentation
+accounts for 1.5–2.0x of that. The remaining ~2x is not decomposed, and this
+method will not decompose it: an external mock cannot reproduce the executor's
+per-node work. Instrumenting inside `DagExecutor.run` at sub-node granularity
+would, and is the way to do it if it matters.
+
+### Method note, recorded because it cost two wrong tables
+
+Host-side Python timing on a shared machine drifts as much as GPU timing does,
+and for the same reason. Every host measurement from here on is interleaved and
+reports its spread, and no difference is claimed that does not exceed it. The
+first two attempts at this table each produced a plausible, publishable-looking
+decomposition that was an artifact.
