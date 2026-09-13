@@ -199,7 +199,7 @@ record that it fails and stop.
 `2995530`). Lowered order is `CP_i -> ring -> CP_{i+1}` both ways. The pass
 acts on edges *between* matched regions, the exact set `shard_tensor` skips.
 
-**G-2 (2 GPU) — queued.** Ring P2P executor over `ep_group` + numerics. Gate first,
+**G-2 (2 GPU) — done (log F40, F41).** Ring P2P executor over `ep_group` + numerics. Gate first,
 outside Piper: `torchrun` ring attention with online-softmax/LSE accumulation
 against a single-GPU reference, tolerance from a measured noise floor, with a
 negative control that drops the rotation. Only then inside Piper.
@@ -211,9 +211,14 @@ rest is measured against.
 region, and the concurrency metric (kernel-sum / wall-span) rises against G-2
 on the same inputs, interleaved A/B.
 
-**G-4 — done on CPU (log F39).** `replicate(prefetch_distance=1)` turns F37's
-`AG_0…AG_8 | compute_0…` into `AG_0 compute_0 AG_1 compute_1 …` with one
-temporal edge per gather and no new mechanism. GPU slope measurement queued.
+**G-4 — dispatch order done (F39); memory prediction failed (F42).**
+`replicate(prefetch_distance=1)` turns F37's `AG_0…AG_8 | compute_0…` into
+`AG_0 compute_0 AG_1 compute_1 …` with one temporal edge per gather. Measured
+peak-memory slope 3.99 × stage-bytes against a predicted 2.0 (plain DP: 4.00
+vs 4.0, so the accounting is right). Hypothesis under test: full-parameter
+buffers are allocated on the host at dispatch and freed on a background thread,
+so the budget edge orders stream work but not allocation. The fix, if so, is a
+bounded buffer pool in the runtime — invisible from the DAG.
 
 **G-5 (backward).** Piper builds BWD by reversing FWD data edges. Whether that
 produces a correct reverse ring for K/V gradients is genuinely unknown and is
