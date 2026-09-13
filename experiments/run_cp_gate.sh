@@ -19,7 +19,7 @@ pick() {  # pick <n> [max_util]: numerics tolerate other tenants' compute; timin
     sleep 30
   done; echo "$ok"
 }
-while :; do CARDS=$(pick 2 95) && break
+while :; do CARDS=$(pick 2 101) && break
   [ $(( $(date +%s) - t0 )) -gt $MAX_WAIT ] && { echo "gave up (2 cards)" >> $OUT; exit 1; }; sleep 120; done
 echo "cards=$CARDS $(date -Is)" >> $OUT
 echo "== torchrun CP gate" >> $OUT

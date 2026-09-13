@@ -16,7 +16,7 @@ pick() { local n=$1 mu=${2:-10} ok=""; for s in 1 2 3; do
     ok=$(nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader,nounits \
         | awk -F', ' -v mu=$mu '$2<mu && $3<100000 {print $1}' | head -$n | paste -sd,)
     [ "$(echo $ok | tr ',' '\n' | grep -c .)" -lt $n ] && return 1; sleep 30; done; echo "$ok"; }
-while :; do CARDS=$(pick 2 95) && break
+while :; do CARDS=$(pick 2 101) && break
   [ $(( $(date +%s) - t0 )) -gt $MAX_WAIT ] && { echo "gave up (2)" >> $OUT; exit 1; }; sleep 120; done
 echo "cards=$CARDS $(date -Is)" >> $OUT
 echo "== hoisted CP=2 vs dense" >> $OUT
