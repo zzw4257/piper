@@ -2743,3 +2743,83 @@ utilization was 0% throughout, on a host that was contended for the whole
 project until this window. The payload-independence is what carries the
 argument, and it is a ratio between two quantities measured in the same
 iteration on the same ranks, so it survives whatever the machine was doing.
+
+## 2026-09-14 — F50: the runtime's share of a Piper iteration is a ~8 ms constant, so the GPU does 12% of the work at the sizes these experiments use and 84% at 68x the work
+
+### Tested
+
+`experiments/probe_host_bound.py` runs one CP rank's forward and backward —
+the same arithmetic, including every ring step — in one process on one GPU with
+no Ray, no DAG and no dispatch loop, and omitting only the collectives. Paired
+against Piper's own minimum iteration time for the identical configuration
+(CP=4, four B200s, `cp4_ring_dp`, dim 512, 8 heads, batch 8, 10 timed
+iterations).
+
+### Result
+
+| seq | s_local | GPU math | Piper iteration | **non-arithmetic** | GPU share |
+|---|---|---|---|---|---|
+| 1024 | 256 | 1.35 ms | 11.08 ms | **9.73 ms** | 12.2% |
+| 2048 | 512 | 5.89 | 12.64 | **6.75** | 46.6% |
+| 4096 | 1024 | 24.01 | 32.04 | **8.03** | 75.0% |
+| 8192 | 2048 | 91.57 | 109.70 | **18.13** | 83.5% |
+
+The arithmetic spans 68x. The non-arithmetic remainder is 6.8–9.7 ms over the
+first three points — flat — and rises only at the largest, where K/V is 32 MiB
+per tensor and communication is itself material (and, per F49, above the ring's
+32–40 MiB localization knee).
+
+So a Piper iteration is, to first order:
+
+    iteration  ~  GPU arithmetic  +  ~8 ms of runtime  +  collectives
+
+and the ~8 ms does not depend on the model. At these experiment sizes it is the
+*dominant* term: at s_local=256 the GPU is doing the model's arithmetic for
+12% of the iteration and something else for 88%.
+
+### Why this matters more than the CP result it came from
+
+It supplies the criterion this project has been missing for which negative
+results are informative. A scheduling change that removes `x` of communication
+changes the iteration by `x / (math + 8 ms + comm)`. At s_local=256 the three
+ring exchanges are ~345 us (F45/F49) against an 11 ms iteration: 3%, of which
+overlap could recover part. That is below the run-to-run spread, and no amount
+of repetition fixes it — the experiment has no resolution *by construction*.
+
+This retroactively explains a family of earlier non-results as one thing:
+`stream` having no effect at one microbatch, the hoist being unmeasurable
+(F46), and the 1.06x ceiling on stream at four microbatches. None of them were
+statements about the directive. They were statements about a denominator.
+
+**The rule**: before measuring a scheduling knob, measure the GPU's share. Below
+about 50% the knob is being tested against the runtime, not against the
+schedule.
+
+### Relation to F43 / F47 / F48
+
+This is the fourth symptom of one cause. The host runs its own dispatch loop per
+rank, ahead of the GPU and uncoupled from the other ranks:
+
+* F43 — it allocates every full-parameter buffer before the GPU needs them;
+* F47 — so peak memory is a property of the machine, not of the program;
+* F48 — so ranks drift, and each collective pays the drift additively;
+* F50 — and it takes ~8 ms per iteration whatever the model does.
+
+The first three were diagnosed from the inside, through the DAG and the
+collectives. This one is the same asynchrony measured from the outside, by
+subtraction against the bare arithmetic, and it is the largest of the four.
+
+### Caveat, stated rather than smoothed
+
+The bare-arithmetic reference runs on one card while Piper runs on four, so
+clock and cache state differ; a standalone run of the same reference on an idle
+card gave 2.51 ms at s_local=256 against the 1.35 ms measured here. Taking the
+larger figure the GPU share at s_local=256 is 23%, not 12%, and every conclusion
+above is unchanged. The reference is also generous to Piper: it includes all the
+ring arithmetic and excludes only the collectives.
+
+### Next
+
+The same sweep on H200 — if the ~8 ms constant is a property of Ray and the
+Python dispatch loop it should reproduce; if it is a property of the host it
+should not. That is the F47 test applied to the fourth symptom.
