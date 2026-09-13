@@ -27,7 +27,10 @@ done
 echo "cards=$CARDS $(date -Is)" >> $OUT
 
 mk() {  # mk <stages> <shard_params> <shard_grads> [prefetch_distance] -> schedule path
-  local n=$1 sp=$2 sg=$3 pf=${4:-} f=examples/base-schedules/_zero_probe_s${n}_${sp}${pf:+_pf$pf}.json
+  local n=$1 sp=$2 sg=$3 pf=${4:-}
+  # separate line: bash expands a whole `local` word list before assigning, so
+  # ${n} on the same line is the (unset) outer n and set -u aborts.
+  local f=examples/base-schedules/_zero_probe_s${n}_${sp}${pf:+_pf$pf}.json
   { echo "["; for ((i=0;i<n;i++)); do
       echo "  {\"op\":\"place\",\"filter\":{\"PP\":$i},\"devices\":[0,1],\"stream\":\"default_stream\"},"; done
     echo "  {\"op\":\"replicate\",\"filter\":{\"PP\":\"*\"},\"devices\":[0,1],\"reduce_stream\":\"dp_stream\",\"shard_grads\":$sg,\"shard_params\":$sp${pf:+,\"prefetch_distance\":$pf}},"
