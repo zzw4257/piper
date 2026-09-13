@@ -248,13 +248,20 @@ behaviour.
 
 **Queued on GPU, with predictions written first.**
 
-- *F37 slope* (`measure_zero3_peak.sh`, 2 cards): peak memory vs depth, three
-  arms — shipped ZeRO-3 predicted 3.0× stage-bytes, `prefetch_distance=1` 2.0×,
-  plain DP 4.0×.
-- *G-2 numerics* (`run_cp_gate.sh`): torchrun ring vs dense attention on output
-  and dQ/dK/dV with two controls (no rotation breaks output; forward-only
-  rotation breaks dK/dV — the control a loss curve cannot provide); in-Piper
-  CP=2 vs dense CP=1 across optimizer steps, with a no-ring negative control.
+- *F37 slope* — **done, prediction failed, mechanism found (F42, F43).** Plain
+  DP 4.00 (predicted 4.0), shipped ZeRO-3 3.61 (3.0), `prefetch_distance=1`
+  3.99 (2.0). The dispatch order changed as the CPU tests say; the peak did not
+  follow, because it sits at the end of the backward where full gradients
+  accumulate ahead of their deferred frees, and allocation happens on the host
+  at dispatch. Blocking the host on the budget predecessor gives slope 2.01
+  and 11.6 GiB at 8 stages against DP's 20.0 — the pre-registered test of the
+  mechanism. An issue budget is a DAG edge *and* a runtime allocation policy;
+  Piper has neither and the first without the second is nothing.
+- *G-2 numerics* — **done (F40, F41).** torchrun: out 4.2e-07, dQ 1.2e-06,
+  dK 2.9e-06, dV 1.9e-06, both controls broke. In Piper: CP=2 mean-over-ranks
+  equals dense CP=1 to 1.7e-06 across three optimizer steps; dropping the ring
+  moves it by 3.2e-03. The hoisted run's per-rank losses are digit-identical to
+  the spliced run's.
 - *G-3* (`run_cp_hoist.sh`): hoisted numerics on 2 cards; on 4 cards spliced vs
   `distance=1` vs `distance=0` — P1 revised predicts `distance=0` peak memory
   grows with steps and `distance=1` does not. Two cards cannot show it: one
