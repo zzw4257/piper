@@ -53,7 +53,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ap.add_argument("--skip-negative-control", action="store_true")
-    ap.add_argument("--extra", nargs="*", default=[], help="passed to both runs")
+    ap.add_argument("extra", nargs=argparse.REMAINDER,
+                    help="after a literal --: harness/test args passed to every run")
     ap.add_argument("--cp", type=int, default=2, help="CP degree / ring steps / ranks")
     ap.add_argument("--negative-schedule", default=None,
                     help="default: cp{N}_no_ring_dp")
@@ -61,6 +62,8 @@ def main() -> int:
                     help="cp2_ring (no replicate) is valid only for a single "
                          "iteration: projection grads then diverge across ranks.")
     args = ap.parse_args()
+    if args.extra[:1] == ["--"]:
+        args.extra = args.extra[1:]
 
     n = args.cp
     sched = args.cp2_schedule or f"cp{n}_ring_dp"

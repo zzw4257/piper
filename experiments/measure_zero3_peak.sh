@@ -48,7 +48,7 @@ for MODE in zero3 zero3_pf1 dp; do
     CUDA_VISIBLE_DEVICES=$CARDS timeout 1200 \
       python examples/test_harness.py --test-file examples/test_tp_mlp.py \
         --base-schedule $S --schedule custom \
-        --stages $N --tp 1 --dim $DIM --hidden $HID --warmup 1 --iters 2 \
+        --stages $N --tp 1 --init random --dim $DIM --hidden $HID --warmup 1 --iters 2 \
         --temp-dir /var/tmp/ziweizho-ray > $LOG 2>&1
     RC=$?
     RUN=$(grep -oE "out/[0-9]{8}_[0-9]{6}" $LOG | tail -1)
