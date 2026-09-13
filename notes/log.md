@@ -1921,3 +1921,58 @@ order says yes; the measurement decides.
 characterization test so the eventual issue-policy change has a red test to turn
 green. Then G-1 (multi-tensor boundaries) proceeds unchanged — F37 strengthens its
 motivation rather than altering its shape.
+
+## 2026-09-13 — F38: `replicate` emits a gradient all-reduce for regions with no parameters; the runtime silently discards it
+
+### Tested
+
+Composing `replicate` (projection weights) with `ring_exchange` (CP regions) on the
+ring-attention model, lowered on CPU. Expected `REDUCE_COMM` on the prologue and
+epilogue backward nodes only, since the CP regions are pure tensor arithmetic on
+q/k/v/o/m/l and carry `param_idxs == []`.
+
+### Unexpected
+
+Every CP region's backward node got a `REDUCE_COMM` too (`reduce.1`, `reduce.2`).
+`_insert_reduce_comm_nodes` (`directives.py:771-800`) filters on backward-weight
+subkind, tag match and device, and never asks whether the region has trainable
+parameters. `_insert_all_gather_comm_nodes` in the same file does
+(`_node_has_trainable_params`, `directives.py:850`). The two passes disagree about
+the same question.
+
+### Consequence
+
+Not a wrong answer and not a stray NCCL call: `all_reduce_grads`
+(`executors.py:164-167`) begins with
+`if not self.has_trainable_params_for_collective(...): return 0`. The node is
+dispatched, waits on its predecessor's event, records its own, releases the
+backward buffer, and does nothing in between. One dead node per parameter-free
+region per microbatch, issued on `reduce_stream`.
+
+The guard is in the wrong layer. The compiler emits a collective it can tell has
+no payload; the runtime knows to skip it. Nothing shipped could expose this:
+every region in the LLaMA, Qwen and MLP examples owns parameters. Attention-only
+ring steps are the first parameter-free regions Piper has seen.
+
+### IR-runtime assumption discovered
+
+Adds to F19-F24's list of unstated invariants: **a comm node may be emitted
+whose payload is statically empty, and correctness then depends on the executor
+recognizing that**. Same family as the silent-skip failures — a pass that has
+nothing to do says nothing — but in the opposite direction: a pass that has
+nothing to do emits a node anyway.
+
+### Evidence pinned
+
+`test/test_ring_directive.py::test_replicate_attaches_reductions_to_parameter_free_regions`
+asserts the current count (three dead reductions for three ring steps). It is a
+characterization: the two-line guard makes it fail, which is when it gets
+rewritten. Not fixed now so the queued G-2 run exercises upstream behaviour;
+recorded so the fix has evidence to cite.
+
+### Next experiment
+
+Queued (`experiments/run_cp_gate.sh`, chained behind the F37 memory job on the
+same card gate): the out-of-band CP gate under torchrun, the in-Piper CP=2 vs
+dense CP=1 equivalence across optimizer steps with a no-ring negative control,
+and P3 on four cards when four are free.

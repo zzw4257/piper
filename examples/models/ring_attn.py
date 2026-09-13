@@ -80,3 +80,17 @@ class RingAttnRebound(RingAttn):
 
     def _rebind(self, k, v):
         return k.clone(), v.clone()
+
+
+def global_weights(dim: int, seed: int, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    """Identical projection weights on every rank and at every CP degree.
+
+    CP shards the sequence, not the parameters, so unlike tp_mlp there is no
+    per-rank slice: the same dict is pushed to every rank. Built from one global
+    seed so a CP=2 run and a dense CP=1 run start from the same model.
+    """
+    g = torch.Generator().manual_seed(seed)
+    return {
+        "q_proj.weight": (torch.randn(dim, dim, generator=g) * 0.02).to(dtype),
+        "o_proj.weight": (torch.randn(dim, dim, generator=g) * 0.02).to(dtype),
+    }
