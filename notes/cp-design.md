@@ -121,6 +121,32 @@ Without it the hoisted node becomes a root and F-c′ issues it at slot 0 — th
 ZeRO-3 failure reproduced on purpose. The same edge, applied to today's
 `ALL_GATHER_COMM`, is the ZeRO-3 prefetch budget.
 
+**G3′ — what G-1b taught about the hoist (2026-09-13).** Two refinements that
+only became visible with the spliced baseline lowered:
+
+*Only the forward ring is hoistable.* Forward, the payload of `ring_i` is the
+K/V chunk `CP_i` received and forwards untouched, so `ring_i`'s true dependency
+is `ring_{i-1}` (or the K/V definer for `i=0`), not `CP_i`. Backward, the
+payload is the gradient of that chunk *after* `CP_{i+1}'` has added its own
+attention contribution — a produced value. The backward ring must wait for the
+compute; the forwarded flag from G-1a says so mechanically (`forwarded=False`
+on the gradient edge is not recorded, but the payload is `inp_grads`, which
+compute writes). In a region-granular IR, ring attention can overlap half its
+communication. Whether that half is the half that matters is a G-3 measurement.
+
+*The issue budget is not optional for CP either.* Hoisted, `ring_i` depends
+only on `ring_{i-1}`; with nothing else, all `n-1` rotations run to completion
+before `CP_0` finishes and every K/V chunk is resident at once — F37's pattern
+reproduced on the feature whose purpose is to hold `1/n` of K/V. The budget
+edge `CP_{i-1} -> ring_i` (temporal, `distance=1`) makes `ring_i` overlap
+exactly `CP_i`. P1 (revised) is the test of this paragraph.
+
+*The consumer must merge, not replace.* Today a compute node with a boundary
+comm predecessor takes that comm node's buffer as its whole input set. Hoisted,
+`CP_{i+1}` has two data predecessors — `CP_i` (accumulators) and `ring_i` (K/V)
+— and must take the accumulator slots from one and the ring slots from the
+other. This is the one executor change G-3 needs beyond the pass.
+
 **G4 — mechanical prerequisites.** A boundary records one `tensor_idx`
 (`fx.py:686`, `_select_boundary_tensor_idx` at `fx.py:495` is a float/
 requires_grad scoring heuristic); CP moves K and V, so this becomes a list.
