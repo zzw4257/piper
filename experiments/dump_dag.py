@@ -20,9 +20,11 @@ from src.schedule import derive_schedule_info, load_schedule_directives
 from src.state import piper_metadata
 from src.tasks import training_dag_task_type
 
+from models.ring_attn import RingAttn
 from models.tp_mlp import TPMlp
 
-_COMM_META = ("direction", "tp_tensor_idx", "a2a_tensor_idx", "peer_pp_rank", "source_uid",
+_COMM_META = ("direction", "tp_tensor_idx", "a2a_tensor_idx", "ring_tensor_idxs", "ring_shift",
+              "peer_pp_rank", "source_uid",
               "target_uid", "bwd_uid", "compute_uid")
 
 
@@ -38,6 +40,10 @@ def main(argv=None) -> int:
     ap.add_argument("--tp", type=int, default=2)
     ap.add_argument("--stages", type=int, default=1)
     ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--model", choices=("tp_mlp", "ring"), default="tp_mlp")
+    ap.add_argument("--heads", type=int, default=2, help="ring only")
+    ap.add_argument("--steps", type=int, default=4, help="ring only")
+    ap.add_argument("--seq", type=int, default=8, help="ring only")
     args = ap.parse_args(argv)
 
     directives = load_schedule_directives(args.schedule)
@@ -48,12 +54,17 @@ def main(argv=None) -> int:
     print(f"schedule: {info}")
 
     with torch.device("meta"):
-        model = TPMlp(args.dim, args.hidden, args.tp, args.stages).to(torch.float32)
-    x = torch.empty(args.batch_size, args.dim, device="meta")
+        if args.model == "ring":
+            model = RingAttn(args.dim, args.heads, args.steps).to(torch.float32)
+            inputs = tuple(torch.empty(args.batch_size, args.seq, args.dim, device="meta")
+                           for _ in range(3))
+        else:
+            model = TPMlp(args.dim, args.hidden, args.tp, args.stages).to(torch.float32)
+            inputs = (torch.empty(args.batch_size, args.dim, device="meta"),)
 
     torch._dynamo.reset()
     compiled = torch.compile(model, backend=piper, fullgraph=True)
-    compiled(x)
+    compiled(*inputs)
 
     dags = piper_metadata.per_pp_training_dags
     print(f"\n{len(dags)} per-PP-rank DAG(s)")

@@ -33,6 +33,8 @@ _FEEDS_COMPUTE = {
     TaskType.BWD_A2A,
     TaskType.FWD_TP_ALL_REDUCE,
     TaskType.BWD_TP_ALL_REDUCE,
+    TaskType.FWD_RING_EXCHANGE,
+    TaskType.BWD_RING_EXCHANGE,
 }
 
 # Comm kinds that feed only UPD or nothing, so no COMPUTE arm needs to wait.
