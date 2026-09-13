@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import os
 import torch
 import torch.distributed as dist
 from torch.autograd.graph import GradientEdge, Node
@@ -661,7 +662,16 @@ class DagExecutor:
         fusion_results: dict[str, list] = {}
         last_comp_event_by_stream: dict[str, torch.cuda.Event] = {}
 
+        # PIPER_MEM_TRACE=<dir>: allocated bytes before each dispatched node, one
+        # TSV per rank per step. Experiment knob (log F42); off unless set.
+        mem_trace_dir = os.environ.get("PIPER_MEM_TRACE")
+        mem_trace: list[tuple[str, str, int, int]] = []
+        ag_host_sync = os.environ.get("PIPER_AG_HOST_SYNC") == "1"
+
         for node in sorted_dag_nodes:
+            if mem_trace_dir:
+                mem_trace.append((node.uid, node.task_type.value,
+                                  torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated()))
             task_type = node.task_type
             batch = node.batches[0]
             mb_idx = batch.mb_idx
@@ -941,6 +951,15 @@ class DagExecutor:
                     assert ag_ubid is not None, (
                         f"ALL_GATHER node uid={node.uid} has no bucket_key"
                     )
+                    if ag_host_sync:
+                        # F42 experiment: alloc_full_params runs on the host at
+                        # dispatch, so a DAG budget edge cannot delay it. Block the
+                        # host on the budget predecessor instead. Stalls dispatch;
+                        # a knob, not a fix.
+                        after = self._node_meta(node).get("prefetch_after_uid")
+                        evt = comp_events.get(after) if after else None
+                        if evt is not None:
+                            evt.synchronize()
                     self.params.all_gather_full_params(ag_ubid, stream=node_stream)
                     ag_evt = torch.cuda.Event()
                     ag_evt.record(node_stream)
@@ -1258,6 +1277,15 @@ class DagExecutor:
             self._rf_exit(rf)
             self.runtime.nvtx_pop()
 
+        if mem_trace_dir:
+            step = getattr(self, "_mem_trace_step", 0)
+            self._mem_trace_step = step + 1
+            os.makedirs(mem_trace_dir, exist_ok=True)
+            path = os.path.join(mem_trace_dir, f"memtrace_rank{self.runtime.global_rank}_step{step}.tsv")
+            with open(path, "w") as f:
+                f.write("uid\ttask\tallocated\tmax_allocated\n")
+                for uid, task, alloc, mx in mem_trace:
+                    f.write(f"{uid}\t{task}\t{alloc}\t{mx}\n")
         return {
             "losses": [
                 loss for result in update_results for loss in result["losses"]

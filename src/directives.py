@@ -1380,6 +1380,7 @@ def _bound_all_gather_issue(
             continue
         dag.add_edge(TrainingDAGEdge(src_uid=back, dst_uid=ag_uid, dep_kind="temporal", tensor_name=None))
         ag.node_meta["prefetch_distance"] = distance
+        ag.node_meta["prefetch_after_uid"] = back
         bounded += 1
     return bounded
 
