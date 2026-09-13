@@ -2159,3 +2159,69 @@ actual shape of the ZeRO-3 fix, and it was invisible from the DAG. The ring's
 `distance` has the same exposure in principle: recv buffers are allocated at
 dispatch too. With two ranks there is one rotation and nothing to accumulate;
 the four-card run is where it would show.
+
+## 2026-09-13 — F43: the peak is a host-ahead-of-GPU race over deferred frees; a DAG budget cannot reach it, and the pre-registered knob proved why
+
+### Tested
+
+`experiments/measure_zero3_mechanism.sh`, same model and arms as F42, plus two
+knobs added for this experiment and off by default: `PIPER_MEM_TRACE` (allocated
+bytes sampled on the host before every dispatched node) and
+`PIPER_AG_HOST_SYNC=1` (block the host on the budget predecessor's event before
+`alloc_full_params`). `PIPER_*` variables are now forwarded to Ray workers via
+`runtime_env`; they were not reliably inherited before.
+
+### Result 1 — the pre-registered prediction held
+
+| arm | slope (× stage-bytes) | peak @8 stages |
+|---|---|---|
+| plain DP | 4.00 | 20.03 GiB |
+| ZeRO-3 shipped | 3.61 | 18.59 |
+| `prefetch_distance=1`, DAG edge only (F42) | 3.99 | 19.22 |
+| `prefetch_distance=1` + host blocked on the budget predecessor | **2.01** | **11.63** |
+
+F42 predicted ≈2.0 if allocation-at-dispatch was the cause and ≈4 if not. The
+rank asymmetry F42 noted under ZeRO-3 (up to 1.3 GiB) is gone under host-sync:
+both ranks report the same byte count at every depth. It was the race.
+
+### Result 2 — what the trace shows, and a correction to F42's own reading
+
+Shipped ZeRO-3, rank 0, before the first forward: twelve `all_gather` nodes
+dispatched back to back, allocated bytes climbing 2.52 → 4.95 GiB in steps of
+64 MB (pre/post) and 0.5 GiB (up/down). That is F37's dispatch order turned into
+bytes, and it is exactly what `prefetch_distance=1` removes: the same point
+reads 2.58 GiB, and the forward stays between 3.1 and 3.7 GiB throughout.
+
+But the step's peak is not there. In *both* arms the sampled maximum is at the
+last node of the backward (`reduce_scatter.0`, 8.15 GiB, identical), reached by
+a monotone climb through the backward — full gradients allocated ahead of
+their deferred frees (`defer_free_full_grads`, same background-thread pattern
+as the parameters). The forward budget shaved 0.57 GiB off a region that was
+below the peak. F42 attributed the whole effect to parameter buffers; the
+parameter half is real and the gradient half sets the number.
+
+Host-sync lowers the peak anyway because it throttles dispatch *globally*: with
+the host unable to run ahead, deferred frees of every kind keep pace. It works
+by accident of coarseness, which is why it is a knob and not a fix.
+
+### What this establishes
+
+An issue budget is two things. In the DAG it is an edge that bounds when a
+collective's stream work may begin — `prefetch_distance` and `ring_exchange`'s
+`distance` do that, and the CPU tests show it. In the runtime it is an
+allocation policy that bounds what may be *held* — and Piper's runtime allocates
+at host dispatch and frees on a background thread, so the second half does not
+exist and the first half alone is measurably nothing (slope 3.99 vs 3.61).
+
+The fix is in the runtime and invisible from the DAG: bounded pools for
+full-parameter and full-gradient buffers, `distance+1` slots, reuse ordered by
+the free event on the stream rather than by a host wait. That preserves the
+asynchronous dispatch the host-sync knob sacrifices. Not built here; the
+argument and the measurement that motivates it are.
+
+### Timing in these runs is not a result
+
+The memory gate deliberately shares cards with tenants at 100% utilization.
+Iteration times swing from 0.066 s (shipped, 8 stages) to 0.33 s (pf1, 8
+stages) with no schedule reason; F36's contamination signature. The overlap
+questions stay with the four-card chains.
