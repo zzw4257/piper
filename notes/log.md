@@ -2433,3 +2433,64 @@ is the regime where nobody needs CP. A sweep down to s_local=256 is queued.
 replaces it. The paragraph was written from the shape of the ZeRO-3 failure
 without lowering a ring DAG at four steps — the same error as F37, one level
 down, and caught the same way.
+
+## 2026-09-14 — F47: replicated on different hardware, the race-free arms reproduce exactly and the racing arms do not — so without the pool, ZeRO-3's peak memory is a property of the machine, not of the program
+
+### Tested
+
+The F42/F44 memory-slope experiment re-run unchanged on two H200s (ZJU host,
+CUDA 12.8, torch 2.10.0+cu128) against the original two B200s
+(catalyst-fleet1). Identical model, depths, metric and code; different GPU,
+different driver, different host load.
+
+### Result
+
+| arm | B200 slope | H200 slope | depends on the host/GPU race? |
+|---|---|---|---|
+| plain DP | 4.00 | **4.00** | no — no deferred frees |
+| ZeRO-3 as shipped | 3.61 | **3.06** | **yes** |
+| `prefetch_distance=1`, DAG edge only | 3.99 | **2.85** | **yes** |
+| `prefetch_distance=1` + pool | 2.01 | **2.01** | no — pool removes it |
+| shipped ZeRO-3 + pool | 3.01 | **3.01** | no — pool removes it |
+
+Three arms reproduce to two decimals across different silicon. The two that do
+not are exactly the two F43 identified as governed by how far the host runs
+ahead of the GPU before the background free thread catches up. A faster GPU
+keeps up better, fewer buffers are live at once, and the slope falls.
+
+The ordering even flips: on B200, `prefetch_distance=1` was *worse* than shipped
+(3.99 vs 3.61); on H200 it is *better* (2.85 vs 3.06). Same code, same
+schedule, opposite conclusion about whether the directive helps.
+
+### What this establishes
+
+F43 argued from a memory trace that the peak is set by a host-ahead-of-GPU race
+over deferred frees, and demonstrated it by blocking the host. This is the
+stronger form of the same claim, and it needed a second machine to make:
+
+> Under Piper's shipped ZeRO-3, **peak memory is not a function of the program.**
+> It is a function of the ratio between host dispatch rate and GPU execution
+> rate. The same schedule on the same code gives 3.61 or 3.06 stage-bytes
+> depending on the card, and two schedules can swap places.
+
+That is a correctness-of-reasoning problem before it is a performance problem: a
+user who measures a memory saving from a scheduling change on one machine has
+not measured a property of their schedule. The pool restores the property —
+2.01 and 3.01 on both machines, to two decimals — which is a better argument
+for it than the 11.6-vs-19.2 GiB headline in F44.
+
+It also retroactively explains the rank asymmetry in F42 (up to 1.3 GiB between
+two ranks of the same run) that vanished under both the host-sync knob and the
+pool: two ranks of one job are two instances of the same race.
+
+### Note on what was *not* replicated
+
+The absolute peaks differ between hosts even in the reproducing arms (e.g. plain
+DP 8 stages: 20.03 GiB on B200, 20.1 GiB on H200), which is allocator rounding
+and context size, not signal. The slope is the invariant; the intercept is not.
+
+### Environment
+
+All 78 CPU tests pass on the H200 host and the out-of-band CP gate reproduces
+bit-identically (F45). The tree there is a clone of `feat/tp-sharding` used as a
+run site; commits are made only on catalyst-fleet1.
