@@ -28,3 +28,21 @@ def test_keys_do_not_mix_and_none_event_means_no_wait() -> None:
 def test_fresh_allocations_are_counted_per_key() -> None:
     pool = _BufferPool()
     assert pool.note_fresh("k") == 1 and pool.note_fresh("k") == 2 and pool.note_fresh("j") == 1
+
+
+def test_release_detaches_by_replacing_the_tensor_and_reattach_restores_views() -> None:
+    """set_ bounds-checks, so the released tensor cannot keep shape (8,) over an
+    empty storage; the pool therefore hands the storage on and rebuilds the
+    tensor object on the next alloc. This is the invariant the first GPU run of
+    the pool violated."""
+    import torch
+    full = torch.arange(8, dtype=torch.float32)
+    view = full[2:6].view(2, 2)
+    pooled = full.untyped_storage()
+    # release
+    full = torch.empty(0, dtype=torch.float32)
+    view = torch.empty(0, dtype=torch.float32)
+    assert full.numel() == 0 and view.numel() == 0
+    # re-attach
+    full = torch.empty(0, dtype=torch.float32).set_(pooled, 0, (8,))
+    assert full[2:6].view(2, 2).tolist() == [[2.0, 3.0], [4.0, 5.0]]
