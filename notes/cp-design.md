@@ -1,6 +1,10 @@
 # Stage G design: what a collective is allowed to depend on
 
-Status: design. Nothing implemented. Marks follow the project rule —
+Status (2026-09-13): G-0 done (log F37 falsified F-c on the way; see §2 F-c′),
+G-1a/b done — boundary outputs carry a forwarded flag, `ring_exchange` lowers as
+the edge-spliced baseline, 67 CPU tests green. G-2 queued on the GPU gate
+(`experiments/run_cp_gate.sh`). F38 found while composing with `replicate`.
+Marks follow the project rule —
 **[code]** verified by reading `src/` at `0b65fb3`, **[intent]** from upstream
 issue #15 / README, **[proposed]** mine.
 
@@ -146,11 +150,12 @@ placeholder in intermediate segments? This is the whole design's crux and costs
 nothing. *Exit:* dump the segments and assert the placeholder property, or
 record that it fails and stop.
 
-**G-1 (CPU).** Multi-tensor boundaries (`tensor_idxs`) + a `ring_exchange`
-directive that still splices on the edge (no hoisting). *Exit:* DAG contains
-`2n` ring comm nodes with correct peer wiring; still topologically sorts.
+**G-1 (CPU) — done.** Boundary `outputs[]` with a forwarded flag (G-1a,
+`2e480d3`) and `ring_exchange` spliced on the edge, no hoisting (G-1b,
+`2995530`). Lowered order is `CP_i -> ring -> CP_{i+1}` both ways. The pass
+acts on edges *between* matched regions, the exact set `shard_tensor` skips.
 
-**G-2 (2 GPU).** Ring P2P executor over `ep_group` + numerics. Gate first,
+**G-2 (2 GPU) — queued.** Ring P2P executor over `ep_group` + numerics. Gate first,
 outside Piper: `torchrun` ring attention with online-softmax/LSE accumulation
 against a single-GPU reference, tolerance from a measured noise floor, with a
 negative control that drops the rotation. Only then inside Piper.

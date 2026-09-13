@@ -14,7 +14,7 @@ pick_two() {  # two cards with util<10% and mem<8GB, 3 samples 30s apart
   local ok=""; for s in 1 2 3; do
     ok=$(nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader,nounits \
         | awk -F', ' '$2<10 && $3<8000 {print $1}' | head -2 | paste -sd,)
-    [ "$(echo $ok | tr ',' '\n' | wc -l)" -lt 2 ] && return 1
+    [ "$(echo $ok | tr ',' '\n' | grep -c .)" -lt 2 ] && return 1
     sleep 30
   done
   echo "$ok"
@@ -41,12 +41,19 @@ for MODE in zero3 dp; do
     S=$(mk $N $SP $SG)
     LOG=logs/zero3_peak_${MODE}_s${N}.log
     echo "== $MODE stages=$N $(date -Is)" >> $OUT
-    CUDA_VISIBLE_DEVICES=$CARDS PYTHONPATH=examples:. timeout 900 \
-      python examples/test_tp_mlp.py --schedule-directives-file $S --stages $N --tp 1 \
-        --dim $DIM --hidden $HID --warmup 1 --iters 2 --temp-dir /var/tmp/ziweizho-ray \
-        > $LOG 2>&1
-    echo "rc=$? per_stage_bytes=$(( 2*DIM*HID*4 ))" >> $OUT
-    grep -E "peak_memory|peak" $LOG | tail -4 >> $OUT
+    CUDA_VISIBLE_DEVICES=$CARDS timeout 1200 \
+      python examples/test_harness.py --test-file examples/test_tp_mlp.py \
+        --base-schedule $S --schedule custom \
+        --stages $N --tp 1 --dim $DIM --hidden $HID --warmup 1 --iters 2 \
+        --temp-dir /var/tmp/ziweizho-ray > $LOG 2>&1
+    RC=$?
+    RUN=$(grep -oE "out/[0-9]{8}_[0-9]{6}" $LOG | tail -1)
+    echo "rc=$RC run=$RUN per_stage_bytes=$(( 2*DIM*HID*4 ))" >> $OUT
+    [ -n "$RUN" ] && python - "$RUN" <<'PY' >> $OUT 2>&1
+import glob, json, sys
+for f in sorted(glob.glob(f"{sys.argv[1]}/tp_metrics_dp*.json")):
+    m = json.load(open(f)); print(f"  dp_rank={m.get('dp_rank')} peak_memory_by_rank={m.get('peak_memory_by_rank')}")
+PY
   done
 done
 echo "done $(date -Is)" >> $OUT

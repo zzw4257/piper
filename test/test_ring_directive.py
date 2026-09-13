@@ -110,3 +110,35 @@ def test_missing_tensor_list_is_refused() -> None:
     d = _ring(["k"]); del d["tensors"]
     with pytest.raises(BackendCompilerFailed, match="non-empty `tensors` list"):
         _lower([_PLACE, _SPLIT, d], steps=2)
+
+
+def test_composes_with_replicate_on_the_projection_region() -> None:
+    """Real CP needs the projection weights' gradients reduced across the group
+    (they see different sequence chunks); ring regions carry no parameters."""
+    rep = {"op": "replicate", "filter": {"PP": 0}, "devices": [0, 1],
+           "reduce_stream": "dp_stream", "shard_grads": False, "shard_params": False}
+    dag = _lower([_PLACE, _SPLIT, rep, _ring(["k", "v"])], steps=3)
+    kinds = {}
+    for n in dag.nodes.values():
+        kinds[n.node_kind] = kinds.get(n.node_kind, 0) + 1
+    assert kinds.get("RING_COMM") == 4, kinds
+    assert kinds.get("REDUCE_COMM", 0) >= 2, kinds   # q_proj and o_proj at least
+
+
+def test_replicate_attaches_reductions_to_parameter_free_regions() -> None:
+    """Characterizes log F38: _insert_reduce_comm_nodes filters on BWD subkind,
+    tag and device but not on whether the region has trainable parameters, so
+    every CP region (param_idxs == []) gets a REDUCE_COMM with nothing to reduce.
+    The all-gather pass does check. When the guard is added this test flips."""
+    rep = {"op": "replicate", "filter": {"PP": 0}, "devices": [0, 1],
+           "reduce_stream": "dp_stream", "shard_grads": False, "shard_params": False}
+    dag = _lower([_PLACE, _SPLIT, rep], steps=3)
+    empty_reductions = []
+    for e in dag.edges:
+        if e.dep_kind != "data" or dag.nodes[e.dst_uid].node_kind != "REDUCE_COMM":
+            continue
+        bwd = dag.nodes[e.src_uid]
+        fwd = dag.nodes[bwd.node_meta["fwd_uid"]]
+        if not fwd.node_meta.get("param_idxs"):
+            empty_reductions.append((e.src_uid, e.dst_uid))
+    assert len(empty_reductions) == 3, empty_reductions   # one per CP region
