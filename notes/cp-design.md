@@ -173,7 +173,9 @@ so the DAG half alone is measurably nothing. The peak is a host-ahead-of-GPU
 race over deferred frees: full parameters in shipped ZeRO-3's forward, full
 gradients in every arm's backward. The fix is bounded pools (`distance+1`
 slots for full parameters and full gradients, reuse ordered by the free event
-on the stream, no host wait), invisible from the DAG. The ring has the same
+on the stream, no host wait), invisible from the DAG. **Built (F44,
+`PIPER_BUFFER_POOL=1`): with the DAG edge, slope 2.01; pool alone, 3.01; both
+predictions held.** The ring has the same
 exposure in principle — recv buffers are allocated at dispatch — which two
 ranks cannot show and four might.
 
