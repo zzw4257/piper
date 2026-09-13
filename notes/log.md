@@ -2823,3 +2823,75 @@ ring arithmetic and excludes only the collectives.
 The same sweep on H200 — if the ~8 ms constant is a property of Ray and the
 Python dispatch loop it should reproduce; if it is a property of the host it
 should not. That is the F47 test applied to the fourth symptom.
+
+## 2026-09-14 — F51: run on two machines, every structural claim reproduces and every constant lands where its mechanism says it should
+
+### Method
+
+The F48/F49/F50 sweeps re-run unchanged on four H200s (ZJU host, NVLink 4,
+CUDA 12.8, a box with 94 logged-in users and load ~8) against four B200s
+(catalyst-fleet1, NVLink 5, CUDA 12.8, idle). Same code, same payloads, same
+iteration counts. This is the F47 test applied to everything Stage G claims:
+a structural claim should reproduce, a hardware constant should not, and a
+software constant should.
+
+### Result
+
+| quantity | B200 | H200 | reproduces? | what it therefore is |
+|---|---|---|---|---|
+| all-reduce intercept `a` | 41.7 us | **44.5 us** | **yes, 7%** | launch + protocol — software |
+| all-reduce slope `b` | 2.49 us/MiB | **4.51 us/MiB** | no, 1.81x | fabric bandwidth — hardware |
+| affine form, max residual | 11.0 us | **7.6 us** | **yes** | the law itself holds |
+| ring is *not* affine, residual | 264 us | **254 us** | **yes** | NCCL protocol piecewise |
+| ring localization knee | 32 -> 40 MiB | **32 -> 40 MiB** | **yes, exactly** | a P2P buffer constant |
+| `natural - synced` | ~2 us | **~3 us** | **yes** | symmetric work never drifts ranks |
+| additive law (`max` refuted) | confirmed | **confirmed** | **yes** | queueing, not hardware |
+| runtime overhead, form | flat over 18x work | **flat over 3.8x** | **yes** | a per-iteration host constant |
+| runtime overhead, value | 6.8–9.7 ms | **10.3–10.9 ms** | no | host CPU and load |
+
+Effective bandwidths (421 vs 232 GB/s) are in the right ratio for NVLink 5
+against NVLink 4, so the slope is measuring what it should.
+
+### The two entries that carry the most
+
+**The intercept is software and the slope is hardware, and the sweep separates
+them.** 41.7 vs 44.5 us of fixed cost on machines whose bandwidths differ by
+1.8x is not a coincidence; it is the affine form being the right
+decomposition. A cost model for Piper can therefore be *calibrated per machine
+in one sweep* and its structure carried across — which is precisely what a
+scheduling search needs and what F31/F32's "cost is not a function of volume"
+appeared to deny.
+
+**The ring's knee is at the same place on both machines.** Two GPU generations,
+two NVLink generations, two hosts: the upstream sender pays 0 us at 32 MiB and
+~1650–1700 us at 40 MiB on both. A bandwidth effect could not do that. It is a
+protocol/buffer constant, and it turns F45's observation into a design rule
+that transfers: **keep a ring's per-hop message under 32 MiB and a straggler
+costs one neighbour; above 40 MiB it costs two.** For CP that is a chunk-size
+constraint, `batch * heads * s_local * head_dim * 4 < 32 MiB`, and it is
+checkable at compile time from the traced shapes.
+
+### The one that is most uncomfortable
+
+The runtime overhead is flat on both machines and *larger on the busier host*
+(10.6 ms on a box with 94 users against 8.2 ms on an idle one). That is
+consistent with it being host-side work — which is what F50 concluded — and it
+means the denominator every scheduling measurement in this project divides by
+is set by who else is logged into the machine. It does not invalidate the
+comparisons, which were interleaved A/B within one window, but it does mean a
+number like "`order` is worth 16%" is a number about one machine at one moment
+in a way that "collective cost is `a + b*bytes`" is not.
+
+### What is now established well enough to hand over
+
+Structure, on two machines: collective cost is affine in bytes for an
+all-reduce and piecewise for raw P2P; skew and transport add rather than
+dominate; symmetric GPU work does not create skew; a ring localizes a straggler
+below a 32-40 MiB protocol knee; the runtime costs a model-independent constant
+per iteration. Constants: per machine, one sweep each, scripts in
+`experiments/probe_collective_law.py`, `probe_skew_transfer.py`,
+`probe_host_bound.py`.
+
+Not established: whether the ~8-11 ms is Ray, the Python dispatch loop, or the
+actor round trip — a breakdown needs host-side instrumentation of `run_dag`,
+which is the obvious next measurement and the one that would say what to fix.
