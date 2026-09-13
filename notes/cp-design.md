@@ -1,0 +1,208 @@
+# Stage G design: what a collective is allowed to depend on
+
+Status: design. Nothing implemented. Marks follow the project rule —
+**[code]** verified by reading `src/` at `0b65fb3`, **[intent]** from upstream
+issue #15 / README, **[proposed]** mine.
+
+---
+
+## 1. The question
+
+The TP work (Stages A–F) concluded that Piper's parallelism is entirely "which
+collective is inserted where", and that TP fits that abstraction perfectly —
+too perfectly to test it. The open question left behind was whether context
+parallelism (CP) fits.
+
+Structurally it does: write each ring step as an annotated region and the K/V
+exchange lands on a region boundary, where the Stage B/C machinery already
+works. But ring attention exists to overlap the exchange of block `i+1` with
+the attention compute on block `i`, and a boundary collective in Piper sits
+*between* two regions. The earlier conclusion was therefore: **CP would run
+correctly and lose the reason to use it.**
+
+That conclusion named the symptom ("a region is the minimum schedulable unit")
+rather than the cause. This design locates the cause, and it is narrower and
+more actionable than the symptom suggested.
+
+## 2. What the code actually does [code]
+
+Three facts, each independently verified:
+
+**F-a. Every collective is spliced onto a dataflow edge.**
+`_insert_shard_a2a_comm_nodes` and `_insert_tp_all_reduce_comm_nodes` both
+rewrite `u -> v` into `u -> c -> v`
+(`directives.py:1143-1144`, `directives.py:1168-1169`). The comm node's
+dependency is therefore *the producing region's completion*, by construction.
+
+**F-b. Piper already materializes pass-through values explicitly.**
+A value defined in segment `s` and used in segment `s+3` is threaded through
+`s+1` and `s+2` as an input and re-emitted as an output
+(`fx.py:591-598`: `for target_seg in range(seg + 1, max_seg + 1)`). In the
+intermediate segment's GraphModule that output element **is literally a
+placeholder** — the segment forwards it without touching it.
+
+**F-c. The ordering pass anchors any non-default-stream node to its nearest
+default-stream neighbour.** `resolve_total_order_per_stream`
+(`ordering.py:115-159`) places a stream node next to
+`min(default_anchors, key=(topo_level, topo_idx))`. ZeRO-3's
+`ALL_GATHER_COMM` is created as a DAG **root** — no incoming edge at all,
+except in the `BWD_W` case (`directives.py:867-895`) — so it is
+dependency-free and could legally be issued arbitrarily early. The ordering
+pass still pins it immediately before its consumer.
+
+## 3. The gap, stated precisely [proposed]
+
+Piper's passes conflate two different things:
+
+- the **edge a collective travels on** (which tensor moves, between whom), and
+- the **dependency a collective has** (when it may start).
+
+For all three shipped collectives these coincide, because all three are
+*producer–consumer* collectives: the gradient all-reduce must wait for the
+gradient, the EP all-to-all must wait for routing, the TP all-reduce must wait
+for the partial sum. The conflation is invisible because it has never been
+wrong.
+
+Ring attention's K/V rotation is the first collective where they differ. Its
+payload is ready when the producing region *begins*, not when it ends. F-b says
+this is not a subtle property — it is visible in the segment's output tuple as a
+bare placeholder.
+
+So the limitation is not "a region is the minimum schedulable unit". It is:
+
+> **A collective's earliest-ready point is currently defined to be its edge's
+> source-region completion, and there are two independent mechanisms (F-a at
+> insertion, F-c at ordering) that enforce that. Neither is required by the IR,
+> which is a general DAG with per-node streams and cross-stream events.**
+
+Both must be lifted. Lifting only F-a leaves F-c to re-serialize the result;
+this is a concrete prediction the first experiment will test (§7, P1).
+
+## 4. Proposal: derive the earliest-ready point [proposed]
+
+Do **not** add placement/partition types to the IR. That would be fitting the
+abstraction to TP, the one case that already worked. Add instead a single
+analysis, and let every existing directive benefit from it.
+
+**G1 — earliest-ready analysis.** For a boundary tensor `t` produced by segment
+`s`, take the backward slice of `t` inside `s`'s GraphModule.
+- slice touches only placeholders → `t` is ready at the start of `s`; the
+  collective's true dependency is the set of DAG nodes defining those
+  placeholders.
+- slice is empty (sharded parameters, ZeRO-3) → no dependency; ready at step
+  start.
+- slice touches compute → unchanged, current behaviour is already tight.
+
+By F-b the common case degenerates to "is output element `i` a placeholder",
+which needs no slicer. Build that first; add the slicer only when a model needs
+it (an explicit rotate op inside the region is the case that needs it).
+
+**G2 — hoist with a budget.** Hoisting `k` regions keeps `k` extra buffers live.
+Express it as a directive argument, not a heuristic:
+`{"op": "prefetch", "filter": ..., "distance": 1}`. CP is `distance=1`;
+ZeRO-3 parameter prefetch is the same directive with `distance>=1` and an
+empty slice. One mechanism, two features.
+
+**G3 — release the ordering anchor.** A hoisted node needs an explicit release
+point instead of `min(default_anchors)`. Cheapest correct form: anchor it to
+the default-stream node its *derived* dependency set ends at, which is exactly
+what G1 computes. This is a change to how the anchor is chosen, not to the
+ordering algorithm.
+
+**G4 — mechanical prerequisites.** A boundary records one `tensor_idx`
+(`fx.py:686`, `_select_boundary_tensor_idx` at `fx.py:495` is a float/
+requires_grad scoring heuristic); CP moves K and V, so this becomes a list.
+`send`/`recv` are `peer_pp_rank`-typed and use the PP groups
+(`executors.py:42-71`); a ring needs intra-group P2P over the existing
+`ep_group` ranks.
+
+## 5. Why this is the right generalization
+
+The test of an abstraction is whether it explains something it was not derived
+from. G1/G2/G3 were derived from CP, and they immediately explain a missing
+optimization in a *shipped* Piper feature: ZeRO-3 cannot prefetch the next
+layer's parameters, which every production ZeRO implementation does by hand.
+F-c says why, and G3 says what to change. That is evidence the framing is at
+the right level; a placement type system would have explained neither.
+
+## 6. Ladder
+
+Each rung is cheap-before-expensive and has a falsifiable exit.
+
+**G-0 (CPU, no GPU).** Can Dynamo trace a ring-attention-shaped model into `n`
+contiguous annotated segments, and does the K/V boundary output appear as a
+placeholder in intermediate segments? This is the whole design's crux and costs
+nothing. *Exit:* dump the segments and assert the placeholder property, or
+record that it fails and stop.
+
+**G-1 (CPU).** Multi-tensor boundaries (`tensor_idxs`) + a `ring_exchange`
+directive that still splices on the edge (no hoisting). *Exit:* DAG contains
+`2n` ring comm nodes with correct peer wiring; still topologically sorts.
+
+**G-2 (2 GPU).** Ring P2P executor over `ep_group` + numerics. Gate first,
+outside Piper: `torchrun` ring attention with online-softmax/LSE accumulation
+against a single-GPU reference, tolerance from a measured noise floor, with a
+negative control that drops the rotation. Only then inside Piper.
+*Exit:* correct, and **measurably non-overlapped** — this is the baseline the
+rest is measured against.
+
+**G-3 (2 GPU).** G1 analysis + G2 hoist + G3 anchor release.
+*Exit:* the ring comm node's DAG predecessors no longer include the producing
+region, and the concurrency metric (kernel-sum / wall-span) rises against G-2
+on the same inputs, interleaved A/B.
+
+**G-4.** Apply the same directive to ZeRO-3 parameter prefetch on an existing
+shipped example. *Exit:* it works with no new mechanism, or it does not and the
+reason is recorded.
+
+**G-5 (backward).** Piper builds BWD by reversing FWD data edges. Whether that
+produces a correct reverse ring for K/V gradients is genuinely unknown and is
+the deepest risk; it is deliberately last so that a failure here does not
+invalidate G-0..G-4.
+
+## 7. Pre-registered predictions
+
+Written before running anything, so a later result cannot be retrofitted.
+
+**P1.** Lifting F-a alone changes nothing measurable, because F-c re-anchors the
+hoisted node. If G-3 shows a gain with the anchor change *reverted*, the F-a/F-c
+two-mechanism claim in §3 is wrong.
+
+**P2.** The Stage E/F finding — every collective re-pays a rank arrival skew of
+157–2831 us, and cost is near-independent of payload — predicts that hoisting
+may raise the concurrency metric without improving step time, because the wait
+moves rather than disappears. A concurrency gain with no wall-clock gain is
+therefore a *confirmation*, not a disappointment, and must be reported as such.
+
+**P3.** A ring P2P couples rank `r` only with `r±1`, so arrival skew should
+*propagate* rather than be globally summed as in an all-reduce. Prediction: for
+equal payload, ring P2P shows materially lower iteration-to-iteration variance
+than all-reduce. This is testable independently of whether CP itself succeeds,
+and it isolates whether the "skew tax" is a property of global synchronization
+or of NCCL. **Run this first — it is a standalone result.**
+
+**P4.** The Stage F observation that `stream` had no effect at 1 microbatch was
+attributed to "no independent work to overlap with". F-c offers a competing
+explanation. Predicted discriminator: at 1 microbatch with an artificially
+dependency-free collective, the current anchor rule still issues it adjacently.
+If so, part of that earlier finding must be restated.
+
+## 8. Risks, cheapest check first
+
+1. Dynamo segmentation of the ring loop (G-0, free). Highest probability of
+   early failure, same as in Stage A.
+2. The placeholder property may be destroyed by graphargs lifting before it
+   reaches the DAG (G-0, free).
+3. Online-softmax numerics — a CP bug and a Piper bug look identical in the
+   loss; the out-of-framework gate exists to separate them (G-2).
+4. Overlap measurement on a contended host is exactly the measurement that was
+   least reliable in Stage E/F. Reuse the median/min contamination check and
+   report concurrency, not wall time alone.
+5. Backward ring correctness (G-5, expensive, deferred by design).
+
+## 9. What would make me drop this
+
+If G-0 shows the K/V boundary does not survive as a placeholder, the cheap form
+of G1 is gone and the design needs a real slicer — at which point the honest
+move is to write down that Piper's segmenter erases the information the
+analysis needs, and stop, rather than build the slicer to save the thesis.
