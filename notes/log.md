@@ -2605,3 +2605,43 @@ That converts a dead end into a specification: a usable cost model for Piper is
 `max(a + b*bytes, skew)` with `a, b` measurable in one sweep like this one and
 `skew` a property of the dispatch loop. Whether `skew` is predictable at all is
 the next question, and it is a runtime question.
+
+### Correction to F48, same day, from its own data
+
+F48 above states the law as `cost ~ max(transport(bytes), arrival skew)`. Its
+own table falsifies that form. Subtracting the synced arm from the skewed arm
+at each payload:
+
+| MiB | synced | skewed | difference |
+|---|---|---|---|
+| 4 | 47.8 | 1973.6 | 1925.8 |
+| 32 | 132.3 | 2045.9 | 1913.6 |
+| 64 | 197.1 | 2100.9 | 1903.8 |
+| 128 | 360.5 | 2268.1 | 1907.6 |
+| 256 | 678.8 | 2549.2 | 1870.4 |
+
+The difference is constant to within 3% across a 64x payload range. Under a
+`max` law it would have collapsed toward zero as transport approached the
+skew; it does not. The terms **add**:
+
+    cost(waiting rank) = transport(bytes) + skew
+    cost(late rank)    = transport(bytes)
+
+which is also what the mechanism requires: the group cannot begin until the
+last rank arrives, so every other rank measures its own wait plus the transfer,
+while the late rank measures the transfer alone. The per-rank table in Result 4
+already showed the late rank paying ~0 and is consistent with this.
+
+The distinction matters for the thing F48 is about. Under `max`, once skew
+dominates, reducing communication volume buys nothing — which is how F31/F32's
+"payload barely matters" invited being read. Under addition, cutting bytes
+always buys its full transport time even while skew is the larger term, so
+`fuse_collectives` and payload reductions keep their value in exactly the
+regime where the earlier reading said they had none.
+
+The `max` form was written from the two endpoints of the skewed row without
+differencing it against the synced row sitting beside it — the F17 error
+(fitting a curve through two points) in a new place. `probe_skew_transfer.py`
+sweeps skew over 0-3200 us at three payloads to test the form rather than infer
+it; it predicts `(waiting - base)/skew = 1.0` everywhere, against a `max` law's
+prediction that the ratio falls below 1 whenever base > skew.
