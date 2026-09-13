@@ -1836,3 +1836,88 @@ limitation is now recorded rather than implied.
 
 **F34's numbers stand**, measured in a better window. Substituting this window's
 would be choosing the data that suits the conclusion; both are in the log.
+
+## 2026-09-13 — F37: a collective's issue point is an accident of topological level; ZeRO-3 gathers every layer before the first forward runs, and `cp-design.md` F-c is retracted
+
+### Tested
+
+`notes/cp-design.md` §7 P4 asked whether the ordering pass pins a
+dependency-free collective next to its consumer. The cheapest discriminator is
+ZeRO-3's `ALL_GATHER_COMM`, which `directives.py:867-895` creates with no
+incoming edge. Three stages, one device group, `replicate(shard_params=true)`,
+mb=1 and mb=2 (`examples/base-schedules/zero3_s3_mb{1,2}.json`), lowered on CPU
+and printed with `experiments/dump_dag.py`. Edge lists confirmed directly.
+
+### Unexpected
+
+The prediction was wrong in both of its parts.
+
+1. The anchor logic does not apply. `ALL_GATHER_COMM` is on `default_stream`;
+   `reduce_stream` governs only the reduce-scatter. `resolve_total_order_per_stream`
+   never sees it.
+2. It is not issued late. It is issued **first**. All nine forward all-gathers
+   occupy dispatch slots 0–8, before any compute node. `_serial_topological_order`
+   sorts by `(topo_level, priority, topo_idx)`; a root has level 0. That is the
+   entire mechanism — there is no policy, the position falls out of the sort key.
+
+The backward all-gathers are the same story one step later: each has exactly one
+predecessor, a *temporal* edge from its layer's forward compute (free-after-forward,
+re-gather-any-time-after), so `all_gather.9` for `s0.seg0.bwd` is issued at slot 10
+and consumed at slot 42.
+
+### Consequence for the shipped system
+
+Full parameters are released by `defer_free_full_params` *after* the consuming
+compute (`executors.py:837-1120`). By the dispatch order, when `s0.seg0` runs every
+layer's full parameters have already been gathered and none has been freed.
+**Peak parameter memory under this schedule is the unsharded total** — the quantity
+ZeRO-3 exists to avoid. Correctness is unaffected; the memory saving is. This is
+stated from the dispatch order and the free point; a GPU measurement of
+`max_memory_allocated` against `sum(full params)` is queued behind the same
+load-gate as F36's experiments and will be recorded when the machine allows.
+
+With mb=2 the artifact is visible in another form: `all_gather.26` (MB1, last stage)
+is dispatched at slot 3, before MB0's first forward.
+
+### IR-runtime assumption discovered
+
+The design document claimed two mechanisms conspire to serialize a ring exchange:
+edge-splicing at insertion (F-a) and a late-pinning anchor at ordering (F-c).
+F-a stands (`directives.py:1143,1168`). F-c is **retracted** — the anchor rule is
+real but irrelevant to this collective, and the actual behaviour is the opposite
+sign.
+
+What replaces it is narrower and, I think, more useful:
+
+> Piper has no notion of *where* a collective is issued. Position is a function of
+> graph structure only. An edge-spliced collective is issued when its source region
+> completes (too late for CP, whose payload was ready at region start); a root
+> collective is issued at topological level 0 (too early for ZeRO-3, whose memory
+> budget wanted it one layer ahead). Both are the same missing concept — an
+> earliest-ready point and an issue budget between it and the consumer — seen from
+> opposite ends.
+
+That reframing makes the `distance` argument in cp-design §4 G2 the *missing*
+knob rather than an optimization: today the only two available values are 0 (for
+spliced collectives) and ∞ (for roots).
+
+### Retraction discipline
+
+F-c was written from reading `ordering.py:115-159` and `directives.py:867-895`
+together and inferring the interaction without lowering a DAG. The inference was
+plausible and wrong. It cost one CPU probe to test; the rule from F16/F17 applies
+to reading code as much as to reading timings: a mechanism inferred from two
+sites is a hypothesis until the lowered artifact is looked at.
+
+### Open question
+
+Whether the executor *actually* holds all gathered buffers concurrently, or whether
+`ParamStore` aliases them in a way the dispatch order does not show. The dispatch
+order says yes; the measurement decides.
+
+### Next experiment
+
+`test/test_zero3_dispatch_order.py` pins the three facts above as a
+characterization test so the eventual issue-policy change has a red test to turn
+green. Then G-1 (multi-tensor boundaries) proceeds unchanged — F37 strengthens its
+motivation rather than altering its shape.
