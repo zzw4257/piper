@@ -52,7 +52,7 @@ for MODE in zero3 zero3_pf1 dp; do
         --temp-dir /var/tmp/ziweizho-ray > $LOG 2>&1
     RC=$?
     RUN=$(grep -oE "out/[0-9]{8}_[0-9]{6}" $LOG | tail -1)
-    echo "rc=$RC run=$RUN per_stage_bytes=$(( 2*DIM*HID*4 ))" >> $OUT
+    echo "rc=$RC run=$RUN per_stage_bytes=$(( (2*DIM*HID + 2*DIM*DIM)*4 ))" >> $OUT
     [ -n "$RUN" ] && python - "$RUN" <<'PY' >> $OUT 2>&1
 import glob, json, sys
 for f in sorted(glob.glob(f"{sys.argv[1]}/tp_metrics_dp*.json")):
