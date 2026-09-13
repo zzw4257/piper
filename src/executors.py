@@ -227,6 +227,37 @@ class CommunicationExecutor:
         return False
 
 
+def boundary_outputs(out_list: list, fwd_inputs: list) -> list:
+    """Detach a segment's boundary outputs, except the ones it merely forwards.
+
+    A segment output that *is* one of the segment's own inputs is forwarded, not
+    produced -- the property notes/cp-design.md G1 relies on, decided here by
+    object identity rather than by metadata so it cannot drift from what the
+    GraphModule actually returned.
+
+    Detaching a forwarded value builds a shadow leaf whose only job is to receive
+    the downstream gradient and hand it to the real leaf one autograd call later.
+    Emitting the input itself lets that gradient land directly on the leaf, and
+    the produced outputs' backward accumulates the in-segment contribution on
+    top: the same sum, one tensor and one graph entry fewer.
+
+    The pairing rule this creates is load-bearing: ``pre_detach_outs[i] is
+    detached_outs[i]`` marks a forwarded output, and ``ComputeExecutor.backward``
+    must *not* drive such a pair or the downstream gradient is counted twice.
+    See ``test/test_boundary_outputs_runtime.py``.
+    """
+    input_ids = {id(t) for t in fwd_inputs if isinstance(t, torch.Tensor)}
+    out = []
+    for t in out_list:
+        if not isinstance(t, torch.Tensor) or not t.requires_grad:
+            out.append(t)
+        elif id(t) in input_ids:
+            out.append(t)
+        else:
+            out.append(t.detach().requires_grad_(True))
+    return out
+
+
 @dataclass
 class ComputeExecutor:
     """Actor-local bucket forward/backward execution."""
@@ -296,12 +327,7 @@ class ComputeExecutor:
             fwd_args[i] = None
 
         out_list = list(output) if isinstance(output, tuple) else [output]
-        possibly_detached = [
-            t.detach().requires_grad_(True)
-            if isinstance(t, torch.Tensor) and t.requires_grad
-            else t
-            for t in out_list
-        ]
+        possibly_detached = boundary_outputs(out_list, fwd_inputs)
         out_with_grad = [
             t for t in out_list if isinstance(t, torch.Tensor) and t.requires_grad
         ]
@@ -335,12 +361,22 @@ class ComputeExecutor:
                 with torch.cuda.stream(compute_stream):
                     outputs_or_loss[0].backward()
         else:
+            # `p is d` marks a forwarded output (forward above emitted the input
+            # itself). Its downstream gradient was assigned straight onto the
+            # leaf, so driving it would accumulate the same gradient a second
+            # time. Skip the pair; the value is already where inp_grads reads it.
             bwd_pairs = [
                 (p, d.grad)
                 for p, d in zip(pre_detach_outs, detached_outs)
-                if (isinstance(d, torch.Tensor) and d.requires_grad and d.grad is not None)
+                if (isinstance(d, torch.Tensor) and d.requires_grad
+                    and d.grad is not None and p is not d)
             ]
-            assert bwd_pairs, (
+            forwarded_with_grad = any(
+                isinstance(d, torch.Tensor) and d.requires_grad
+                and d.grad is not None and p is d
+                for p, d in zip(pre_detach_outs, detached_outs)
+            )
+            assert bwd_pairs or forwarded_with_grad, (
                 f"BWD ubid={ubid} mb={mb_idx}: detached boundary has no tensors "
                 "with a materialized grad"
             )

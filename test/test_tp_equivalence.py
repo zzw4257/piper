@@ -75,11 +75,20 @@ class _F(torch.autograd.Function):
 
 
 def _global_weights(device):
-    """The same weights examples/test_tp_mlp.py uses, on this device."""
-    return {
-        k.removesuffix(".weight"): v.to(device)
-        for k, v in global_weights(DIM, HIDDEN, SEED, DTYPE).items()
-    }
+    """The same weights examples/test_tp_mlp.py uses, on this device.
+
+    `global_weights` keys by module path (`blocks.0.up.weight`) so the in-Piper
+    run can push them straight into `named_parameters()`. This gate builds one
+    block, so the last path component identifies each weight; asserting that
+    keeps the short names honest if the model ever grows a second block.
+    """
+    full = global_weights(DIM, HIDDEN, SEED, DTYPE)
+    short = {k.removesuffix(".weight").rsplit(".", 1)[-1]: v.to(device) for k, v in full.items()}
+    assert len(short) == len(full), (
+        f"weight names collapse to {sorted(short)} from {sorted(full)}; this gate "
+        f"assumes a single block"
+    )
+    return short
 
 
 def _reference(weights, x):
@@ -94,6 +103,7 @@ def _sharded(weights, x, rank, tp_degree):
     local_w = shard_weights(
         {f"{k}.weight": v for k, v in weights.items()}, rank, tp_degree
     )
+    assert {"up.weight", "down.weight"} <= local_w.keys(), sorted(local_w)
     up_local = local_w["up.weight"]
     down_local = local_w["down.weight"]
 
