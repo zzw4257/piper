@@ -2645,3 +2645,101 @@ differencing it against the synced row sitting beside it — the F17 error
 sweeps skew over 0-3200 us at three payloads to test the form rather than infer
 it; it predicts `(waiting - base)/skew = 1.0` everywhere, against a `max` law's
 prediction that the ratio falls below 1 whenever base > skew.
+
+## 2026-09-14 — F49: the additive law, proved without reference to the injected value; arrival differences below ~100 us are partly absorbed; and the ring's localization ends in a step between 32 and 40 MiB
+
+### The law, in measured quantities only
+
+`experiments/probe_skew_transfer.py`, four idle B200s, all-reduce, skew swept
+0–3200 us at 4 / 32 / 128 MiB. The quantity below uses no assumption about how
+much delay was actually injected: it is the **waiting rank's cost minus the late
+rank's cost** in the same iteration. The late rank waits for nobody, so its cost
+*is* the transport term, measured rather than modelled.
+
+| skew req. | 4 MiB | 32 MiB | 128 MiB | spread |
+|---|---|---|---|---|
+| 25 | 14.5 | 18.3 | 8.6 | 70% |
+| 50 | 34.9 | 35.6 | 24.8 | 34% |
+| 100 | 71.7 | 73.3 | 76.2 | **6.2%** |
+| 200 | 160.7 | 161.8 | 150.8 | **7.0%** |
+| 400 | 335.6 | 337.7 | 326.8 | **3.3%** |
+| 800 | 660.7 | 682.0 | 666.2 | **3.2%** |
+| 1600 | 1371.0 | 1373.5 | 1368.5 | **0.4%** |
+| 3200 | 2758.1 | 2752.1 | 2749.4 | **0.3%** |
+
+Transport at these payloads is 37 / 120 / 350 us, so the 32x payload range
+changes the transport term by 9.5x while leaving this difference constant. That
+is the additive law:
+
+    cost(waiting rank) = transport(bytes) + arrival difference
+    cost(late rank)    = transport(bytes)
+
+**`max` is refuted directly, not by inference.** At 128 MiB the transport is
+350 us, so `max(transport, skew)` predicts that a skew of 25/50/100/200 us costs
+nothing at all. Measured: +9 / +25 / +76 / +151 us. The F48 body's `max` form is
+retracted; the correction appended to F48 stands and this is its test.
+
+### Arrival differences below ~100 us are partly absorbed
+
+The difference tracks the injected skew with a slope of 0.86 and an offset that
+is proportional rather than constant (25 us of skew buys 8.6–18.3 us of cost;
+3200 buys 2749–2758). Two contributions, separated:
+
+* `experiments/probe_sleep_cal.py` shows the injection itself is faithful —
+  delivered/requested is 1.000 at 3200 us and 1.26 at 25 us (it *over*-delivers
+  when small). The in-probe calibration was cold, one spin with no warmup, and
+  read 1853.7 cycles/us against a careful 1963.8, so it under-injected by 5.6%.
+* The remaining ~9% is real: a waiting rank's own NCCL setup overlaps the head
+  of its wait, so a fraction of any arrival difference is hidden.
+
+The practical form of this: **an arrival difference under about 40 us is free,
+and the absorbed fraction is roughly a tenth thereafter.** Piper's measured
+skews (F19: 157–2831 us) are an order of magnitude above the free region.
+
+### What this settles about `fuse_collectives`
+
+F34 measured fusion worth 2.35x on communication time and explained it by byte
+count and NCCL call overhead. The additive law gives the real account: each
+collective pays its own arrival difference, so fusing `n` collectives into one
+saves `(n-1)` skew payments, not `(n-1)` launch overheads. In the fused
+schedules that is 28 skew payments of 157–2831 us each against transport terms
+of order 100 us. The mechanism was mis-attributed and the measurement stands.
+
+It also answers the question F31/F32 raised and could not: cutting bytes is
+*always* worth its full transport time, because the terms add. A schedule that
+both fuses and shrinks payload collects both.
+
+### The ring's localization ends in a step, not a slope
+
+Fine sweep, 16–96 MiB, per-rank cost of a 2000 us skew over each rank's own
+synced baseline (rank 2 late; rank 1 upstream; rank 3 downstream):
+
+| MiB | opposite | **upstream** | late | downstream |
+|---|---|---|---|---|
+| 16 | 3 | **3** | −32 | 1860 |
+| 24 | 0 | **1** | −34 | 1895 |
+| 32 | −27 | **0** | −34 | 1913 |
+| 40 | 5 | **1699** | −37 | 1895 |
+| 48 | 0 | **1684** | −36 | 1177 |
+| 64 | −3 | **1700** | −40 | 1892 |
+| 96 | 2 | **1689** | −38 | 1902 |
+
+Between 32 and 40 MiB the upstream sender goes from paying nothing to paying
+1699 us. A **step**, not a transition: 0 at 32, 1699 at 40, and flat either
+side. That is a buffer or protocol constant, not a bandwidth effect — which the
+smooth affine cost curve over the same range (F48) already implied, since the
+transport term shows no feature there at all.
+
+So F45's statement is sharpened: a ring localizes a straggler to one hop for
+messages under ~36 MiB on this hardware and to two hops above it, and the
+boundary is sharp enough to be designed around. For CP this is a chunk-size
+rule: K/V per step under the knee keeps a straggler's cost on one neighbour.
+Whether the constant is the same on H200 is the point of the paired sweep.
+
+### Method note
+
+Every number above is a minimum over 25 iterations on four cards whose
+utilization was 0% throughout, on a host that was contended for the whole
+project until this window. The payload-independence is what carries the
+argument, and it is a ratio between two quantities measured in the same
+iteration on the same ranks, so it survives whatever the machine was doing.
