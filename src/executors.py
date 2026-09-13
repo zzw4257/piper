@@ -965,17 +965,29 @@ class DagExecutor:
                             if len(getattr(p, "data_succs", ())) <= 1:
                                 self.events.a2a.pop(p.uid, None)
 
-                    # Base input set: the compute predecessor when there is one
-                    # (hoisted ring), else the spliced comm node's buffer as before.
-                    fwd_data_pred = next(
-                        (p for p in node.data_preds if p.task_type == TaskType.FWD), None
-                    ) or next(iter(comm_preds), None)
+                    # Base input set. Only a *hoisted* ring changes the rule: then
+                    # the compute predecessor carries the produced slots and the
+                    # ring node the rotated ones. Otherwise this is upstream's
+                    # first-match lookup, byte for byte.
+                    hoisted_preds = [
+                        p for p in comm_preds if self._node_meta(p).get("hoisted")
+                    ]
+                    if hoisted_preds:
+                        fwd_data_pred = next(
+                            (p for p in node.data_preds if p.task_type == TaskType.FWD), None
+                        ) or hoisted_preds[0]
+                    else:
+                        fwd_data_pred = next(
+                            (p for p in node.data_preds
+                             if p.task_type == TaskType.FWD
+                             or p.task_type in _FWD_BOUNDARY_COMM_TASKS), None
+                        )
                     if fwd_data_pred is not None:
                         input_tensors = list(self.buffers.task[fwd_data_pred.uid]["detached_outs"])
                         self.buffers.release(fwd_data_pred.uid)
-                        for p in comm_preds:
+                        for p in hoisted_preds:
                             pm = self._node_meta(p)
-                            if p.uid == fwd_data_pred.uid or not pm.get("hoisted"):
+                            if p.uid == fwd_data_pred.uid:
                                 continue
                             ring_outs = self.buffers.task[p.uid]["detached_outs"]
                             for i in pm["ring_tensor_idxs"]:
