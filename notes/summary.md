@@ -256,7 +256,9 @@ behaviour.
   at dispatch. Blocking the host on the budget predecessor gives slope 2.01
   and 11.6 GiB at 8 stages against DP's 20.0 — the pre-registered test of the
   mechanism. An issue budget is a DAG edge *and* a runtime allocation policy;
-  Piper has neither and the first without the second is nothing.
+  Piper has neither and the first without the second is nothing. **The policy
+  is now built (F44): a bounded buffer pool reused on the stream-side free
+  event, no host wait — with the edge, slope 2.01; alone, 3.01; both predicted.**
 - *G-2 numerics* — **done (F40, F41).** torchrun: out 4.2e-07, dQ 1.2e-06,
   dK 2.9e-06, dV 1.9e-06, both controls broke. In Piper: CP=2 mean-over-ranks
   equals dense CP=1 to 1.7e-06 across three optimizer steps; dropping the ring

@@ -2225,3 +2225,65 @@ The memory gate deliberately shares cards with tenants at 100% utilization.
 Iteration times swing from 0.066 s (shipped, 8 stages) to 0.33 s (pf1, 8
 stages) with no schedule reason; F36's contamination signature. The overlap
 questions stay with the four-card chains.
+
+## 2026-09-13 — F44: a bounded buffer pool is the runtime half of the budget; with the DAG edge it gives ZeRO-3 slope 2.01, and both predictions held
+
+### Tested
+
+`PIPER_BUFFER_POOL=1` (`src/runtime.py::_BufferPool`, off by default): a
+released full-parameter or full-gradient buffer goes back to a pool with the
+event after which the GPU is done with it, and the next taker waits on that
+event on its own stream. The host never blocks and the background free thread
+is bypassed. Same model, depths and metric as F42/F43; predictions written in
+the runner before it ran.
+
+| arm | predicted | measured | peaks 2/4/8 stages (GiB) |
+|---|---|---|---|
+| `prefetch_distance=1` + pool | ≈2.0 | **2.01** | 4.16 / 6.67 / 11.69 |
+| shipped ZeRO-3 + pool | ≈3.0 | **3.01** | 4.85 / 8.61 / 16.13 |
+
+For reference from F42/F43: plain DP 4.00, shipped 3.61, DAG edge alone 3.99,
+DAG edge + host blocked 2.01 (20.0 / 18.6 / 19.2 / 11.6 GiB at 8 stages).
+
+Ranks report identical bytes in every pooled run; the F42 asymmetry was the
+host/GPU race and the pool removes the race. Losses are identical to the
+corresponding non-pool arms at every depth (28347.9492…, 1.58e9…, 1.48e18…), so
+the pool computes the same thing. Those loss magnitudes are the `--init random`
+scale through un-normalized MLP stages (per-stage gain ≈10.7, eight stages
+≈1.7e8, squared), not a defect; memory is shape-driven and indifferent to it.
+
+### What the two rows say together
+
+The 3.01 row isolates the gradient half: with no DAG budget the forward still
+gathers every layer (F37), the pool bounds the backward's gradient buffers, and
+the peak returns to the forward gather-all at exactly the 3.0 the F42 accounting
+predicted for shipped ZeRO-3 before the gradient race pushed it to 3.61. The 2.01
+row is both halves: the DAG edge bounds the gathers' issue, the pool bounds what
+is held, and the host runs free.
+
+This closes the loop opened in F37. An issue budget is an edge in the DAG and an
+allocation policy in the runtime. Piper shipped with neither; F39 added the edge
+and F42 showed it alone is nothing; F43 showed why; this entry adds the policy
+and measures the pair.
+
+### What it took to get right
+
+The first GPU run failed on the first reuse: release had detached the bucket
+tensor by `set_` to shape `(0,)`, so the next alloc sized itself from
+`numel()==0`. The fix — keep the shape, empty the storage — failed a CPU test I
+wrote for the invariant: `set_` bounds-checks, and `resize_(0)` reaches that
+state only because it does not. Under the pool the tensor object is rebuilt on
+alloc and replaced on release, with every parameter view pointed at an empty
+tensor so a stale use still fails loudly. Two rounds, both caught before or at
+the first GPU attempt; the CPU test stays.
+
+### Default
+
+Off. The pool changes when memory is reclaimed, and the shipped examples lower
+and run exactly as before with it off. Turning it on is the recommendation; the
+measurement above is the argument.
+
+### Pending
+
+An interleaved same-window A/B of pool against host-sync at 8 stages, for a
+timing hint only (cards are shared). The 4-card overlap and P3 runs.
