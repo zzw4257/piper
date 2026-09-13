@@ -2895,3 +2895,93 @@ per iteration. Constants: per machine, one sweep each, scripts in
 Not established: whether the ~8-11 ms is Ray, the Python dispatch loop, or the
 actor round trip — a breakdown needs host-side instrumentation of `run_dag`,
 which is the obvious next measurement and the one that would say what to fix.
+
+## 2026-09-14 — F52: the per-iteration constant is not Ray and not the scheduling loop — it is the segmented execution path, which costs 4.6x the host launch time of the same arithmetic run straight
+
+### Tested
+
+`PIPER_TIME_TRACE` records a host timestamp before every dispatched node, plus
+markers after the last enqueue and after the drain, so an iteration splits into
+host dispatch / GPU drain / everything else. CP=4 on four B200s, ring model,
+s_local=256, 10 timed iterations. Paired with `probe_host_bound.py`, now
+reporting the bare reference's **host** launch time as well as its GPU time.
+
+### Result 1 — the iteration *is* the dispatch loop
+
+| | steady-state |
+|---|---|
+| host dispatch (first node to last enqueue) | 10.3–11.7 ms |
+| GPU drain after the last enqueue | **0.10–0.13 ms** |
+| driver-side iteration | 11.85 ms |
+| Ray + driver remainder | **~0 ms** |
+
+By the time the host finishes issuing 21 nodes the GPU has finished executing
+them. F50's open question — Ray, the actor round trip, or the loop — is
+answered: **it is the loop, and the Ray round trip is not measurable against
+it.**
+
+### Result 2 — but the loop's cost is in the compute nodes, not the scheduling
+
+| task | n | total | mean |
+|---|---|---|---|
+| backward | 6 | 5.93 ms | **989 us** |
+| forward | 6 | 1.69 | 282 |
+| update | 1 | 1.46 | 1464 |
+| backward_ring_exchange | 3 | 0.88 | 295 |
+| forward_ring_exchange | 3 | 0.72 | 239 |
+| all_reduce | 2 | 0.35 | 177 |
+| **total** | **21** | **11.05 ms** | |
+
+Compute nodes are **82%**; every communication node together is 18%. So this is
+not scheduling overhead in the sense of "the DAG machinery is expensive".
+
+### Result 3 — it is the *segmented* execution path, and that is measurable
+
+The bare reference runs the identical arithmetic as one straight Python
+function. Its host launch time:
+
+| s_local | bare GPU | **bare host launch** | Piper host dispatch |
+|---|---|---|---|
+| 256 | 2.39 ms | **2.40 ms** | **11.05 ms** |
+| 512 | 3.67 | **2.81** | ~11 |
+| 1024 | 11.81 | **2.90** | ~11 |
+
+The same math costs **2.4 ms** of host time launched straight and **11.05 ms**
+launched through Piper — **4.6x** — and the bare figure barely moves with
+problem size, so the gap is per-node, not per-flop. Restricted to the compute
+nodes, 9.08 ms against 2.4 ms is **3.8x**.
+
+What the segmented path does that the straight one does not: interpret twelve
+FX GraphModules instead of running one function; detach, clone and re-attach at
+every segment boundary; and call autograd once per segment rather than once per
+step. `backward` at 989 us per node against `forward` at 282 us is consistent
+with the last of these being the largest term.
+
+### Correction to F50
+
+F50 called the ~8 ms "the runtime's share" and grouped it with F43/F47/F48 as a
+symptom of host-side asynchrony. The grouping was too quick. The asynchrony
+finding stands for the memory race and the arrival skew, which are about ranks
+drifting *relative to each other*. This constant is a different thing: a
+single-rank, per-node cost of the execution model, present even with one rank
+and no collectives. F50's practical criterion is unaffected — the denominator
+is what it is — but its attribution is corrected here.
+
+### The obvious mitigation works for the shipped example and fails for this one
+
+`--use-inductor` compiles each GraphModule, which should collapse the
+interpretation cost. It runs clean on the shipped `test_tp_mlp` example
+(rc=0) and fails on the ring model with
+`InductorError: SubprocException ... RuntimeError: PassManager::run failed`.
+So the mitigation exists, is off by default in both examples, and does not
+currently apply to the model this project added. Whether the failure is the
+online-softmax `-inf` initialisation or the segment shape is not yet known and
+is worth one bisect, because it decides whether "turn on Inductor" is a general
+answer to Result 3 or only a sometimes-answer.
+
+### Method note
+
+Per-node cost is the gap between consecutive host timestamps, so node `i` is
+charged with its own dispatch plus any blocking that node `i+1` does before its
+timestamp. With the drain at 0.1 ms the GPU is never the thing being waited on,
+so the attribution is sound here; it would not be in a GPU-bound regime.
