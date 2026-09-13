@@ -3415,3 +3415,95 @@ The two halves of this entry were measured independently — an engine microbenc
 on one host and an FX op count with no GPU at all — and they agree to 1% on a
 number neither was fitted to. That is the only kind of agreement in this project
 that was not arranged.
+
+## 2026-09-14 — F58: forwarded boundary outputs no longer get a shadow leaf — correct, verified six ways, and with no measurable benefit
+
+### The change
+
+`ComputeExecutor.forward` detached every boundary output that required grad. For
+an output the segment *forwards* rather than produces — the value is the very
+object the segment received — that builds a shadow leaf whose only job is to
+receive the downstream gradient and hand it to the real leaf one autograd call
+later. `boundary_outputs` (extracted to module level for testing) now emits the
+input itself in that case, decided by object identity so it cannot drift from
+what the GraphModule actually returned.
+
+The change is only correct in pairs. The plumbing is: the successor's
+`inp_grads` are assigned positionally onto the producer's
+`detached_outs[j].grad`, and `compute.backward` drives
+`(pre_detach_outs[j], detached_outs[j].grad)`. With the shadow leaf gone,
+`pre_detach_outs[j] is detached_outs[j]` is the segment's own input leaf, and
+driving that pair would accumulate the downstream gradient **a second time** on
+a tensor that already holds it. So `backward` now skips pairs where `p is d`;
+the value is already where `inp_grads` reads it, and the produced outputs'
+backward accumulates the in-segment contribution on top. Same sum, one tensor
+and one graph entry fewer per forwarded value.
+
+For this model that is 3 of the 6 tensors crossing each of 5 boundaries: 15
+fewer detaches and 15 fewer backward pairs per iteration.
+
+### Verification
+
+Every check has a negative control, and the in-Piper ones span optimizer steps
+on purpose: a gradient counted once too often or too few leaves iteration 0
+correct and diverges from iteration 1 (the F10 pattern).
+
+| check | result | control |
+|---|---|---|
+| out-of-band TP math (torchrun) | output 1.49e-08, input grad 2.21e-09 | dropping the collectives changes it |
+| out-of-band CP math (torchrun) | out 4.17e-07, dQ/dK/dV 1.2–2.9e-06 | no-rotation and forward-only-rotation both break |
+| in-Piper TP=2 vs TP=1, 3 steps | worst 7.15e-07, both ranks agree | no directive: 1.103 |
+| in-Piper CP=2 vs dense, 3 steps | worst 1.729e-06 | no ring: 3.220e-03 |
+| in-Piper CP=4 spliced, 5 steps | worst 1.293e-05 | — |
+| in-Piper CP=4 hoisted, 5 steps | worst 1.293e-05, identical to spliced | — |
+| CPU suite | 82 passed (78 before, +4 for the new rule) | — |
+
+All of it re-run after the helper was extracted, because moving code is exactly
+the kind of "should be identical" this project keeps being punished for.
+
+### The measurement, and it is negative
+
+Interleaved before/after, five reps each, four H200s at under 25% utilization,
+swapping the executor between harness launches:
+
+| | before min | after min | delta | within-arm range |
+|---|---|---|---|---|
+| iteration | 13.09 ms | 12.80 ms | −0.29 | 13.1–20.8 / 12.8–18.0 |
+| forward node | 338 us | **454 us** | +116 | — |
+| backward node | 913 us | 769 us | −144 | — |
+
+F57 predicted 0.2–0.5 ms per iteration from 15 fewer detaches at ~15 us and 15
+fewer backward entries at ~21 us. The measured |delta| is at most 0.35 ms
+against a within-arm range of 5–8 ms — a twentieth of the noise. And the forward
+node moved *up* while the backward moved down, which a change that removes work
+from both cannot do. **Not resolvable.** The prediction is neither confirmed nor
+refuted; the experiment lacks the resolution, on the quietest cards available.
+
+### Kept, and why that is a judgement not a measurement
+
+It removes work that is provably redundant, it is verified, and the saving
+scales with boundaries times forwarded tensors — a 32-layer model under CP=8
+crosses far more of both than this one. Against that: it adds an invariant to a
+correctness-critical path, which is why the rule is now a module-level function
+with four CPU tests including one that checks a gradient is counted exactly once
+end to end. If the invariant is ever broken the tests fail rather than the loss
+curve diverging on the second optimizer step.
+
+It would be equally defensible to revert it. The honest summary is: correct,
+free of measured benefit, kept for a scaling argument that has not been tested
+at scale.
+
+### Found on the way: the out-of-band TP gate had rotted
+
+It failed with `KeyError: 'pre'` and does not import `src` at all, so the change
+could not have caused it. `tp_mlp.global_weights` grew an `n_stages` parameter
+and moved to `blocks.N.*` naming; the gate kept indexing short names. It carries
+the `gpu` mark, so the CPU suite deselects it, and every chain since had run the
+*in-Piper* TP check instead — so it broke silently and stayed broken. Fixed by
+deriving short names from the module path with an assertion that fails loudly if
+a second block ever makes them ambiguous.
+
+That is the same failure mode this project has been documenting in Piper —
+something with no observer stops being true — occurring in this project's own
+test suite. The lesson recorded: a gpu-marked test that nothing in the default
+path runs needs a scheduled run, or it is documentation.
