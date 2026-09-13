@@ -42,8 +42,11 @@ def fit(xs, ys):
     return slope, my - slope * mx
 
 
-def main(path="logs/zero3_peak.txt"):
+def main(path="logs/zero3_peak.txt", per_stage_override=None):
     runs = parse(path)
+    if per_stage_override:
+        for r in runs.values():
+            r["per_stage"] = int(per_stage_override)
     if not runs:
         print("no completed runs in", path); return 1
     by_mode = {}
@@ -65,4 +68,6 @@ def main(path="logs/zero3_peak.txt"):
 
 
 if __name__ == "__main__":
+    # TPMlp stage = pre(dim^2) + up + down (2 dim*hid) + post(dim^2); the runner
+    # logged only 2*dim*hid*4. Pass the true value as the second argument.
     sys.exit(main(*sys.argv[1:]))
