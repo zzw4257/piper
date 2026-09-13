@@ -170,3 +170,91 @@ python experiments/check_tp_overlap.py                  # mb=1 cannot overlap, m
 
 Environment is on catalyst-fleet1; `notes/log.md` F5 records the layout and the
 host's traps.
+
+## Stage G: context parallelism as the probe that found the floor
+
+*Status 2026-09-13. CPU side complete; GPU rungs queued behind the card gate.
+Design: `notes/cp-design.md`. Findings F37–F39 in `notes/log.md`.*
+
+TP fit Piper too well to test it (§ "What TP exposes"). The open question it
+left was whether CP fits, and the earlier answer — "CP runs correctly and loses
+the reason to use it, because a region is the minimum schedulable unit" — named
+a symptom. Stage G located the cause, and it is narrower and more actionable.
+
+**The cause.** Piper's passes conflate the *edge a collective travels on* with
+the *dependency a collective has*. For all three shipped collectives these
+coincide, because all three are producer–consumer (gradient, routed tokens,
+partial sum). Ring attention's K/V rotation is the first where they differ: its
+payload is ready when the source region *starts*. The IR can express the
+resulting diamond — it is a general DAG with per-node streams and events — the
+directive language could not.
+
+**What was wrong in the design, and how it was found.** The design predicted a
+second mechanism: the ordering pass pins a dependency-free collective next to
+its consumer. One CPU lowering of a ZeRO-3 DAG (F37) showed the opposite sign:
+`ALL_GATHER_COMM` is a DAG root on `default_stream`, so the anchor rule never
+applies, and `_serial_topological_order` issues *every* gather at topological
+level 0 — all layers' parameters before the first forward. Peak parameter
+memory under shipped ZeRO-3 is, by the dispatch order and the free point, the
+unsharded total. The corrected statement: **Piper has no notion of where a
+collective is issued; position falls out of graph structure — spliced
+collectives at source completion (too late for CP), roots at level 0 (too early
+for ZeRO-3).** One missing concept, seen from both ends. Retracted in place.
+
+**What was built (all CPU-verified, 74 tests).**
+
+| rung | what | evidence |
+|---|---|---|
+| G-0 | ring-shaped model traces to `n` contiguous CP regions; K/V survive as bare placeholders in every intermediate region (Piper already threads cross-segment values, `fx.py:591-598`) | `experiments/probe_cp_segments.py` |
+| G-1a | every boundary output recorded with a `forwarded` flag — the earliest-ready fact, free at segmentation | `test_boundary_outputs.py` |
+| G-1b | `ring_exchange` directive: acts on edges *between* matched regions (the set `shard_tensor` skips), refuses produced tensors, rotates +1 forward / −1 backward; `RING_COMM` kind, `batch_isend_irecv` on `ep_group`, two dispatch arms, contract test updated | `test_ring_directive.py` |
+| G-3 | `hoist=true, distance=d`: forward ring depends on its supplier (previous ring / definer), source→successor edge restored for produced slots, consumer merges; backward stays spliced (its payload is *produced*); `record_stream` on merged tensors | 11 ring tests, `dump_dag --model ring` |
+| G-4 | `replicate(prefetch_distance=d)`: one temporal edge per gather turns F37's `AG_0…AG_8 │ compute_0…` into `AG_0 compute_0 AG_1 compute_1 …` with no new mechanism (F39) | `test_zero3_prefetch_budget.py` |
+
+**Three things the hoist taught (design § G3′).** Only the forward ring is
+hoistable — backward's payload is a gradient the compute produces, so at most
+half the ring can overlap in a region-granular IR. The issue budget is not
+optional for CP either: without `distance`, every rotation completes before
+step 0 finishes and all K/V chunks are resident — F37 on the feature meant to
+hold `1/n`. And at `distance=1` the budget edge is also what makes buffer reuse
+safe: the codebase has no `record_stream`; spliced topologies were safe only
+because every comm node waited on its consumer's predecessor, which hoisting
+removes.
+
+**F38.** `replicate` emits a `REDUCE_COMM` for regions with no parameters
+(`_insert_reduce_comm_nodes` never checks; the all-gather pass does). The
+executor's `all_reduce_grads` guard returns 0 — a dead node per parameter-free
+region per microbatch, not a wrong answer. Invisible until CP's attention-only
+regions, the first parameter-free regions Piper has seen. Pinned as a
+characterization test; fixed after the queued run has exercised upstream
+behaviour.
+
+**Queued on GPU, with predictions written first.**
+
+- *F37 slope* (`measure_zero3_peak.sh`, 2 cards): peak memory vs depth, three
+  arms — shipped ZeRO-3 predicted 3.0× stage-bytes, `prefetch_distance=1` 2.0×,
+  plain DP 4.0×.
+- *G-2 numerics* (`run_cp_gate.sh`): torchrun ring vs dense attention on output
+  and dQ/dK/dV with two controls (no rotation breaks output; forward-only
+  rotation breaks dK/dV — the control a loss curve cannot provide); in-Piper
+  CP=2 vs dense CP=1 across optimizer steps, with a no-ring negative control.
+- *G-3* (`run_cp_hoist.sh`): hoisted numerics on 2 cards; on 4 cards spliced vs
+  `distance=1` vs `distance=0` — P1 revised predicts `distance=0` peak memory
+  grows with steps and `distance=1` does not. Two cards cannot show it: one
+  rotation.
+- *P2*: hoisting may raise the concurrency metric without moving step time,
+  because the per-collective skew tax (Stage E/F) moves rather than disappears.
+  A concurrency gain with no wall-clock gain is a confirmation.
+- *P3* (`probe_skew_topology.py`, 4 cards): is the skew tax a property of global
+  synchronization or of NCCL? Ring couples only neighbours; the rank opposite
+  the skewed one should not pay on that step. Standalone result, independent of
+  whether CP succeeds.
+
+**What this says about "going up a level".** The abstraction to add is not a
+placement/partition type — that fits TP, the case that already worked. It is
+an *issue point* per collective: an earliest-ready dependency, derivable from
+the segment (a bare placeholder in the output tuple), and a budget edge between
+that point and the consumer. Derived from CP; it explained a missing
+optimization in shipped ZeRO-3 after being wrong about its sign. That is
+better evidence of being at the right level than a confirmed guess would have
+been.
