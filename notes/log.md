@@ -3247,3 +3247,89 @@ machines and accounts for most of Piper's segmented-arithmetic gap on B200, it
 does not scale with boundary count on H200, and the B/C/D distinctions stay
 below the noise floor everywhere.** The `--segments` axis is in the probe for
 whoever picks this up.
+
+## 2026-09-14 — F56: the update node is not the optimizer — it is a full `torch.cuda.synchronize()` that absorbs the whole iteration's cross-rank wait, and it forbids overlap between iterations
+
+### Tested
+
+`_update` (`executors.py`) split under `PIPER_TIME_TRACE` into its parts:
+draining deferred frees, the per-bucket `optimizer.step()` loop, and the
+`torch.cuda.synchronize()` that ends it. Ring model, four B200s, steady state.
+
+### Result
+
+| part | CP=4, four ranks | CP=1, one rank |
+|---|---|---|
+| drain deferred frees | 2–3 us | 2–3 us |
+| per-bucket loop incl. event waits | 254–274 us | 292–432 us |
+| **`optimizer.step()`, 2 buckets** | **191–212 us** | **226–350 us** |
+| **final `torch.cuda.synchronize()`** | **2788–16934 us** | **2257–2490 us** |
+
+The optimizer is a fifth of a millisecond. The node costs 11.5 ms because it
+ends with a full device synchronize.
+
+### Per-rank, same step
+
+| step | r0 | r1 | r2 | r3 | spread |
+|---|---|---|---|---|---|
+| 8 | 6786 | 8836 | 7178 | 9860 | 3074 us |
+| 10 | 11176 | 14533 | 16771 | 11896 | 5595 |
+| 11 | 16523 | 15907 | 10702 | 16934 | 6232 |
+| 13 | 16798 | 15649 | 11555 | 16404 | 5243 |
+
+Ranks in the *same iteration* differ by 2.9–6.2 ms, and the value swings by 6x
+across iterations, while the optimizer next to it is stable to 10%. With one
+rank and no collectives the sync is 2.3–2.5 ms and steady. That is the
+signature of waiting on peers: the collectives' NCCL kernels cannot retire
+until the other ranks arrive, and the device sync is where that bill is
+presented.
+
+### What it corrects
+
+**F52's headline.** F52 measured 0.10–0.13 ms of GPU drain after the last
+enqueue and concluded that by the time the host has issued every node the GPU
+has finished. The drain is small because it already happened — inside the
+update node, which is not last in dispatch order. The correct statement is that
+the iteration is host dispatch *up to* the update node, then a blocking device
+sync that absorbs everything outstanding, then a short tail.
+
+**F55's reading of the update node.** F55 recorded "update 1974 us ... real work
+by any measure" and left it. It is 210 us of real work and the rest is a wait.
+
+### What it means
+
+`torch.cuda.synchronize()` is device-wide: it waits on every stream, not just
+the one carrying the losses it is there to materialize. Three consequences,
+in increasing order of interest:
+
+1. **The update node's cost is not attributable to the update.** Any profile
+   that reads the DAG's per-node times will mis-attribute the iteration's
+   cross-rank wait to the optimizer.
+2. **It is where the additive law's skew term is actually paid.** F48/F49
+   showed each collective pays `transport + skew`; in Piper most of that skew
+   is deferred to this one point, because the collectives are enqueued and only
+   the sync forces them to retire.
+3. **Piper cannot overlap anything across iterations.** A device-wide sync at
+   the end of every step means iteration `n+1`'s first kernel cannot be issued
+   until iteration `n`'s last one has retired on every stream. The multi-stream
+   design the `stream` directive exists to exploit is confined within one
+   iteration by construction. That is a plausible part of why `stream` measured
+   1.00x at one microbatch and 1.06x at four.
+
+### The fix, and why it is not free
+
+The sync exists so `_drain_losses` can read loss values on the host. Waiting on
+an event recorded after the loss-producing backward, rather than on the device,
+would materialize the same values without stalling other streams; returning the
+loss tensors and synchronizing once in the driver would do better still. Neither
+is a one-liner: `drain_pending_frees` and the ZeRO path also rely on the sync's
+ordering, and the second `torch.cuda.synchronize()` in
+`step_zero_shard_optimizers` would need the same treatment. Not attempted here;
+the measurement is what this entry contributes.
+
+### Method note
+
+This was found by splitting a node that three previous entries had treated as
+atomic, after F55 flagged it as the largest single node and moved on. The
+project's own rule — measure the parts before naming the whole — had not been
+applied to the one node whose name made its cost sound self-explanatory.
