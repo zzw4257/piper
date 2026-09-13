@@ -2366,3 +2366,70 @@ Second host, so this is also a portability check: the out-of-band CP gate
 4.172325134277344e-07`, `dQ 1.1920928955078125e-06`, `dK 2.86102294921875e-06`,
 `dV 1.9073486328125e-06`), and all 78 CPU tests pass. The tree there is a clone
 of `feat/tp-sharding`; commits are still made only on catalyst-fleet1.
+
+## 2026-09-14 — F46: P1 falsified — a ring needs no issue budget, because its own data dependency is one; and at s_local=2048 the exchange is 1.4% of the step, so P2 is not testable there
+
+### Tested
+
+Four H200s. CP=4 ring attention, global seq 8192 (s_local 2048), dim 512, 8
+heads, batch 2, five optimizer steps, three schedules: spliced,
+`hoist distance=1`, `hoist distance=0`.
+
+### Result 1 — all three are correct and indistinguishable
+
+Every schedule matches dense CP=1 to 1.29e-05 across five steps, and the four
+per-rank loss sequences are identical across schedules to every printed digit.
+Peak memory is identical **to the byte** (3,099,330,048 on every rank in every
+arm) and minimum iteration time is 0.0241–0.0260 s in all three.
+
+### Result 2 — why, and what P1 got wrong
+
+`cp-design.md` G3′ claimed that without a budget "every rotation completes
+before step 0 finishes and every K/V chunk is resident — F37's pattern on the
+feature meant to hold 1/n of K/V". Lowering the three DAGs shows the hoist
+applied exactly as designed (`hoisted=True`, ring node dispatched *before* its
+source region in both hoisted arms) and the budget edge doing nothing:
+
+    spliced   : seg1 #1  ring0 #2  seg2 #3  ring1 #4  seg3 #5  ring2 #6
+    hoist d=1 : ring0 #1  seg1 #2  ring1 #3  seg2 #4  ring2 #5  seg3 #6
+    hoist d=0 : ring0 #1  seg1 #2  ring1 #3  seg2 #4  ring2 #5  seg3 #6
+
+d=1 and d=0 are the same order. The reason is that **rotation `i` consumes the
+chunk rotation `i-1` produced**: the ring nodes form a data chain, so at most
+one rotation is ever in flight no matter what the budget says. F37's pattern
+required the opposite — ZeRO-3's gathers are mutually *independent* DAG roots,
+which is precisely why all nine fired at topological level 0.
+
+That gives the criterion the design was missing:
+
+> An issue budget is needed exactly when the collectives it governs are
+> **mutually independent**. For a chain of collectives the data dependency is
+> already the budget, and adding one is a no-op.
+
+So the `distance` argument is not wrong for `ring_exchange`, it is *redundant*
+there — and it is load-bearing for `replicate(prefetch_distance)`, which is
+where F39/F44 measured it. The two features share the mechanism but not the
+need. This is the first time the design's "one knob, two features" claim has
+been qualified rather than confirmed.
+
+### Result 3 — P2 is not testable at this problem size
+
+K/V per rank is 2 x 2 x 8 x 2048 x 64 x 4 B = 16 MiB; from F45 a 16 MiB ring
+exchange costs ~115 us, so the three exchanges are ~345 us of a 25 ms
+iteration: **1.4%**. Perfect overlap would save 1.4%, an order of magnitude
+below the run-to-run spread on this shared host. The identical timings are
+therefore not evidence that the hoist fails to overlap; they are evidence that
+the experiment had no resolution.
+
+Ring attention's own scaling says where to look. Per step, communication is
+proportional to `b·h·s_local·d` and compute to `b·h·s_local²·d`, so the
+communication fraction goes as **1/s_local**: it rises as the local chunk
+shrinks, i.e. exactly as CP degree rises at fixed global sequence. s_local=2048
+is the regime where nobody needs CP. A sweep down to s_local=256 is queued.
+
+### Correction recorded
+
+`cp-design.md` G3′'s second paragraph is retracted; the criterion above
+replaces it. The paragraph was written from the shape of the ZeRO-3 failure
+without lowering a ring DAG at four steps — the same error as F37, one level
+down, and caught the same way.
