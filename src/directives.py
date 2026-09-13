@@ -1323,6 +1323,67 @@ def _insert_tp_all_reduce_comm_nodes(
                 src_uid=comm_uid, dst_uid=e.dst_uid, dep_kind="data", tensor_name=e.tensor_name))
 
 
+def _bound_all_gather_issue(
+    dag: TrainingDAG,
+    filters: list[dict[str, Any]],
+    distance: int,
+) -> int:
+    """Give ZeRO-3 all-gathers an issue budget (log F37).
+
+    An ``ALL_GATHER_COMM`` is created as a DAG root, so ``_serial_topological_order``
+    issues every one of them at topological level 0: all layers are gathered
+    before the first forward runs, and peak parameter memory is the unsharded
+    total. A temporal edge from the compute node ``distance`` steps earlier in
+    execution order bounds how far ahead each gather may run; ``distance=1`` is
+    the usual one-layer prefetch. Gathers with fewer than ``distance`` compute
+    predecessors keep no edge and start the pipeline.
+
+    This is the same knob as ``ring_exchange``'s ``distance``, applied to the
+    collective it was first observed missing on. Off by default so shipped
+    schedules lower exactly as before.
+
+    "Steps" are compute nodes along data edges, walking through comm nodes;
+    under a BWD_I/BWD_W split one layer is two steps.
+    """
+    if not isinstance(distance, int) or distance < 1:
+        raise ValueError(f"replicate: prefetch_distance must be a positive int, got {distance!r}")
+
+    def _compute_pred(uid: str) -> str | None:
+        frontier, seen = [uid], {uid}
+        while frontier:
+            u = frontier.pop(0)
+            for e in dag.edges:
+                if e.dst_uid != u or e.dep_kind != "data" or e.src_uid in seen:
+                    continue
+                seen.add(e.src_uid)
+                p = dag.nodes[e.src_uid]
+                if p.node_kind == "COMPUTE":
+                    return p.uid
+                frontier.append(p.uid)
+        return None
+
+    bounded = 0
+    for ag_uid, ag in list(dag.nodes.items()):
+        if ag.node_kind != "ALL_GATHER_COMM":
+            continue
+        target = ag.node_meta.get("compute_uid")
+        if target not in dag.nodes:
+            continue
+        if not any(_match_filter(dag.nodes[target].tag, flt) for flt in filters):
+            continue
+        back: str | None = target
+        for _ in range(distance):
+            back = _compute_pred(back)
+            if back is None:
+                break
+        if back is None or back == target:
+            continue
+        dag.add_edge(TrainingDAGEdge(src_uid=back, dst_uid=ag_uid, dep_kind="temporal", tensor_name=None))
+        ag.node_meta["prefetch_distance"] = distance
+        bounded += 1
+    return bounded
+
+
 def _insert_ring_exchange_comm_nodes(
     dag: TrainingDAG,
     filters: list[dict[str, Any]],
@@ -2126,6 +2187,8 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
                 _bucket_matched_fwd_nodes(training_dag, filters, int(bucket_size))
             if shard_params:
                 _insert_all_gather_comm_nodes(training_dag, filters, devices, comm_stream=gather_stream)
+                if raw.get("prefetch_distance") is not None:
+                    _bound_all_gather_issue(training_dag, filters, int(raw["prefetch_distance"]))
                 _insert_reduce_scatter_comm_nodes(training_dag, filters, devices, comm_stream=reduce_stream)
             elif shard_grads:
                 _insert_reduce_scatter_comm_nodes(training_dag, filters, devices, comm_stream=reduce_stream)

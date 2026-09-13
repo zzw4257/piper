@@ -2,8 +2,11 @@
 
 Status (2026-09-13): G-0 done (log F37 falsified F-c on the way; see §2 F-c′),
 G-1a/b done — boundary outputs carry a forwarded flag, `ring_exchange` lowers as
-the edge-spliced baseline, 67 CPU tests green. G-2 queued on the GPU gate
-(`experiments/run_cp_gate.sh`). F38 found while composing with `replicate`.
+the edge-spliced baseline. G-3 done on CPU (`hoist`/`distance`, consumer merge,
+`record_stream`), G-4 done on CPU (`replicate(prefetch_distance)`, log F39:
+same knob, no new mechanism). 74 CPU tests green. GPU rungs queued behind the
+card gate: `measure_zero3_peak.sh` → `run_cp_gate.sh` → `run_cp_hoist.sh`.
+F38 found while composing with `replicate`.
 Marks follow the project rule —
 **[code]** verified by reading `src/` at `0b65fb3`, **[intent]** from upstream
 issue #15 / README, **[proposed]** mine.
@@ -203,9 +206,9 @@ rest is measured against.
 region, and the concurrency metric (kernel-sum / wall-span) rises against G-2
 on the same inputs, interleaved A/B.
 
-**G-4.** Apply the same directive to ZeRO-3 parameter prefetch on an existing
-shipped example. *Exit:* it works with no new mechanism, or it does not and the
-reason is recorded.
+**G-4 — done on CPU (log F39).** `replicate(prefetch_distance=1)` turns F37's
+`AG_0…AG_8 | compute_0…` into `AG_0 compute_0 AG_1 compute_1 …` with one
+temporal edge per gather and no new mechanism. GPU slope measurement queued.
 
 **G-5 (backward).** Piper builds BWD by reversing FWD data edges. Whether that
 produces a correct reverse ring for K/V gradients is genuinely unknown and is

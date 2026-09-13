@@ -1976,3 +1976,51 @@ Queued (`experiments/run_cp_gate.sh`, chained behind the F37 memory job on the
 same card gate): the out-of-band CP gate under torchrun, the in-Piper CP=2 vs
 dense CP=1 equivalence across optimizer steps with a no-ring negative control,
 and P3 on four cards when four are free.
+
+## 2026-09-13 — F39: one temporal edge gives ZeRO-3 its prefetch budget; the knob derived for CP needed no new mechanism
+
+### Tested
+
+`replicate(prefetch_distance=1)` on the three-stage ZeRO-3 schedule from F37,
+lowered on CPU. `_bound_all_gather_issue` adds, for each `ALL_GATHER_COMM`, a
+temporal edge from the compute node `distance` steps before its consumer along
+data edges (walking through comm nodes).
+
+### Result
+
+Dispatch order goes from F37's
+
+    AG_0 AG_1 ... AG_8 | compute_0 compute_1 ...
+
+to
+
+    AG_0 compute_0 AG_1 compute_1 AG_2 compute_2 ...
+
+Backward gathers, which F37 showed issued during the forward pass ~30 slots
+ahead of their consumer, now sit 1–3 slots ahead. The first layer keeps no edge
+and starts the pipeline. Default behaviour is untouched and still pinned by
+`test_zero3_dispatch_order.py`; the new behaviour by
+`test_zero3_prefetch_budget.py`. 74 CPU tests.
+
+### Why this is the design's central claim, and what it does not yet show
+
+The `distance` argument was derived in `cp-design.md` for the ring exchange,
+where without it a hoisted ring reproduces F37 on the feature meant to hold
+`1/n` of K/V. Applied unchanged to the collective F37 was found on, it produces
+the schedule every hand-written ZeRO-3 implementation uses. One mechanism —
+"a collective's issue point is an edge, not an accident of topological level" —
+covers both. That is the evidence the abstraction is at the right level; a
+placement type system would have said nothing about either.
+
+What the CPU cannot show: the memory. The dispatch order says peak parameter
+memory drops from the unsharded total to one layer's full parameters plus the
+shard; the slope experiment queued in `experiments/measure_zero3_peak.sh` now
+has a third arm predicting 2.0× stage-bytes against the shipped 3.0× and plain
+DP's 4.0×. Also not shown: overlap. `ALL_GATHER_COMM` sits on `default_stream`
+unless `gather_stream` is set, so at `distance=1` on one stream the prefetch is
+serial — it bounds memory, it does not yet hide latency. That needs a second
+stream and is the same measurement as the ring's.
+
+### Next experiment
+
+The queued slope run. Then the GPU G-2/G-3 chain.
