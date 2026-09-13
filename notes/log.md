@@ -3333,3 +3333,85 @@ This was found by splitting a node that three previous entries had treated as
 atomic, after F55 flagged it as the largest single node and moved on. The
 project's own rule — measure the parts before naming the whole — had not been
 applied to the one node whose name made its cost sound self-explanatory.
+
+## 2026-09-14 — F57: `backward` costs 79 us per call plus 21 us per op, which predicts the node times from the op counts — so there is no separate Piper tax inside the compute nodes
+
+### Tested
+
+Two measurements that meet in the middle.
+
+**The engine's cost function.** `experiments/probe_autograd_fixed.py` backwards
+chains of 1–32 elementwise ops, interleaved, 30 rounds, spread reported. On
+H200 (the clean host this round; B200's spreads were 333–421 us and its fit is
+not usable):
+
+    backward(n ops) = 79 us + 20.9 us/op
+
+Validated against the thing Piper actually does — the same 32 ops backwarded in
+one call versus in K calls of 32/K, predicted as `79*K + 20.9*32`:
+
+| segments | predicted | measured |
+|---|---|---|
+| 1 | 749 us | 748 |
+| 2 | 828 | 852 |
+| 4 | 987 | 1008 |
+| 8 | 1305 | 1288 |
+
+Within 3% at every point.
+
+**The op counts.** Dumping each segment's GraphModule for this model:
+
+| segment | fx ops | boundary outputs |
+|---|---|---|
+| s0.seg0 prologue | 10 | 6 |
+| s0.seg1–4, one per CP step | 17 each | 6 |
+| s0.seg5 epilogue | 5 | 1 |
+| **total forward** | **83** | |
+
+### The two meet
+
+A 17-op forward segment has roughly 30–35 backward ops (each `matmul` becomes
+two, `exp`/`mul`/`sub` one each, plus the accumulations). At the measured rate
+that is `79 + 21*35 ≈ 814 us`. **Piper's measured backward node is 822 us.**
+The forward node at 249 us over 17 ops is 14.6 us/op, the eager launch rate for
+these shapes.
+
+So the compute nodes cost what their op counts say they should. Combined with
+F55 (the executor's wrapper around a compute node is 66–106 us) and F56 (the
+update node is a device sync, not the optimizer), **every large item in a Piper
+iteration is now accounted for by a measured constant times a counted
+quantity**, and none of the accounts needs a term for "Piper overhead" inside a
+compute node.
+
+### Which also kills the tidiest available explanation
+
+The obvious story after F54 was that Piper pays the autograd engine's fixed cost
+once per segment instead of once per step. It does, and that cost is 79 us, so
+six segments cost `5 * 79 = 395 us` per iteration — real, and roughly 3% of the
+iteration. Not the segmentation tax. The tax F54 measured at 1.5–2.0x is
+elsewhere, and F57's arithmetic says where it is not.
+
+### What is left, stated precisely
+
+Piper's compute nodes total 6.80 ms (F55) for arithmetic the straight reference
+does in 2.05 ms (F54). The op counts differ by much less than 3.3x — 83 forward
+ops against roughly 65 for the reference — so most of the gap is a **per-op
+rate** difference, about 24 us/op against 12. Candidates, none isolated: the
+`with torch.cuda.stream(...)` entered per node, the argument marshalling through
+the bucket closure, the detach at every boundary output (six tensors per
+boundary in this model, of which three are values the segment only forwards),
+and saved-tensor lifetimes that cross a detached boundary. Distinguishing them
+needs a profiler at the operator level, not more arithmetic.
+
+One of those candidates is cheap to test and worth recording as a suggestion:
+three of the six tensors crossing each boundary here are *forwarded*, not
+produced — the flag G-1a already records — and a forwarded tensor does not need
+its own detach-and-reattach, because it is the same value on both sides. That
+is 15 of the model's 30 boundary detaches, and their backwards.
+
+### Method note
+
+The two halves of this entry were measured independently — an engine microbenchmark
+on one host and an FX op count with no GPU at all — and they agree to 1% on a
+number neither was fitted to. That is the only kind of agreement in this project
+that was not arranged.
