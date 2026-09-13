@@ -137,12 +137,17 @@ on the gradient edge is not recorded, but the payload is `inp_grads`, which
 compute writes). In a region-granular IR, ring attention can overlap half its
 communication. Whether that half is the half that matters is a G-3 measurement.
 
-*The issue budget is not optional for CP either.* Hoisted, `ring_i` depends
-only on `ring_{i-1}`; with nothing else, all `n-1` rotations run to completion
-before `CP_0` finishes and every K/V chunk is resident at once — F37's pattern
-reproduced on the feature whose purpose is to hold `1/n` of K/V. The budget
-edge `CP_{i-1} -> ring_i` (temporal, `distance=1`) makes `ring_i` overlap
-exactly `CP_i`. P1 (revised) is the test of this paragraph.
+*The issue budget is redundant for CP (revised 2026-09-14, log F46).* This
+paragraph originally claimed that without `distance` every rotation would
+complete before step 0 finishes and all K/V chunks would be resident — F37's
+pattern on the feature meant to hold `1/n`. Lowering a four-step ring falsified
+it: rotation `i` consumes the chunk rotation `i-1` produced, so the ring nodes
+form a data chain and at most one rotation is ever in flight. `distance=1` and
+`distance=0` produce the identical dispatch order, and the measured peak memory
+is identical to the byte. The criterion this yields: **an issue budget is needed
+exactly when the collectives it governs are mutually independent** (ZeRO-3's
+gathers are DAG roots; the ring's are a chain). The knob is shared by both
+features; the need is not.
 
 *The consumer must merge, not replace.* Today a compute node with a boundary
 comm predecessor takes that comm node's buffer as its whole input set. Hoisted,
