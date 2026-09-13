@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import os
+import time
 import torch
 import torch.distributed as dist
 from torch.autograd.graph import GradientEdge, Node
@@ -665,13 +666,19 @@ class DagExecutor:
         # PIPER_MEM_TRACE=<dir>: allocated bytes before each dispatched node, one
         # TSV per rank per step. Experiment knob (log F42); off unless set.
         mem_trace_dir = os.environ.get("PIPER_MEM_TRACE")
-        mem_trace: list[tuple[str, str, int, int]] = []
+        time_trace_dir = os.environ.get("PIPER_TIME_TRACE")
+        trace_dir = mem_trace_dir or time_trace_dir
+        # Memory sampling costs a device query per node; timing costs ~50 ns.
+        want_mem = bool(mem_trace_dir)
+        mem_trace: list[tuple] = []
         ag_host_sync = os.environ.get("PIPER_AG_HOST_SYNC") == "1"
 
         for node in sorted_dag_nodes:
-            if mem_trace_dir:
+            if trace_dir:
                 mem_trace.append((node.uid, node.task_type.value,
-                                  torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated()))
+                                  torch.cuda.memory_allocated() if want_mem else 0,
+                                  torch.cuda.max_memory_allocated() if want_mem else 0,
+                                  time.perf_counter()))
             task_type = node.task_type
             batch = node.batches[0]
             mb_idx = batch.mb_idx
@@ -1277,15 +1284,21 @@ class DagExecutor:
             self._rf_exit(rf)
             self.runtime.nvtx_pop()
 
-        if mem_trace_dir:
+        if trace_dir:
             step = getattr(self, "_mem_trace_step", 0)
             self._mem_trace_step = step + 1
-            os.makedirs(mem_trace_dir, exist_ok=True)
-            path = os.path.join(mem_trace_dir, f"memtrace_rank{self.runtime.global_rank}_step{step}.tsv")
+            os.makedirs(trace_dir, exist_ok=True)
+            path = os.path.join(trace_dir, f"trace_rank{self.runtime.global_rank}_step{step}.tsv")
+            # last_enqueue: after the final node was issued, before the drain
+            # below; end: after it. Their difference is the host waiting for
+            # the GPU rather than dispatching to it.
+            last_enqueue = time.perf_counter()
             with open(path, "w") as f:
-                f.write("uid\ttask\tallocated\tmax_allocated\n")
-                for uid, task, alloc, mx in mem_trace:
-                    f.write(f"{uid}\t{task}\t{alloc}\t{mx}\n")
+                f.write("uid\ttask\tallocated\tmax_allocated\thost_s\n")
+                for uid, task, alloc, mx, ts in mem_trace:
+                    f.write(f"{uid}\t{task}\t{alloc}\t{mx}\t{ts:.6f}\n")
+                f.write(f"__last_enqueue__\tmarker\t0\t0\t{last_enqueue:.6f}\n")
+                f.write(f"__end__\tmarker\t0\t0\t{time.perf_counter():.6f}\n")
         return {
             "losses": [
                 loss for result in update_results for loss in result["losses"]

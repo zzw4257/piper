@@ -16,6 +16,7 @@ collectives (which F48/F49 price separately at 37-350 us each).
 import argparse
 import math
 import sys
+import time
 
 import torch
 
@@ -53,12 +54,16 @@ def one_rank_step(dim, heads, steps, batch, s_local, dev, dtype=torch.float32):
     for _ in range(3):
         step()
     torch.cuda.synchronize()
-    ts = []
+    gpu, host = [], []
     for _ in range(10):
         a, b = torch.cuda.Event(True), torch.cuda.Event(True)
-        a.record(); step(); b.record(); torch.cuda.synchronize()
-        ts.append(a.elapsed_time(b))
-    return min(ts)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        a.record(); step(); b.record()
+        t1 = time.perf_counter()          # host returns once everything is enqueued
+        torch.cuda.synchronize()
+        gpu.append(a.elapsed_time(b)); host.append((t1 - t0) * 1000)
+    return min(gpu), min(host)
 
 
 def main(argv=None) -> int:
@@ -76,18 +81,18 @@ def main(argv=None) -> int:
           f"steps={args.steps} batch={args.batch_size}")
     piper = [float(x) for x in args.piper_ms.split(",")] if args.piper_ms else []
     seqs = [int(s) for s in args.seqs.split(",")]
-    print(f"{'seq':>7}{'s_local':>9}{'GPU math ms':>13}{'rel work':>10}"
+    print(f"{'seq':>7}{'s_local':>9}{'GPU math ms':>13}{'host launch':>13}{'rel work':>10}"
           + (f"{'Piper ms':>11}{'GPU frac':>10}" if piper else ""))
     base = None
     for i, seq in enumerate(seqs):
         s_local = seq // args.steps
         try:
-            ms = one_rank_step(args.dim, args.heads, args.steps, args.batch_size, s_local, dev)
+            ms, host_ms = one_rank_step(args.dim, args.heads, args.steps, args.batch_size, s_local, dev)
         except torch.cuda.OutOfMemoryError:
             print(f"{seq:>7}{s_local:>9}{'OOM':>13}")
             torch.cuda.empty_cache(); continue
         base = base or ms
-        row = f"{seq:>7}{s_local:>9}{ms:>13.2f}{ms/base:>10.2f}"
+        row = f"{seq:>7}{s_local:>9}{ms:>13.2f}{host_ms:>13.2f}{ms/base:>10.2f}"
         if i < len(piper):
             row += f"{piper[i]:>11.2f}{ms/piper[i]*100:>9.1f}%"
         print(row)
