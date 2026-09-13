@@ -1,9 +1,12 @@
 # Piper-TP: status
 
-Branch `feat/tp-sharding` on `zzw4257/piper`, 19 commits off `uw-syfi/main@439e960b`.
-Addresses upstream issue [#15 "CP/TP support"](https://github.com/uw-syfi/piper/issues/15).
-Detail and evidence for every claim here is in `notes/log.md` as `F1`–`F19`; this
-page is the synthesis, not a duplicate.
+Branch `feat/tp-sharding` on `zzw4257/piper`, 53 commits off `uw-syfi/main@439e960b`.
+Addresses upstream issue [#15 "CP/TP support"](https://github.com/uw-syfi/piper/issues/15):
+TP is done and verified (Stages A–F); CP is built and CPU-verified, GPU rungs
+queued (Stage G, at the end of this page). Detail and evidence for every claim
+here is in `notes/log.md` as `F1`–`F39`; this page is the synthesis, not a
+duplicate. Retractions (F16→F17, F31→F32→F33, F34, cp-design F-c→F37) are kept
+in place.
 
 ## What works
 
@@ -151,7 +154,16 @@ is unchecked, so the failure mode is wrong arithmetic with no diagnostic.
 2. The loss plumbing (F8) — prerequisite for any correctness lane on any
    parallelism dimension.
 3. The `order`-requirement diagnosis (F14) — message-only.
-4. `shard_tensor` itself, against issue #15.
+4. `shard_tensor` itself, against issue #15 (the TP half).
+5. `replicate(prefetch_distance)` (F37/F39) — shipped ZeRO-3 gathers every layer
+   before the first forward; one temporal edge per gather gives it the schedule
+   hand-written ZeRO-3 uses. Off by default; both behaviours are pinned by tests.
+   GPU memory slope measurement queued.
+6. The parameter-free `REDUCE_COMM` guard (F38) — two lines, brings
+   `_insert_reduce_comm_nodes` in line with the all-gather pass; today a dead
+   node per parameter-free region per microbatch.
+7. `ring_exchange` (the CP half of #15) with `hoist`/`distance` — after the
+   queued G-2/G-3 runs, not before.
 
 Open design questions for #15: should `shard` grow a `collective` field instead of
 a sibling op? Should `shard_tensor` refuse to compose with `replicate` (current
@@ -161,10 +173,15 @@ be per-stage, removing the hidden `order` dependency?
 ## Reproducing
 
 ```bash
-python -m pytest -m "not gpu" test                      # 39 tests, no GPU
+python -m pytest -m "not gpu" test                      # 74 tests, no GPU
 python experiments/dump_dag.py --schedule examples/base-schedules/tp2.json
+python experiments/dump_dag.py --model ring --schedule examples/base-schedules/cp2_ring_dp_hoist.json --steps 3
+python experiments/dump_dag.py --schedule examples/base-schedules/zero3_s3_mb1_prefetch1.json --stages 3 --tp 1
+PYTHONPATH=examples:. python experiments/probe_cp_segments.py --steps 4  # G-0: K/V survive as placeholders
 torchrun --nproc_per_node=2 test/test_tp_equivalence.py # TP math, no Piper
+torchrun --nproc_per_node=2 test/test_cp_equivalence.py # ring math, no Piper (queued)
 python experiments/check_tp_equivalence.py              # TP=2 vs TP=1 in Piper
+python experiments/check_cp_equivalence.py --cp 2       # CP=2 ring vs dense in Piper (queued)
 python experiments/check_tp_overlap.py                  # mb=1 cannot overlap, mb=4 does
 ```
 
