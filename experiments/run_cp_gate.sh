@@ -11,15 +11,15 @@ until grep -qE "^(done|gave up)" logs/zero3_peak.txt 2>/dev/null; do
   [ $(( $(date +%s) - t0 )) -gt $MAX_WAIT ] && { echo "gave up waiting for peak job" >> $OUT; exit 1; }
   sleep 120
 done
-pick() {  # pick <n>: n cards with util<10% and mem<8GB, 3 samples 30s apart
-  local n=$1 ok=""; for s in 1 2 3; do
+pick() {  # pick <n> [max_util]: numerics tolerate other tenants' compute; timing (P3) does not
+  local n=$1 mu=${2:-10} ok=""; for s in 1 2 3; do
     ok=$(nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader,nounits \
-        | awk -F', ' '$2<10 && $3<100000 {print $1}' | head -$n | paste -sd,)
+        | awk -F', ' -v mu=$mu '$2<mu && $3<100000 {print $1}' | head -$n | paste -sd,)
     [ "$(echo $ok | tr ',' '\n' | grep -c .)" -lt $n ] && return 1
     sleep 30
   done; echo "$ok"
 }
-while :; do CARDS=$(pick 2) && break
+while :; do CARDS=$(pick 2 95) && break
   [ $(( $(date +%s) - t0 )) -gt $MAX_WAIT ] && { echo "gave up (2 cards)" >> $OUT; exit 1; }; sleep 120; done
 echo "cards=$CARDS $(date -Is)" >> $OUT
 echo "== torchrun CP gate" >> $OUT
