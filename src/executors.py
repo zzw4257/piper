@@ -1286,7 +1286,9 @@ class DagExecutor:
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.UPD:
+                    _t0 = time.perf_counter()
                     update_results.append(self._update(node_stream, loss_buffer))
+                    _inner(node.uid, _t0)
 
                 case TaskType.ORDER_DUMMY:
                     pass
@@ -1309,6 +1311,8 @@ class DagExecutor:
                     f.write(f"{uid}\t{task}\t{alloc}\t{mx}\t{ts:.6f}\t{inner.get(uid, -1):.1f}\n")
                 f.write(f"__last_enqueue__\tmarker\t0\t0\t{last_enqueue:.6f}\t-1\n")
                 f.write(f"__end__\tmarker\t0\t0\t{time.perf_counter():.6f}\t-1\n")
+                for k, v in (getattr(self, "_upd_parts", None) or {}).items():
+                    f.write(f"__upd_{k}__\tmarker\t0\t0\t0\t{v:.1f}\n")
         return {
             "losses": [
                 loss for result in update_results for loss in result["losses"]
@@ -1316,7 +1320,12 @@ class DagExecutor:
         }
 
     def _update(self, stream: torch.cuda.Stream, loss_buffer: list):
+        _parts = self._upd_parts = {} if os.environ.get("PIPER_TIME_TRACE") else None
+        _t = time.perf_counter() if _parts is not None else 0.0
         self.params.drain_pending_frees()
+        if _parts is not None:
+            _parts["drain_frees"] = (time.perf_counter() - _t) * 1e6
+            _parts["_t"] = time.perf_counter()
         if self.params.has_zero_shard_optimizers():
             self.params.step_zero_shard_optimizers(stream, self.events.reduce_scatter)
             torch.cuda.synchronize()
@@ -1333,9 +1342,22 @@ class DagExecutor:
                 stream.wait_event(bwd_evt)
 
             with torch.cuda.stream(stream):
+                _ts = time.perf_counter() if getattr(self, "_upd_parts", None) is not None else 0.0
                 bucket.optimizer.step()
+                if getattr(self, "_upd_parts", None) is not None:
+                    self._upd_parts["opt_step"] = self._upd_parts.get("opt_step", 0.0) + (
+                        time.perf_counter() - _ts) * 1e6
+                    self._upd_parts["n_buckets"] = self._upd_parts.get("n_buckets", 0) + 1
 
+        _ts = time.perf_counter() if getattr(self, "_upd_parts", None) is not None else 0.0
         torch.cuda.synchronize()
+        if getattr(self, "_upd_parts", None) is not None:
+            # A full device sync sits at the end of the update node, so this
+            # node absorbs whatever GPU work is still outstanding. Separating it
+            # is the difference between "the optimizer is expensive" and "the
+            # iteration's drain happens here" (log F56).
+            self._upd_parts["final_sync"] = (time.perf_counter() - _ts) * 1e6
+            self._upd_parts["loop"] = (_ts - self._upd_parts.pop("_t", _ts)) * 1e6
 
         return {
             "losses": _drain_losses(loss_buffer),
