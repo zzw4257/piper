@@ -148,7 +148,12 @@ exactly `CP_i`. P1 (revised) is the test of this paragraph.
 comm predecessor takes that comm node's buffer as its whole input set. Hoisted,
 `CP_{i+1}` has two data predecessors — `CP_i` (accumulators) and `ring_i` (K/V)
 — and must take the accumulator slots from one and the ring slots from the
-other. This is the one executor change G-3 needs beyond the pass.
+other. This is the one executor change G-3 needs beyond the pass. The new
+rule is gated on a hoisted predecessor being present; a probe over the shipped
+Qwen EP lowering (`experiments/probe_ep_consumer_preds.py`) found 0 of 20
+forward compute nodes with both a compute and a boundary-comm data
+predecessor — 16 have exactly one A2A, 4 have none — so upstream's first-match
+lookup was never ambiguous and the gate is defensive, not corrective.
 
 *The budget edge is also the memory-safety edge — at `distance=1` only.* The
 codebase has no `record_stream` anywhere. Spliced topologies are safe without
