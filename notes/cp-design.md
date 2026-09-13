@@ -41,14 +41,17 @@ A value defined in segment `s` and used in segment `s+3` is threaded through
 intermediate segment's GraphModule that output element **is literally a
 placeholder** — the segment forwards it without touching it.
 
-**F-c. The ordering pass anchors any non-default-stream node to its nearest
-default-stream neighbour.** `resolve_total_order_per_stream`
-(`ordering.py:115-159`) places a stream node next to
-`min(default_anchors, key=(topo_level, topo_idx))`. ZeRO-3's
-`ALL_GATHER_COMM` is created as a DAG **root** — no incoming edge at all,
-except in the `BWD_W` case (`directives.py:867-895`) — so it is
-dependency-free and could legally be issued arbitrarily early. The ordering
-pass still pins it immediately before its consumer.
+**F-c (retracted 2026-09-13, see log F37).** This fact originally claimed the
+ordering pass pins a dependency-free collective next to its consumer. Lowering
+a ZeRO-3 DAG showed the opposite: `ALL_GATHER_COMM` is created as a DAG root
+(`directives.py:867-895`), lives on `default_stream` so the stream-anchor logic
+in `resolve_total_order_per_stream` never applies to it, and is issued at
+**topological level 0** by `_serial_topological_order` — every layer's
+parameters are gathered before the first forward runs. The corrected fact:
+
+**F-c′. A collective's issue point is a function of graph structure only.**
+Spliced collectives issue when their source region completes; root collectives
+issue first. There is no policy in between, and no knob.
 
 ## 3. The gap, stated precisely [proposed]
 
@@ -70,13 +73,17 @@ bare placeholder.
 
 So the limitation is not "a region is the minimum schedulable unit". It is:
 
-> **A collective's earliest-ready point is currently defined to be its edge's
-> source-region completion, and there are two independent mechanisms (F-a at
-> insertion, F-c at ordering) that enforce that. Neither is required by the IR,
-> which is a general DAG with per-node streams and cross-stream events.**
+> **Piper has no notion of where a collective is issued.** Position falls out
+> of graph structure: an edge-spliced collective is issued at source-region
+> completion (too late for CP — its payload was ready at region start); a root
+> collective is issued at topological level 0 (too early for ZeRO-3 — its
+> memory budget wanted one layer of lookahead, not all of them). These are the
+> same missing concept seen from opposite ends: an earliest-ready point, and an
+> issue budget between that point and the consumer. Today the only available
+> budgets are 0 and ∞.
 
-Both must be lifted. Lifting only F-a leaves F-c to re-serialize the result;
-this is a concrete prediction the first experiment will test (§7, P1).
+F-a is what must be lifted for CP. F-c′ is what makes the `distance` argument
+in §4 G2 a *missing* knob rather than an optimization.
 
 ## 4. Proposal: derive the earliest-ready point [proposed]
 
@@ -103,11 +110,12 @@ Express it as a directive argument, not a heuristic:
 ZeRO-3 parameter prefetch is the same directive with `distance>=1` and an
 empty slice. One mechanism, two features.
 
-**G3 — release the ordering anchor.** A hoisted node needs an explicit release
-point instead of `min(default_anchors)`. Cheapest correct form: anchor it to
-the default-stream node its *derived* dependency set ends at, which is exactly
-what G1 computes. This is a change to how the anchor is chosen, not to the
-ordering algorithm.
+**G3 — an issue point, not an anchor (revised per F37).** The hoist needs an
+explicit *latest-issue* edge as well as the earliest-ready dependency: a
+temporal edge from the compute node `distance` regions before the consumer.
+Without it the hoisted node becomes a root and F-c′ issues it at slot 0 — the
+ZeRO-3 failure reproduced on purpose. The same edge, applied to today's
+`ALL_GATHER_COMM`, is the ZeRO-3 prefetch budget.
 
 **G4 — mechanical prerequisites.** A boundary records one `tensor_idx`
 (`fx.py:686`, `_select_boundary_tensor_idx` at `fx.py:495` is a float/
@@ -120,10 +128,13 @@ requires_grad scoring heuristic); CP moves K and V, so this becomes a list.
 
 The test of an abstraction is whether it explains something it was not derived
 from. G1/G2/G3 were derived from CP, and they immediately explain a missing
-optimization in a *shipped* Piper feature: ZeRO-3 cannot prefetch the next
-layer's parameters, which every production ZeRO implementation does by hand.
-F-c says why, and G3 says what to change. That is evidence the framing is at
-the right level; a placement type system would have explained neither.
+defect in a *shipped* Piper feature — though not the one first predicted.
+ZeRO-3 does not under-prefetch; it gathers *every* layer before the first
+forward (log F37), which by the dispatch order and the free point makes peak
+parameter memory the unsharded total. F-c′ says why, and G3's issue budget is
+the fix. A framing derived from CP that lands on ZeRO-3's actual failure —
+after being wrong about its sign — is better evidence of being at the right
+level than one that had merely confirmed a guess.
 
 ## 6. Ladder
 
@@ -164,9 +175,10 @@ invalidate G-0..G-4.
 
 Written before running anything, so a later result cannot be retrofitted.
 
-**P1.** Lifting F-a alone changes nothing measurable, because F-c re-anchors the
-hoisted node. If G-3 shows a gain with the anchor change *reverted*, the F-a/F-c
-two-mechanism claim in §3 is wrong.
+**P1 (revised per F37).** Lifting F-a alone makes the ring-exchange node a
+root, and F-c′ will issue it at slot 0 — every step's K/V exchange fired before
+step 0's compute. Correct, and the memory-worst schedule. If G-3 without the
+latest-issue edge shows *bounded* buffer growth, F-c′ is wrong.
 
 **P2.** The Stage E/F finding — every collective re-pays a rank arrival skew of
 157–2831 us, and cost is near-independent of payload — predicts that hoisting
@@ -181,11 +193,10 @@ than all-reduce. This is testable independently of whether CP itself succeeds,
 and it isolates whether the "skew tax" is a property of global synchronization
 or of NCCL. **Run this first — it is a standalone result.**
 
-**P4.** The Stage F observation that `stream` had no effect at 1 microbatch was
-attributed to "no independent work to overlap with". F-c offers a competing
-explanation. Predicted discriminator: at 1 microbatch with an artificially
-dependency-free collective, the current anchor rule still issues it adjacently.
-If so, part of that earlier finding must be restated.
+**P4 — resolved (log F37).** Tested on CPU before any GPU work. The anchor
+rule does not apply to the collective in question and the sign of the effect
+was the reverse of the prediction. The Stage F `stream` finding stands as
+originally stated; the competing explanation is withdrawn.
 
 ## 8. Risks, cheapest check first
 
