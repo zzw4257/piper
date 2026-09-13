@@ -2024,3 +2024,39 @@ stream and is the same measurement as the ring's.
 ### Next experiment
 
 The queued slope run. Then the GPU G-2/G-3 chain.
+
+## 2026-09-13 — F40: ring attention matches dense attention out of band, and the backward ring is constrained
+
+### Tested
+
+`torchrun --nproc_per_node=2 test/test_cp_equivalence.py` on two B200s shared
+with other tenants (numerics are indifferent to that). Each rank holds one
+sequence chunk of Q/K/V; K/V travel the ring via an autograd Function whose
+forward hands the chunk to the next rank and whose backward hands the chunk's
+gradient back to the previous one. Reference: gather the chunks, run dense
+`scaled_dot_product_attention`, slice this rank's rows.
+
+### Result
+
+    out 4.2e-07   dQ 1.2e-06   dK 2.9e-06   dV 1.9e-06     (fp32, max abs err)
+
+Both controls broke as required: with no rotation the output differs; with a
+forward-only rotation the output *matches* and dK/dV differ. The second control
+is the one a loss curve cannot provide — it is the only thing in this project
+that constrains the backward ring's placement, and it fails the moment the
+gradient stops travelling back.
+
+### What this does and does not establish
+
+Establishes: the math in `examples/models/ring_attn.py::ring_step`, the
+forward/backward rotation directions (+1/−1) that `ring_exchange` lowers to,
+and that the accumulation of a chunk's gradient across ranks is correct when
+done by the receiving rank's autograd (no explicit reduction). These are the
+three things G-1b's executor arms encode.
+
+Does not establish: that Piper's executor does the same. That is the in-Piper
+half of G-2, which had not run at this point (a script bug; rerun queued).
+
+### Next experiment
+
+In-Piper CP=2 vs dense CP=1 across optimizer steps with the no-ring control.
