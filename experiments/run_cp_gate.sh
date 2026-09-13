@@ -28,7 +28,7 @@ CUDA_VISIBLE_DEVICES=$CARDS timeout 600 python -m torch.distributed.run --nproc_
 grep -E "CP=|Error|error|assert" logs/cp_gate_torchrun.log | tail -4 >> $OUT
 echo "== in-Piper CP equivalence" >> $OUT
 CUDA_VISIBLE_DEVICES=$CARDS timeout 2400 python experiments/check_cp_equivalence.py \
-  --extra --temp-dir /var/tmp/ziweizho-ray > logs/cp_gate_piper.log 2>&1; echo "rc=$?" >> $OUT
+  -- --temp-dir /var/tmp/ziweizho-ray > logs/cp_gate_piper.log 2>&1; echo "rc=$?" >> $OUT
 grep -E "^CP=|negative control|Error|failed|assert" logs/cp_gate_piper.log | tail -8 >> $OUT
 if ! grep -q "ring == CP=1 dense" logs/cp_gate_piper.log; then
   # Insurance for a scarce window: if the replicate-composed run failed (F38's
@@ -36,15 +36,8 @@ if ! grep -q "ring == CP=1 dense" logs/cp_gate_piper.log; then
   # iteration -- no replicate, so no weight sync, so only iteration 0 is valid.
   echo "== fallback: cp2_ring (no replicate), one iteration" >> $OUT
   CUDA_VISIBLE_DEVICES=$CARDS timeout 1800 python experiments/check_cp_equivalence.py \
-    --cp2-schedule cp2_ring --extra --temp-dir /var/tmp/ziweizho-ray --warmup 0 --iters 1 \
+    --cp2-schedule cp2_ring -- --temp-dir /var/tmp/ziweizho-ray --warmup 0 --iters 1 \
     > logs/cp_gate_piper_fallback.log 2>&1; echo "rc=$?" >> $OUT
   grep -E "^CP=|negative control|Error|failed|assert" logs/cp_gate_piper_fallback.log | tail -8 >> $OUT
 fi
-echo "== P3 skew topology (4 cards)" >> $OUT
-while :; do CARDS4=$(pick 4) && break
-  [ $(( $(date +%s) - t0 )) -gt $MAX_WAIT ] && { echo "gave up (4 cards) $(date -Is)" >> $OUT; exit 0; }; sleep 300; done
-echo "cards=$CARDS4 $(date -Is)" >> $OUT
-CUDA_VISIBLE_DEVICES=$CARDS4 timeout 900 python -m torch.distributed.run --nproc_per_node=4 \
-  experiments/probe_skew_topology.py > logs/p3_skew.log 2>&1; echo "rc=$?" >> $OUT
-cat logs/p3_skew.log | grep -vE "Warning|^$" | head -40 >> $OUT
 echo "done $(date -Is)" >> $OUT

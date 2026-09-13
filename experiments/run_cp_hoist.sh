@@ -21,7 +21,7 @@ while :; do CARDS=$(pick 2 101) && break
 echo "cards=$CARDS $(date -Is)" >> $OUT
 echo "== hoisted CP=2 vs dense" >> $OUT
 CUDA_VISIBLE_DEVICES=$CARDS timeout 2400 python experiments/check_cp_equivalence.py --cp 2 \
-  --cp2-schedule cp2_ring_dp_hoist --skip-negative-control --extra --temp-dir /var/tmp/ziweizho-ray \
+  --cp2-schedule cp2_ring_dp_hoist --skip-negative-control -- --temp-dir /var/tmp/ziweizho-ray \
   > logs/cp_hoist_2.log 2>&1; echo "rc=$?" >> $OUT
 grep -E "^CP=|peak_memory|Error|failed|assert" logs/cp_hoist_2.log | tail -10 >> $OUT
 
@@ -33,7 +33,7 @@ for S in cp4_ring_dp cp4_ring_dp_hoist cp4_ring_dp_hoist_unbounded; do
   echo "-- $S" >> $OUT
   CUDA_VISIBLE_DEVICES=$CARDS4 timeout 2400 python experiments/check_cp_equivalence.py --cp 4 \
     --cp2-schedule $S --skip-negative-control \
-    --extra --temp-dir /var/tmp/ziweizho-ray --seq 8192 --dim 512 --heads 8 --batch-size 2 --iters 5 \
+    -- --temp-dir /var/tmp/ziweizho-ray --seq 8192 --dim 512 --heads 8 --batch-size 2 --iters 5 \
     > logs/cp_hoist_4_$S.log 2>&1; echo "rc=$?" >> $OUT
   grep -E "^CP=|peak_memory|worst|Error|failed|assert" logs/cp_hoist_4_$S.log | tail -12 >> $OUT
 done

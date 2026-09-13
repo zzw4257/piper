@@ -13,3 +13,4 @@ logs/
 *.nsys-rep
 *.sqlite
 .venv*
+examples/base-schedules/_zero_probe_*.json
