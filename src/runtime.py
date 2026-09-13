@@ -1,11 +1,49 @@
 from __future__ import annotations
 
+import os
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 import torch.distributed as dist
 from concurrent.futures import Future, ThreadPoolExecutor
+
+
+class _BufferPool:
+    """Bounded reuse of full-size buffers (log F43).
+
+    A buffer is returned together with the event after which the GPU is done
+    with it. The next taker waits on that event *on its own stream*, so the host
+    never blocks, and the number of live buffers is bounded by how many are in
+    flight between the dispatch of an alloc and the dispatch of its release --
+    which is what a DAG issue budget bounds. Without the pool, alloc happens on
+    the host at dispatch and free on a background thread after the event
+    completes, so the host running ahead of the GPU holds every buffer at once.
+
+    Keyed by (kind, bytes, dtype); a miss allocates fresh, so the pool only ever
+    grows to the in-flight count. Enabled with PIPER_BUFFER_POOL=1.
+    """
+
+    def __init__(self) -> None:
+        self.free: dict[Any, deque] = {}
+        self.allocated: dict[Any, int] = {}
+
+    def take(self, key: Any, stream: Any) -> Any | None:
+        q = self.free.get(key)
+        if not q:
+            return None
+        buf, evt = q.popleft()
+        if evt is not None and stream is not None:
+            stream.wait_event(evt)
+        return buf
+
+    def give(self, key: Any, buf: Any, evt: Any) -> None:
+        self.free.setdefault(key, deque()).append((buf, evt))
+
+    def note_fresh(self, key: Any) -> int:
+        self.allocated[key] = self.allocated.get(key, 0) + 1
+        return self.allocated[key]
 
 
 @dataclass
@@ -282,8 +320,18 @@ class ParamStorage:
                 )
                 param.grad = None
 
+    @property
+    def _pool(self) -> _BufferPool | None:
+        if not hasattr(self, "_pool_obj"):
+            self._pool_obj = _BufferPool() if os.environ.get("PIPER_BUFFER_POOL") == "1" else None
+        return self._pool_obj
+
     def defer_free_full_params(self, ubid: Any | None, evt: torch.cuda.Event) -> None:
         if ubid is None or ubid not in self.stages.param_sharded_ubids:
+            return
+        if self._pool is not None:
+            # Release now; the next taker orders itself after evt on its stream.
+            self.free_full_params(ubid, evt=evt)
             return
         self.wait_pending_free(self.pending_param_frees, ubid)
         self.pending_param_frees[ubid] = self.cleanup_executor.submit(
@@ -294,6 +342,9 @@ class ParamStorage:
 
     def defer_free_full_grads(self, ubid: Any | None, evt: torch.cuda.Event) -> None:
         if ubid is None or ubid not in self.stages.grad_sharded_ubids:
+            return
+        if self._pool is not None:
+            self.free_full_grads(ubid, evt=evt)
             return
         self.wait_pending_free(self.pending_grad_frees, ubid)
         self.pending_grad_frees[ubid] = self.cleanup_executor.submit(
@@ -310,7 +361,7 @@ class ParamStorage:
         evt.synchronize()
         self.free_full_grads(ubid)
 
-    def alloc_full_params(self, ubid: Any) -> None:
+    def alloc_full_params(self, ubid: Any, stream: torch.cuda.Stream | None = None) -> None:
         assert ubid is not None, "alloc_full_params requires a non-None ubid"
         assert ubid in self.stages.param_sharded_ubids, (
             f"alloc_full_params: ubid={ubid} is not in param_sharded_ubids="
@@ -329,7 +380,18 @@ class ParamStorage:
         assert specs, f"alloc_full_params: missing param_view_specs for ubid={ubid}"
         storage = full.untyped_storage()
         required_bytes = full.numel() * full.element_size()
-        storage.resize_(required_bytes)
+        pool = self._pool
+        if pool is not None:
+            key = ("param", required_bytes, full.dtype)
+            pooled = pool.take(key, stream)
+            if pooled is not None:
+                full.set_(pooled, 0, full.shape)
+            else:
+                storage.resize_(required_bytes)
+                pool.note_fresh(key)
+            storage = full.untyped_storage()
+        else:
+            storage.resize_(required_bytes)
         self.logger.debug(
             f"[alloc_full_params] rank={self.runtime.global_rank} ubid={ubid}: "
             f"numel={full.numel()} required_bytes={required_bytes} "
@@ -352,7 +414,7 @@ class ParamStorage:
             f"ubid={ubid}: " + " | ".join(zero_storage)
         )
 
-    def free_full_params(self, ubid: Any) -> None:
+    def free_full_params(self, ubid: Any, evt: torch.cuda.Event | None = None) -> None:
         assert ubid is not None, "free_full_params requires a non-None ubid"
         assert ubid in self.stages.param_sharded_ubids, (
             f"free_full_params: ubid={ubid} is not in param_sharded_ubids="
@@ -368,7 +430,14 @@ class ParamStorage:
             f"[free_full_params] rank={self.runtime.global_rank} ubid={ubid}: "
             f"storage_size_before={storage.size()} fresh_before={bucket.full_params_fresh}"
         )
-        storage.resize_(0)
+        pool = self._pool
+        if pool is not None and storage.size() > 0:
+            pool.give(("param", storage.size(), full.dtype), storage, evt)
+            # Detach the bucket's tensor from the pooled storage; the next alloc
+            # rebinds it (and every parameter view) to whichever storage it takes.
+            full.set_(torch.empty(0, dtype=full.dtype, device=full.device).untyped_storage(), 0, (0,))
+        else:
+            storage.resize_(0)
         bucket.full_params_fresh = False
 
     def alloc_full_grads(self, ubid: Any, stream: torch.cuda.Stream) -> None:
@@ -388,11 +457,20 @@ class ParamStorage:
         shard_size = shard_info[1]
         with torch.cuda.stream(stream):
             if bucket.flat_grads is None:
-                bucket.flat_grads = torch.zeros(
-                    shard_size * self.runtime.dp_degree,
-                    dtype=self.grad_buffer_dtype,
-                    device=self.runtime.device,
-                )
+                numel = shard_size * self.runtime.dp_degree
+                pool = self._pool
+                pooled = pool.take(("grad", numel, self.grad_buffer_dtype), stream) if pool is not None else None
+                if pooled is not None:
+                    pooled.zero_()
+                    bucket.flat_grads = pooled
+                else:
+                    if pool is not None:
+                        pool.note_fresh(("grad", numel, self.grad_buffer_dtype))
+                    bucket.flat_grads = torch.zeros(
+                        numel,
+                        dtype=self.grad_buffer_dtype,
+                        device=self.runtime.device,
+                    )
             if bucket.reduce_scatter_grads is None:
                 bucket.reduce_scatter_grads = torch.zeros(
                     shard_size,
@@ -400,7 +478,7 @@ class ParamStorage:
                     device=self.runtime.device,
                 )
 
-    def free_full_grads(self, ubid: Any) -> None:
+    def free_full_grads(self, ubid: Any, evt: torch.cuda.Event | None = None) -> None:
         assert ubid is not None, "free_full_grads requires a non-None ubid"
         assert ubid in self.stages.grad_sharded_ubids, (
             f"free_full_grads: ubid={ubid} is not in grad_sharded_ubids="
@@ -411,6 +489,10 @@ class ParamStorage:
         assert specs, f"free_full_grads: missing param_view_specs for ubid={ubid}"
         for param, *_ in specs:
             param.grad = None
+        pool = self._pool
+        if pool is not None and bucket.flat_grads is not None:
+            g = bucket.flat_grads
+            pool.give(("grad", g.numel(), g.dtype), g, evt)
         bucket.flat_grads = None
 
     def all_gather_full_params(self, ubid: Any, stream: torch.cuda.Stream) -> int:
@@ -422,7 +504,7 @@ class ParamStorage:
             f"{self.stages.param_sharded_ubids}"
         )
         bucket = self.stages.bucket(ubid)
-        self.alloc_full_params(ubid)
+        self.alloc_full_params(ubid, stream)
         flat_params = bucket.flat_params
         shard_in = bucket.shard_param
         assert flat_params is not None, (
