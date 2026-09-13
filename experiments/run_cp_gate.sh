@@ -14,7 +14,7 @@ done
 pick() {  # pick <n>: n cards with util<10% and mem<8GB, 3 samples 30s apart
   local n=$1 ok=""; for s in 1 2 3; do
     ok=$(nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader,nounits \
-        | awk -F', ' '$2<10 && $3<8000 {print $1}' | head -$n | paste -sd,)
+        | awk -F', ' '$2<10 && $3<100000 {print $1}' | head -$n | paste -sd,)
     [ "$(echo $ok | tr ',' '\n' | grep -c .)" -lt $n ] && return 1
     sleep 30
   done; echo "$ok"

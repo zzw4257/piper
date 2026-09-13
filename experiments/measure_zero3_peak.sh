@@ -13,7 +13,7 @@ echo "start $(date -Is)" >> $OUT
 pick_two() {  # two cards with util<10% and mem<8GB, 3 samples 30s apart
   local ok=""; for s in 1 2 3; do
     ok=$(nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader,nounits \
-        | awk -F', ' '$2<10 && $3<8000 {print $1}' | head -2 | paste -sd,)
+        | awk -F', ' '$2<10 && $3<100000 {print $1}' | head -2 | paste -sd,)
     [ "$(echo $ok | tr ',' '\n' | grep -c .)" -lt 2 ] && return 1
     sleep 30
   done

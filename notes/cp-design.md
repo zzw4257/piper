@@ -147,6 +147,16 @@ comm predecessor takes that comm node's buffer as its whole input set. Hoisted,
 — and must take the accumulator slots from one and the ring slots from the
 other. This is the one executor change G-3 needs beyond the pass.
 
+*The budget edge is also the memory-safety edge — at `distance=1` only.* The
+codebase has no `record_stream` anywhere. Spliced topologies are safe without
+it: every comm-stream node waits on the event of the compute that consumed the
+buffer it is about to reuse, so the allocator may hand a block over early but
+the write is stream-ordered behind the read. Hoisting removes exactly that
+wait. At `distance=1` the temporal edge `CP_i -> ring_{i+1}` restores it by
+coincidence; at `distance>=2` nothing does. G-3's consumer therefore calls
+`record_stream` on merged ring tensors, so correctness does not depend on the
+budget the user chose.
+
 **G4 — mechanical prerequisites.** A boundary records one `tensor_idx`
 (`fx.py:686`, `_select_boundary_tensor_idx` at `fx.py:495` is a float/
 requires_grad scoring heuristic); CP moves K and V, so this becomes a list.
