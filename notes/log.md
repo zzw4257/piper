@@ -2985,3 +2985,85 @@ Per-node cost is the gap between consecutive host timestamps, so node `i` is
 charged with its own dispatch plus any blocking that node `i+1` does before its
 timestamp. With the drain at 0.1 ms the GPU is never the thing being waited on,
 so the attribution is sound here; it would not be in a GPU-bound regime.
+
+## 2026-09-14 — F53: the 4.6x host-side tax decomposed — segmentation 1.3-1.7x, FX interpretation another 1.2-1.6x, and about 1.8x that is Piper's own per-node machinery
+
+### Tested
+
+`experiments/probe_segmentation_cost.py`: the same ring arithmetic three ways,
+plain PyTorch, no Ray and no DAG, host launch time as the metric (the GPU is
+starved throughout, and its time tracks the host's in every variant).
+
+* **A straight** — one function, one backward over the whole thing.
+* **B detached** — a `detach().clone().requires_grad_()` boundary between ring
+  steps and `torch.autograd.grad` called once per segment with explicit
+  `grad_outputs`. This is what Piper's segment boundaries do.
+* **C detached + fx** — B with each segment run through `torch.fx.Interpreter`,
+  which is how Piper executes a segment's GraphModule.
+
+Inductor, the obvious way to ask the same question, fails on both hosts for
+unrelated toolchain reasons (B200: Triton's NVIDIA backend, `make_ttgir` →
+`PassManager::run failed`; H200: `gcc` on Triton's `cuda_utils.c`), while the
+model's own math compiles standalone on B200. So the cost was decomposed
+directly instead.
+
+### Result
+
+| variant | B200 host | vs A | H200 host | vs A |
+|---|---|---|---|---|
+| A straight | 1.97 ms | 1.00x | 3.47 ms | 1.00x |
+| B detached | 3.43 | **1.74x** | 4.39 | **1.26x** |
+| C detached + fx | 4.19 | **2.13x** | 6.83 | **1.97x** |
+
+Both machines order the three the same way and land within 8% of each other on
+the combined factor (2.13x, 1.97x), which by the F51 criterion makes this a
+structural property rather than a machine one. FX interpretation on top of
+segmentation is 1.22x (B200) and 1.56x (H200).
+
+### The accounting
+
+Piper's compute nodes cost 9.08 ms of host time (F52) against 2.4 ms for the
+same arithmetic written straight — 3.8x. Of that:
+
+| component | factor | measured by |
+|---|---|---|
+| detach/clone boundaries + per-segment autograd | 1.3–1.7x | B/A |
+| FX interpretation of each segment | 1.2–1.6x | C/B |
+| **the two together** | **2.0–2.1x** | C/A |
+| everything else Piper does per node | **~1.8x** | 3.8x / C/A |
+
+The remainder is not mysterious, it is just not isolated here: a CUDA event
+created and recorded per node, the buffer store's dict traffic and refcounting,
+the `match task_type` dispatch with its predecessor lookups, the
+`requires_grad_`/contiguity handling at each boundary — and the fact that
+Piper's DAG has twelve compute nodes for this model where the probe has four
+segments, so per-segment costs are counted three times as often.
+
+### Why this is the useful form of F50
+
+F50 said the runtime costs a model-independent ~8-11 ms and that below about
+50% GPU share a scheduling knob is being tested against the runtime. F52 said
+the cost is the loop and 82% of it is compute nodes. This says what inside the
+compute nodes, in components that can be attacked separately:
+
+* the FX term is what `--use-inductor` is for, and it is *off by default in
+  every shipped example*, so every number in the Piper paper and in this one is
+  measured with it on the table;
+* the segmentation term is the price of the IR itself — cutting autograd at
+  every boundary is what makes boundary collectives expressible (§Background),
+  so it is not removable without changing what Piper is;
+* the per-node term is ordinary engineering, and the event-per-node is the
+  first thing to look at.
+
+That is a different conclusion from "Piper has overhead". One of the three
+components is load-bearing for the abstraction, one is a compile flag that does
+not currently work on either of our hosts for this model, and one is
+implementation.
+
+### Caveat
+
+The probe's four segments are not Piper's twelve compute nodes, so B and C
+under-count relative to Piper by roughly the segment-count ratio; the 1.8x
+remainder is an upper bound on Piper-specific machinery and would shrink if the
+probe matched the node count. The direction and the ordering are what the
+two-machine agreement supports, not the third decimal.
