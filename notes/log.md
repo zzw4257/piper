@@ -2494,3 +2494,114 @@ and context size, not signal. The slope is the invariant; the intercept is not.
 All 78 CPU tests pass on the H200 host and the out-of-band CP gate reproduces
 bit-identically (F45). The tree there is a clone of `feat/tp-sharding` used as a
 run site; commits are made only on catalyst-fleet1.
+
+## 2026-09-14 — F48: with the ranks synchronized, collective cost *is* affine in bytes (421 GB/s, residual <= 11 us). F31/F32 measured the skew term, not the transport term — and symmetric GPU work does not produce that skew
+
+### Tested
+
+`experiments/probe_collective_law.py` on four idle B200s (catalyst-fleet1 went
+quiet for the first time in this project: five cards at 0%). Payload swept
+0.5–256 MiB, two collectives (`all_reduce`; a one-hop ring over
+`batch_isend_irecv`), three regimes at each point, 30 iterations, minimum per
+rank, group cost = slowest rank:
+
+* **synced** — `barrier` + device sync immediately before each call;
+* **natural** — a ~2 ms matmul between calls, no barrier, as inside a real step;
+* **skewed** — rank 2 delayed 2000 us before each call.
+
+The hypothesis under test, assembled from F19/F31/F32/F33/F45:
+
+    cost  ~  max( transport(bytes),  arrival skew )
+
+### Result 1 — the transport term exists and is clean
+
+| MiB | AR synced | AR natural | AR skewed | ring synced | ring skewed |
+|---|---|---|---|---|---|
+| 1 | 32.6 | 31.1 | 1983 | 57.3 | 1929 |
+| 8 | 59.2 | 59.7 | 1973 | 95.6 | 1996 |
+| 32 | 132.3 | 134.4 | 2046 | 243.3 | 874 |
+| 64 | 197.1 | 198.2 | 2101 | 437.2 | 2337 |
+| 256 | 678.8 | 679.2 | 2549 | 840.5 | 2108 |
+
+Affine fit over 4–256 MiB, synced:
+
+    all_reduce:  41.7 us + 2.49 us/MiB   ->  421 GB/s,  max |residual| 11 us
+    ring      : 139.8 us + 3.31 us/MiB   ->  317 GB/s,  max |residual| 264 us
+
+**`all_reduce` is a textbook bandwidth model.** Eleven microseconds of residual
+across a 64x payload range is as clean as this kind of measurement gets.
+
+F31 and F32 reported that a 32x payload sweep changed cost by only 2.3x and
+concluded that cost is near-independent of volume. That conclusion is now
+qualified: it was measured with a real Piper DAG between collectives, where
+F19's 157–2831 us of arrival skew dwarfs the 60–200 us of transport that TP
+payloads actually need. **They measured the skew term.** The transport term was
+there all along, below it.
+
+The skewed column is the same law from the other side: flat at ~2000 us while
+the injected skew dominates, and rising above it only once transport becomes
+comparable (256 MiB: 2549 ~ 2000 + 549). For `all_reduce` the crossover is
+`2.49 * MiB + 41.7 = skew`; at F19's typical few-hundred-us skew that is
+~100 MiB, and at 2000 us it is ~800 MiB.
+
+### Result 2 — the ring is *not* affine, on the same hardware in the same sweep
+
+The ring's residual is 264 us, 24x the all-reduce's, and the misfit is
+structured: 128 MiB costs 827 us and 256 MiB costs 840 us — 2x the bytes for
+1.6% more time. NCCL switches protocol/channel configuration under the ring,
+and the cost is piecewise. So "a bandwidth model is valid" is a claim about a
+*collective*, not about a machine: it holds for `all_reduce` here and fails for
+raw neighbour P2P beside it.
+
+### Result 3 — the skew is not made by symmetric GPU work
+
+`natural` and `synced` agree to a median of **2.2 us** across all twenty
+(payload, collective) pairs, against the 2000 us the injection produces. Four
+identical GPUs running identical matmuls do not drift apart.
+
+This contradicts the mechanism F33 proposed — "computation between collectives
+desynchronizes the ranks" — in its general form, and narrows it to something
+sharper. The arrival skew inside a Piper step cannot come from symmetric device
+work. What is left is **host-side asynchrony**: each rank runs its own Python
+dispatch loop in its own Ray process, and those loops are not coupled to each
+other by anything except the collectives themselves.
+
+That is the same mechanism F43 and F47 found on the memory side: the host runs
+ahead of the GPU, independently per rank. One asynchrony, two symptoms —
+unbounded buffer residency and arrival skew. F47 showed the memory symptom is
+machine-dependent because the race is; the skew should be too, which the H200
+run of this same sweep will say.
+
+### Result 4 — the ring's localization threshold is between 32 and 64 MiB here
+
+Per-rank cost of the 2000 us skew, over each rank's own synced baseline
+(rank 2 delayed; rank 1 sends into it, rank 3 receives from it):
+
+| MiB | collective | r0 (opposite) | r1 (upstream) | r2 (delayed) | r3 (downstream) |
+|---|---|---|---|---|---|
+| 4 | all_reduce | +1021 | +1458 | +8 | +1928 |
+| 4 | ring | −0 | −1 | −32 | **+1909** |
+| 32 | ring | −2 | +2 | −33 | **+638** |
+| 64 | ring | −6 | **+1696** | −41 | **+1903** |
+| 256 | ring | −7 | **+1277** | −54 | **+1277** |
+
+F45 found on H200 that the upstream sender begins paying at 64 MiB but not at
+16. B200 agrees: clean localization at 4 and 32 MiB, upstream paying from 64.
+Two different machines put the knee in the same octave, which suggests a
+protocol constant rather than a bandwidth effect. A fine sweep between 16 and
+96 MiB on both hosts is queued to pin it.
+
+### Consequence for the project's thesis
+
+The paper's limitation paragraph said automatic TP selection must model the
+runtime rather than the hardware, "because communication cost is not a function
+of communication volume". The conclusion stands; its reason was wrong and the
+correct reason is more useful. Cost *is* a function of volume. The roofline
+failed because it was missing a second term — arrival skew — which at TP
+payloads is the larger of the two, and which belongs to the runtime because the
+runtime is what lets the ranks drift.
+
+That converts a dead end into a specification: a usable cost model for Piper is
+`max(a + b*bytes, skew)` with `a, b` measurable in one sweep like this one and
+`skew` a property of the dispatch loop. Whether `skew` is predictable at all is
+the next question, and it is a runtime question.
