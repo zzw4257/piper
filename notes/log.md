@@ -2060,3 +2060,102 @@ half of G-2, which had not run at this point (a script bug; rerun queued).
 ### Next experiment
 
 In-Piper CP=2 vs dense CP=1 across optimizer steps with the no-ring control.
+
+## 2026-09-13 — F41: `ring_exchange` is numerically correct inside Piper across optimizer steps, spliced and hoisted alike
+
+### Tested
+
+`experiments/check_cp_equivalence.py --cp 2`: CP=2 (`cp2_ring_dp`: place on two
+ranks, `replicate` on the projection weights, `ring_exchange` on the CP regions)
+against dense CP=1 on one rank, same global seed for data and weights, three
+optimizer steps, fp32, Inductor off. Then the same with `cp2_ring_dp_hoist`
+(`hoist=true, distance=1`). Two shared B200s.
+
+### Result
+
+    CP=1 dense            [1.002299, 0.998082, 0.994083]
+    CP=2 rank0            [0.998436, 0.994217, 0.990225]
+    CP=2 rank1            [1.006162, 1.001945, 0.997937]
+    CP=2 mean over ranks  [1.002299, 0.998081, 0.994081]   worst |diff| 1.7e-06
+    no-ring control differs by 3.2e-03
+
+The hoisted run's per-rank losses are **identical to the last printed digit** to
+the spliced run's. The consumer merge, the ring node reading a ring predecessor,
+the shared-event rule and `record_stream` compute the same thing as the spliced
+path.
+
+### What it constrains
+
+Iteration 0 matching blames nothing; iterations 1–2 matching means the backward
+ring delivered each chunk's gradient to its owner and the projection-weight
+all-reduce composed with it — otherwise the two ranks' weights would have
+diverged from step 1 (as they did for TP in F10 when the backward collective was
+missing). Per-rank losses differ (different sequence halves) and their mean
+equals the dense loss, which is the arithmetic of equal chunks.
+
+With F40 this closes G-2 and the numerics half of G-3. The overlap half of G-3
+needs four quiet cards and is queued.
+
+## 2026-09-13 — F42: `prefetch_distance` changed the dispatch order and not the peak memory; the budget edge bounds issue on the stream, allocation happens on the host
+
+### Tested
+
+`experiments/measure_zero3_peak.sh`: TPMlp, dim 4096, hidden 16384 (stage =
+pre+up+down+post = 0.625 GiB fp32), two ranks, mb=1, stages ∈ {2,4,8}, three
+arms. Peak = `max_memory_allocated` over the timed iterations, max over ranks.
+Slope fitted against stages × stage-bytes.
+
+| arm | predicted | measured | intercept |
+|---|---|---|---|
+| plain DP | 4.0 | **4.00** | 0.03 GiB |
+| ZeRO-3 as shipped | 3.0 | **3.61** | 0.72 |
+| ZeRO-3, `prefetch_distance=1` | 2.0 | **3.99** | −0.78 |
+
+Plain DP landing on 4.00 says the accounting (params + grads + 2× Adam) is
+right and the measurement is clean. The `prefetch_distance` arm is the failure:
+at 2 and 4 stages it is lower than shipped (4.28 vs 4.85, 9.09 vs 10.34 GiB), at
+8 stages it is *higher* (19.22 vs 18.59). Shipped ZeRO-3 shows a rank asymmetry
+plain DP does not (17.41 vs 18.59 GiB at 8 stages).
+
+### Retraction
+
+F37's consequence paragraph — "by the dispatch order and the free point, peak
+parameter memory is the unsharded total" — inferred memory from dispatch order.
+The dispatch order did change exactly as `test_zero3_prefetch_budget.py` says
+(CPU-verified). Peak memory did not follow. The inference was wrong, and the
+mechanism is in the runtime, not the DAG:
+
+- `alloc_full_params` runs **on the host, at dispatch time** (`runtime.py:334`);
+- the free is deferred to a **background thread** that `evt.synchronize()`s and
+  then frees (`runtime.py:285-300`, `defer_free_full_params`);
+- the host dispatch loop (`executors.py:664`) does not block on anything.
+
+So the host allocates every layer's full-parameter buffer while the GPU is still
+on layer 0, in *both* arms. The temporal edge orders the gather's stream work
+after the previous compute; it cannot delay a host-side `alloc`. Peak is then
+set by the race between host dispatch and GPU completion — which is why the
+gain is non-monotone in depth and why ranks differ under ZeRO-3 and not under
+DP (DP has no deferred frees).
+
+This is stated as a mechanism *hypothesis*, consistent with every number above
+but not yet observed directly.
+
+### Pre-registered prediction
+
+If the cause is allocation-at-dispatch, a host-side `synchronize()` on the
+budget predecessor's event before `alloc_full_params` (an experiment knob, not
+a fix — it stalls dispatch) brings the `prefetch_distance=1` slope to ≈2.0. If
+the slope stays ≈4, the cause is elsewhere and the hypothesis is withdrawn. A
+per-node memory trace (allocated bytes after each dispatched node) should show
+the full-parameter buffers accumulating during the first layer's dispatch.
+
+### Consequence for the design
+
+An issue budget on the DAG bounds when a collective *executes*; bounding what
+it *holds* needs the runtime to allocate in step with the budget — a bounded
+pool of `distance+1` full-parameter buffers reused round-robin, with reuse
+ordered by the free event on the stream rather than by a host wait. That is the
+actual shape of the ZeRO-3 fix, and it was invisible from the DAG. The ring's
+`distance` has the same exposure in principle: recv buffers are allocated at
+dispatch too. With two ranks there is one rotation and nothing to accumulate;
+the four-card run is where it would show.
