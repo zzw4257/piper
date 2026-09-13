@@ -379,16 +379,21 @@ class ParamStorage:
         specs = bucket.param_view_specs
         assert specs, f"alloc_full_params: missing param_view_specs for ubid={ubid}"
         storage = full.untyped_storage()
-        required_bytes = full.numel() * full.element_size()
+        required_numel = sum(numel for _, _, numel, _ in specs)
+        required_bytes = required_numel * full.element_size()
         pool = self._pool
         if pool is not None:
+            # set_ bounds-checks, so a released tensor cannot keep its shape over
+            # an empty storage the way resize_(0) leaves it; rebuild the tensor
+            # object instead (free_full_grads already replaces its object).
             key = ("param", required_bytes, full.dtype)
             pooled = pool.take(key, stream)
             if pooled is not None:
-                full.set_(pooled, 0, full.shape)
+                full = torch.empty(0, dtype=full.dtype, device=full.device).set_(pooled, 0, (required_numel,))
             else:
-                storage.resize_(required_bytes)
+                full = torch.empty(required_numel, dtype=full.dtype, device=full.device)
                 pool.note_fresh(key)
+            bucket.flat_params = full
             storage = full.untyped_storage()
         else:
             storage.resize_(required_bytes)
@@ -433,9 +438,12 @@ class ParamStorage:
         pool = self._pool
         if pool is not None and storage.size() > 0:
             pool.give(("param", storage.size(), full.dtype), storage, evt)
-            # Detach the bucket's tensor from the pooled storage; the next alloc
-            # rebinds it (and every parameter view) to whichever storage it takes.
-            full.set_(torch.empty(0, dtype=full.dtype, device=full.device).untyped_storage(), 0, (0,))
+            # Detach: replace the bucket's tensor and blank every parameter view,
+            # so a stale use fails the way it does after resize_(0) upstream
+            # instead of silently reading a buffer the pool has handed on.
+            bucket.flat_params = torch.empty(0, dtype=full.dtype, device=full.device)
+            for param, *_ in bucket.param_view_specs:
+                param.data = torch.empty(0, dtype=param.dtype, device=param.device)
         else:
             storage.resize_(0)
         bucket.full_params_fresh = False

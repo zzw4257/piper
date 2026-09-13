@@ -41,6 +41,6 @@ PY
 }
 for N in 2 4 8; do run pf1_pool $N 1 PIPER_BUFFER_POOL=1; done
 for N in 2 4 8; do run shipped_pool $N "" PIPER_BUFFER_POOL=1; done
-# same-window A/B at 8 stages, interleaved, for a timing hint (cards are shared; hint only)
-for i in 1 2; do run pf1_pool_ab 8 1 PIPER_BUFFER_POOL=1; run pf1_hostsync_ab 8 1 PIPER_AG_HOST_SYNC=1; run pf1_plain_ab 8 1 PIPER_NOOP=1; done
+# same-window A/B at 8 stages, interleaved (cards are shared; timing is a hint only)
+for i in 1 2; do run pf1_pool_ab 8 1 PIPER_BUFFER_POOL=1; run pf1_hostsync_ab 8 1 PIPER_AG_HOST_SYNC=1; done
 echo "done $(date -Is)" >> $OUT
