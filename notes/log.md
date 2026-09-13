@@ -3507,3 +3507,67 @@ That is the same failure mode this project has been documenting in Piper —
 something with no observer stops being true — occurring in this project's own
 test suite. The lesson recorded: a gpu-marked test that nothing in the default
 path runs needs a scheduled run, or it is documentation.
+
+## 2026-09-14 — F59: an iteration is 38% host dispatch, 44% blocked in the device sync, 10% idle waiting for the driver — so neither the sync nor Ray is the single binding constraint
+
+### Method
+
+No new run. Every `PIPER_TIME_TRACE` file records absolute `perf_counter`
+values, so step *n*'s `__end__` and step *n+1*'s first node give the gap in
+which the actor is doing nothing, and F56's `__upd_final_sync__` gives the part
+of the in-actor span where the host is blocked rather than dispatching. Median
+over four ranks and fourteen steps (the max column is the warm-up compile and is
+why the median is the statistic).
+
+### Result, on the instrumented four-rank run
+
+| | ms | share |
+|---|---|---|
+| host actually dispatching | **8.58** | 38% |
+| host blocked in the update node's `torch.cuda.synchronize()` | **9.98** | 44% |
+| actor idle between `run_dag` calls — Ray round trip and driver | **2.35** | 10% |
+| iteration | **22.55** | |
+
+The idle gap is 1.43–4.32 ms across all ranks and steps; it never goes away.
+
+### This corrects two earlier entries
+
+**F52 said the Ray round trip "is not measurable against" the dispatch loop.**
+It is 1.4–2.4 ms per iteration, about a tenth of the step. F52 computed it as
+`driver_iteration - (dispatch + drain)` using the *minimum* driver iteration
+against a *per-step* dispatch, so the subtraction went negative and was read as
+zero. Measuring the gap between consecutive traces, rather than subtracting two
+statistics taken differently, gives the number directly.
+
+**F56 called the device sync "the consequence worth acting on" for
+cross-iteration overlap.** Reading `piper_exec_dag` settles it: the driver does
+`run_refs = [actor.run_dag.remote(...) for ...]` then `ray.get(run_refs)`, one
+synchronous round trip per step. So even with the sync gone the actor would
+return and sit idle until the driver issued the next step. The sync forbids
+overlap, but it is not the binding constraint by itself — **both** it and the
+driver's synchronous step loop have to change before the host can dispatch
+iteration *n+1* while the GPU finishes *n*.
+
+That is why the change F56 pointed at was not attempted: on inspection it would
+have bought nothing on its own, and the measurement above is the reason rather
+than the excuse.
+
+### The ceiling, stated properly
+
+With both removed, an iteration is bounded by `max(host dispatch, GPU work)`.
+Host dispatch is 8.58 ms against today's 22.55 — a **2.6x ceiling on a loaded
+machine**. On a quiet one the sync term collapses (it is mostly cross-rank
+waiting, F56) and the ceiling falls to roughly the 1.4–2.4 ms of idle, about
+1.15x. So the value of pipelining is a function of how contended the machine
+is, which is the same dependence F47 found for memory and F51 for the runtime
+constant, and it means a benchmark of this change would report whatever the
+machine was doing that day.
+
+### What would actually be worth building
+
+Not the sync removal alone. The pair: return the loss as a device tensor and
+convert it at the top of the next step, and have the driver keep two steps in
+flight. That is a change to `piper_exec_dag` and `_update` together, it changes
+the observable contract (losses lag by one step), and its benefit is between
+1.15x and 2.6x depending on the machine. Recorded as specified rather than
+built; the three numbers above are what a decision would need.
