@@ -775,6 +775,12 @@ def _insert_reduce_comm_nodes(
             continue
         if not any(_match_filter(node.tag, flt) for flt in filters):
             continue
+        # A region with no trainable parameters has nothing to reduce. The
+        # all-gather pass already checks this; without the same check here every
+        # parameter-free region (log F38: CP's attention-only ring steps) got a
+        # REDUCE_COMM whose executor arm returns 0 -- a dead node per microbatch.
+        if not _node_has_trainable_params(dag, node):
+            continue
         if node.device is None:
             raise ValueError(
                 f"replicate requires placed backward weight-gradient nodes, but node {node.uid} has device=None; "
