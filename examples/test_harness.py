@@ -9,6 +9,7 @@ Piper placement group, and runs the model through ``PiperProgramCoordinator``.
 from __future__ import annotations
 
 import argparse
+import os
 import csv
 import importlib.util
 import json
@@ -232,12 +233,16 @@ def _run_test_module(
         test_ns.num_stages = test_module._derive_num_stages(test_ns.schedule_directives_file)
 
     namespace = args.ray_namespace or module_name.rsplit(".", 1)[-1].replace("test_", "")
+    # Ray workers do not reliably inherit the driver's environment; forward the
+    # PIPER_* knobs (A/B switches, experiment tracing) explicitly.
+    piper_env = {k: v for k, v in os.environ.items() if k.startswith("PIPER_")}
     ray.init(
         address=f"{args.address}:{args.port}" if args.address else None,
         namespace=namespace,
         log_to_driver=True,
         include_dashboard=False,
         _temp_dir=args.temp_dir,
+        runtime_env={"env_vars": piper_env} if piper_env else None,
     )
     try:
         pp_outer = getattr(test_ns, "pp_outer", False)
