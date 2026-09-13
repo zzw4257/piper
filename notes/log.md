@@ -3134,3 +3134,84 @@ and for the same reason. Every host measurement from here on is interleaved and
 reports its spread, and no difference is claimed that does not exceed it. The
 first two attempts at this table each produced a plausible, publishable-looking
 decomposition that was an artifact.
+
+## 2026-09-14 — F55: the executor's wrapper is thin; the cost is the segmented arithmetic plus twelve nodes the reference does not have — and a comm node costs ~9x its own transport in host time
+
+### Tested
+
+`PIPER_TIME_TRACE` now also times the `compute.forward` / `compute.backward`
+call inside each compute node, so a node splits into the call and the executor
+around it. CP=4, four B200s, ring model, s_local=256, 12 iterations, steady
+state only (last six).
+
+### Result
+
+| task | n | total us | inside compute.* | executor | inside % |
+|---|---|---|---|---|---|
+| backward | 6 | 762 | 656 | **106** | **86%** |
+| forward | 6 | 543 | 477 | **66** | **88%** |
+| update | 1 | 1974 | — | 1974 | — |
+| backward ring exchange | 3 | 402 | — | 402 | — |
+| forward ring exchange | 3 | 399 | — | 399 | — |
+| all-reduce | 2 | 193 | — | 193 | — |
+
+Per iteration: **12.59 ms total, 6.80 ms inside `compute.*` (54%), 5.79 ms
+executor (46%)**.
+
+### Three things this settles
+
+**The executor's per-node wrapper is not the problem.** Around a compute node
+it is 66–106 us — event creation, buffer-store traffic, the `match` dispatch,
+predecessor lookups, boundary `requires_grad_` handling, all of it — against a
+543–762 us node. F54 left "~2x unattributed" and suggested per-node machinery;
+that guess is now excluded for compute nodes.
+
+**The 3.8x comparison was against a reference missing a third of the work.**
+F52 compared Piper's compute-node time to the same arithmetic written straight.
+But Piper's DAG for this model has *twelve* non-compute nodes — six ring
+exchanges, two all-reduces, an update, and the rest — costing 5.79 ms, and the
+straight reference has no counterpart to any of them. The honest split is:
+
+* segmented arithmetic: 6.80 ms against 2.05 ms straight (F54) — **3.3x**, and
+  F54 priced 1.5–2.0x of that as the boundary cost;
+* everything the reference does not do at all: **5.79 ms**, of which the
+  optimizer step is 1.97 ms and is real work by any measure.
+
+"Piper costs 4.6x" was therefore comparing unlike things. The defensible
+statement is the first bullet.
+
+**A communication node costs about nine times its own transport, in host time.**
+Each ring exchange moves 1 MiB per tensor; by F48's affine fit that is
+$41.7 + 2.49 \approx 44$ us on the wire. The node costs **399–402 us of host
+time**. The all-reduce node, which touches one tensor instead of two, costs
+193 us — so this is ordinary per-tensor, per-op Python cost (a
+`detach().clone()`, an `empty_like`, `P2POp` objects, `batch_isend_irecv`,
+`wait`, an event, buffer dict copies), scaling with the tensors touched, not one
+pathological call. Roughly **100–200 us of host time per tensor a collective
+touches.**
+
+### The law, as it applies inside Piper
+
+F48/F49 measured `cost = transport(bytes) + skew` in a tight loop with no
+dispatch. Inside Piper a third term sits in front of it:
+
+    cost of a collective in a Piper step
+        ~ host_dispatch(~100-200 us per tensor) + transport(bytes) + skew
+
+and at TP and CP payloads the host term is comparable to or larger than the
+transport term (400 us against 44 us here). That is the third and best account
+of `fuse_collectives`: F34 explained its 2.35x by bytes, F49 corrected that to
+`(n-1)` saved skew payments, and this adds `(n-1)` saved host dispatches of
+100–200 us per tensor. Fusing 32 collectives into 4 saves 28 of each.
+
+It also explains why fusion helped on single-stage TP and was indistinguishable
+under 1F1B (F34): under 1F1B the host has other nodes to dispatch in the gap, so
+the saved host time is absorbed; on a single stage it is on the critical path.
+
+### What is not resolved
+
+Why the segmented arithmetic costs 3.3x when F54 priced the boundary at
+1.5–2.0x. The gap is inside `fwd_fn(fwd_args)` and the per-segment
+`torch.autograd.grad`, and F54's mock had four segments where Piper has six of
+each. Matching the segment count in the mock is the cheap next step; if the
+factors then agree, the accounting is closed.
