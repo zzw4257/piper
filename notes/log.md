@@ -2283,7 +2283,9 @@ Off. The pool changes when memory is reclaimed, and the shipped examples lower
 and run exactly as before with it off. Turning it on is the recommendation; the
 measurement above is the argument.
 
-### Pending
+### Timing hint, and what is still pending
 
-An interleaved same-window A/B of pool against host-sync at 8 stages, for a
-timing hint only (cards are shared). The 4-card overlap and P3 runs.
+Interleaved in one window at 8 stages, min iteration time: pool 0.0965 /
+0.0949 s, host-sync 0.109 / 0.176 s. Cards were shared, so this is a hint: the
+pool is not slower than blocking the host, and blocking the host is what it
+costs. The 4-card overlap and P3 runs remain queued.
