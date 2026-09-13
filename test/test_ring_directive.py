@@ -142,3 +142,81 @@ def test_replicate_skips_parameter_free_regions() -> None:
     assert reduced_from, "projection regions must still be reduced"
     assert all(has_params for _, has_params in reduced_from), reduced_from
     assert not any("CP" in dag.nodes[u].tag for u, _ in reduced_from)
+
+
+def _ring_h(tensors, distance=1):
+    d = _ring(tensors)
+    d.update({"hoist": True, "distance": distance})
+    return d
+
+
+def _fwd_rings(dag):
+    rings = {u: n for u, n in dag.nodes.items() if n.node_kind == "RING_COMM"}
+    fwd = sorted((u for u, n in rings.items() if n.tag["PASS"] == "F"),
+                 key=lambda u: rings[u].tag["CP"])
+    return rings, fwd
+
+
+def test_hoisted_forward_ring_depends_on_its_supplier_not_its_source() -> None:
+    dag = _lower([_PLACE, _SPLIT, _ring_h(["k", "v"])], steps=4)
+    rings, fwd = _fwd_rings(dag)
+    assert len(fwd) == 3
+    for j, u in enumerate(fwd):
+        n = rings[u]
+        assert n.node_meta["hoisted"] and n.node_meta["hoist_distance"] == 1
+        preds = {e.src_uid: e.dep_kind for e in dag.edges if e.dst_uid == u}
+        data = [p for p, k in preds.items() if k == "data"]
+        assert len(data) == 1, data
+        supplier = dag.nodes[data[0]]
+        if j == 0:
+            assert supplier.node_kind == "COMPUTE" and "CP" not in supplier.tag  # the prologue
+        else:
+            assert data[0] == fwd[j - 1]
+        assert n.node_meta["source_uid"] not in data  # the whole point
+        temporal = [p for p, k in preds.items() if k == "temporal"]
+        if j == 0:
+            assert temporal == []
+        else:
+            assert [dag.nodes[t].tag.get("CP") for t in temporal] == [j - 1]  # budget
+        succs = {e.dst_uid for e in dag.edges if e.src_uid == u and e.dep_kind == "data"}
+        assert {dag.nodes[s].tag.get("CP") for s in succs} >= {j + 1}
+
+    # Produced slots still flow CP_i -> CP_{i+1} directly.
+    cps = sorted((u for u, n in dag.nodes.items()
+                  if n.node_kind == "COMPUTE" and n.compute_subkind == "FWD" and "CP" in n.tag),
+                 key=lambda u: dag.nodes[u].tag["CP"])
+    for a, b in zip(cps, cps[1:]):
+        assert any(e.src_uid == a and e.dst_uid == b and e.dep_kind == "data" for e in dag.edges)
+
+    # Backward untouched: produced payload, spliced.
+    for u, n in rings.items():
+        if n.tag["PASS"] == "B":
+            assert not n.node_meta.get("hoisted")
+            assert {e.src_uid for e in dag.edges if e.dst_uid == u and e.dep_kind == "data"} \
+                == {n.node_meta["source_uid"]}
+
+
+def test_hoisted_ring_is_dispatched_before_its_source_region() -> None:
+    """Siblings after the supplier; the comm has critical-path priority."""
+    dag = _lower([_PLACE, _SPLIT, _ring_h(["k", "v"])], steps=4)
+    rings, fwd = _fwd_rings(dag)
+    pos = {u: i for i, u in enumerate(_serial_topological_order(dag))}
+    for u in fwd:
+        assert pos[u] < pos[rings[u].node_meta["source_uid"]], u
+
+
+def test_distance_zero_drops_the_budget_edge() -> None:
+    dag = _lower([_PLACE, _SPLIT, _ring_h(["k", "v"], distance=0)], steps=4)
+    _, fwd = _fwd_rings(dag)
+    for u in fwd:
+        assert not [e for e in dag.edges if e.dst_uid == u and e.dep_kind == "temporal"]
+
+
+def test_spliced_baseline_is_unchanged_by_the_hoist_code() -> None:
+    dag = _lower([_PLACE, _SPLIT, _ring(["k", "v"])], steps=3)
+    rings, fwd = _fwd_rings(dag)
+    for u in fwd:
+        n = rings[u]
+        assert not n.node_meta.get("hoisted")
+        assert {e.src_uid for e in dag.edges if e.dst_uid == u and e.dep_kind == "data"} \
+            == {n.node_meta["source_uid"]}
