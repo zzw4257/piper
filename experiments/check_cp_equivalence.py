@@ -54,20 +54,28 @@ def main() -> int:
     ap.add_argument("--repo", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ap.add_argument("--skip-negative-control", action="store_true")
     ap.add_argument("--extra", nargs="*", default=[], help="passed to both runs")
-    ap.add_argument("--cp2-schedule", default="cp2_ring_dp",
+    ap.add_argument("--cp", type=int, default=2, help="CP degree / ring steps / ranks")
+    ap.add_argument("--negative-schedule", default=None,
+                    help="default: cp{N}_no_ring_dp")
+    ap.add_argument("--cp2-schedule", default=None,
                     help="cp2_ring (no replicate) is valid only for a single "
                          "iteration: projection grads then diverge across ranks.")
     args = ap.parse_args()
 
-    cp2 = _run(args.cp2_schedule, ["--steps", "2", *args.extra], args.repo)
+    n = args.cp
+    sched = args.cp2_schedule or f"cp{n}_ring_dp"
+    cp2 = _run(sched, ["--steps", str(n), *args.extra], args.repo)
     cp1 = _run("cp1", ["--steps", "1", *args.extra], args.repo)
     mean2, ranks2 = _mean_over_ranks(cp2["metrics"])
     l1 = cp1["metrics"][0]["losses"]
     print(f"CP=1 dense ({cp1['dir']}):        {[round(x, 6) for x in l1]}")
     for r, l in enumerate(ranks2):
-        print(f"CP=2 rank{r}  ({cp2['dir']}):        {[round(x, 6) for x in l]}")
-    print(f"CP=2 mean over ranks:               {[round(x, 6) for x in mean2]}")
-    assert len(ranks2) == 2, f"expected two CP ranks, got {len(ranks2)}"
+        print(f"CP={n} rank{r} [{sched}] ({cp2['dir']}): {[round(x, 6) for x in l]}")
+    print(f"CP={n} mean over ranks:             {[round(x, 6) for x in mean2]}")
+    for m in cp2["metrics"]:
+        print(f"  rank{m['dp_rank']} peak_memory_by_rank={m['peak_memory_by_rank']} "
+              f"iter_times_s={[round(t, 4) for t in m['iter_times_s']]}")
+    assert len(ranks2) == n, f"expected {n} CP ranks, got {len(ranks2)}"
     assert len(l1) == len(mean2), "iteration counts differ"
     worst = 0.0
     for i, (a, b) in enumerate(zip(mean2, l1)):
@@ -77,10 +85,11 @@ def main() -> int:
             f"blames the forward ring; a later iteration blames the backward ring "
             f"or the projection-weight replicate."
         )
-    print(f"CP=2 ring == CP=1 dense across {len(l1)} iterations, worst |diff| {worst:.3e}")
+    print(f"CP={n} ring == CP=1 dense across {len(l1)} iterations, worst |diff| {worst:.3e}")
 
     if not args.skip_negative_control:
-        bad = _run("cp2_no_ring_dp", ["--steps", "2", *args.extra], args.repo)
+        bad = _run(args.negative_schedule or f"cp{n}_no_ring_dp",
+                   ["--steps", str(n), *args.extra], args.repo)
         mean_bad, _ = _mean_over_ranks(bad["metrics"])
         diff = max(abs(a - b) for a, b in zip(mean_bad, l1))
         assert diff > ATOL + RTOL * max(abs(x) for x in l1), (

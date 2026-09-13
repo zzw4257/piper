@@ -1329,6 +1329,8 @@ def _insert_ring_exchange_comm_nodes(
     devices: list[int],
     tensors: list[str] | None,
     comm_stream: str | None = None,
+    hoist: bool = False,
+    distance: int = 1,
 ) -> None:
     """Rotate forwarded tensors one hop around the group between consecutive matched regions.
 
@@ -1345,10 +1347,25 @@ def _insert_ring_exchange_comm_nodes(
     placeholder it also reads, and autograd on that segment sums the gradient from
     both uses.
 
-    This is the edge-spliced baseline of notes/cp-design.md G-1: the comm node waits
-    for the source region to *finish* although its payload was ready when the region
-    *started*. That gap is what G-3 removes; this pass exists so the gap can be
-    measured first.
+    With ``hoist=False`` this is the edge-spliced baseline of notes/cp-design.md
+    G-1: the comm node waits for the source region to *finish* although its payload
+    was ready when the region *started*.
+
+    With ``hoist=True`` the forward ring node instead depends on whoever supplied
+    the forwarded slots to its source region -- the previous ring node, or the
+    region that defined them -- so it runs concurrently with the source region.
+    The source's direct edge to its successor is kept for the produced slots, and
+    the consumer merges the two (executor FWD arm). Only the forward ring moves:
+    the backward payload is a gradient the source's backward *produces*, so it
+    stays spliced.
+
+    ``distance`` bounds how early a hoisted ring may issue: a temporal edge from
+    the region ``distance`` steps back. Without it every rotation completes
+    before the first step finishes and all chunks are resident -- log F37's
+    pattern on the feature meant to hold 1/n of K/V. ``distance=0`` drops the
+    edge on purpose, for measuring exactly that. At ``distance=1`` the edge is
+    also what orders the ring's buffer reuse after the consumer's read; for
+    larger distances the consumer's ``record_stream`` carries that instead.
     """
     expected = sorted(int(d) for d in devices)
     if len(set(expected)) < 2:
@@ -1449,6 +1466,74 @@ def _insert_ring_exchange_comm_nodes(
                     src_uid=uid, dst_uid=comm_uid, dep_kind="data", tensor_name=e.tensor_name))
                 dag.add_edge(TrainingDAGEdge(
                     src_uid=comm_uid, dst_uid=dst_uid, dep_kind="data", tensor_name=e.tensor_name))
+
+    if not hoist:
+        return
+    if not isinstance(distance, int) or distance < 0:
+        raise ValueError(f"ring_exchange: distance must be a non-negative int, got {distance!r}")
+
+    # ---- G-3: lift the forward ring off its source region ------------------
+    # Ring chains keyed by every tag except CP, so microbatch/stage copies stay
+    # separate; within a chain, CP index orders the steps.
+    def _chain_key(tag: dict[str, Any]) -> tuple:
+        return tuple(sorted((k, v) for k, v in tag.items() if k != "CP"))
+
+    chains: dict[tuple, dict[int, str]] = {}
+    for u in matched:
+        n = dag.nodes[u]
+        if n.compute_subkind == "FWD" and "CP" in n.tag:
+            chains.setdefault(_chain_key(n.tag), {})[int(n.tag["CP"])] = u
+
+    fwd_rings = sorted(
+        (u for u, n in dag.nodes.items()
+         if n.node_kind == "RING_COMM" and n.tag.get("PASS") == "F"
+         and n.node_meta.get("source_uid") in matched and not n.node_meta.get("hoisted")),
+        key=lambda u: (_chain_key(dag.nodes[u].tag), int(dag.nodes[u].tag.get("CP", -1))),
+    )
+    for r_uid in fwd_rings:
+        r = dag.nodes[r_uid]
+        src_uid = r.node_meta["source_uid"]
+        src = dag.nodes[src_uid]
+        in_edges = [e for e in list(dag.edges) if e.dst_uid == r_uid and e.dep_kind == "data"]
+        out_edges = [e for e in list(dag.edges) if e.src_uid == r_uid and e.dep_kind == "data"]
+
+        # Whoever handed the forwarded slots to the source region: an earlier
+        # ring node if there is one (already rewired, since we go in CP order),
+        # otherwise the forward region that defined them.
+        supplier = None
+        for e in dag.edges:
+            if e.dst_uid != src_uid or e.dep_kind != "data":
+                continue
+            p = dag.nodes[e.src_uid]
+            if p.node_kind == "RING_COMM":
+                supplier = p.uid
+                break
+            if p.node_kind == "COMPUTE" and p.compute_subkind == "FWD" and supplier is None:
+                supplier = p.uid
+        if supplier is None:
+            raise ValueError(
+                f"ring_exchange(hoist): region {src_uid} has no upstream supplier of "
+                f"{wanted}; the first ring step must receive its chunk from a region"
+            )
+        for e in in_edges:
+            _remove_edge(dag, e)
+            dag.add_edge(TrainingDAGEdge(
+                src_uid=supplier, dst_uid=r_uid, dep_kind="data", tensor_name=e.tensor_name))
+        # The splice removed source -> destination; the produced slots
+        # (accumulators) still travel that way, so put it back.
+        for oe in out_edges:
+            if not any(x.src_uid == src_uid and x.dst_uid == oe.dst_uid and x.dep_kind == "data"
+                       for x in dag.edges):
+                dag.add_edge(TrainingDAGEdge(
+                    src_uid=src_uid, dst_uid=oe.dst_uid, dep_kind="data", tensor_name=oe.tensor_name))
+        # Issue budget.
+        if distance > 0 and "CP" in src.tag:
+            back = chains.get(_chain_key(src.tag), {}).get(int(src.tag["CP"]) - distance)
+            if back is not None:
+                dag.add_edge(TrainingDAGEdge(
+                    src_uid=back, dst_uid=r_uid, dep_kind="temporal", tensor_name=None))
+        r.node_meta["hoisted"] = True
+        r.node_meta["hoist_distance"] = distance
 
 
 def _fuse_tp_collectives(
@@ -2051,6 +2136,7 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
         elif op == "ring_exchange":
             _insert_ring_exchange_comm_nodes(
                 training_dag, filters, devices, tensors=raw.get("tensors"), comm_stream=stream,
+                hoist=bool(raw.get("hoist", False)), distance=int(raw.get("distance", 1)),
             )
         elif op == "shard_tensor":
             _insert_tp_all_reduce_comm_nodes(training_dag, filters, devices, comm_stream=stream)
