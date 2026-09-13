@@ -2289,3 +2289,80 @@ Interleaved in one window at 8 stages, min iteration time: pool 0.0965 /
 0.0949 s, host-sync 0.109 / 0.176 s. Cards were shared, so this is a hint: the
 pool is not slower than blocking the host, and blocking the host is what it
 costs. The 4-card overlap and P3 runs remain queued.
+
+## 2026-09-14 — F45: the per-collective skew tax is a property of global synchronization, not of NCCL — and a ring confines it to one hop until the message outgrows the eager path
+
+### Tested
+
+`experiments/probe_skew_topology.py` on four H200s (ZJU host, cards 1/2/3/5 all
+idle; this is the four-quiet-card window catalyst-fleet1 never produced in ~20
+hours of waiting). Four ranks; rank 2 is delayed by a busy-wait kernel of
+0/100/500/2000 us before each collective; every rank times its own call. Two
+arms with identical payload: `all_reduce` (global) and a one-hop ring
+(`batch_isend_irecv`, send to `r+1`, recv from `r-1`). 40 iterations, medians,
+payloads 4/16/64 MiB.
+
+Roles relative to the delayed rank 2: rank 1 is **upstream** (sends *into* it),
+rank 3 is **downstream** (receives *from* it), rank 0 is **opposite**.
+
+### Result — median cost of a 2000 us skew, over the unskewed baseline
+
+| payload | collective | delayed | upstream | downstream | opposite |
+|---|---|---|---|---|---|
+| 4 MiB | all-reduce | −35 us | **+1869** | **+1876** | **+1873** |
+| 4 MiB | ring | −61 | +4 | **+1852** | −4 |
+| 16 MiB | all-reduce | −33 | **+1881** | **+1630** | **+1880** |
+| 16 MiB | ring | −72 | +4 | **+1638** | +2 |
+| 64 MiB | all-reduce | −25 | **+1880** | **+1880** | **+1872** |
+| 64 MiB | ring | −67 | **+1669** | **+1849** | −7 |
+
+Under an all-reduce, *every* rank that was not delayed pays the full delay, at
+every payload. Under a ring at 4 and 16 MiB, exactly **one** rank pays — the one
+receiving from the delayed rank — and the rank on the opposite side of the ring
+pays nothing measurable (−4 to +2 us). The delayed rank itself always pays
+negative: it arrives last and waits for no one.
+
+### The 64 MiB exception, and why it is the useful part
+
+At 64 MiB the **upstream** rank starts paying too (+1669 us), which it does not
+at 4 or 16 MiB. A send into a rank that has not reached its receive can complete
+into an eager buffer while the message is small; past the eager threshold it
+needs the receiver, so the delay propagates one hop *backwards* as well. So the
+locality is not a property of P2P as such — it is a property of P2P **below the
+eager threshold**. That is a schedulable fact: it says the chunk size at which a
+ring stops localizing skew is a tunable of the transport, not of the algorithm.
+
+### What this settles
+
+Stage E/F left this open. F19 established that each collective in a Piper step
+re-pays a rank arrival difference of 157–2831 us, and F33 attributed the cost to
+computation *between* collectives desynchronizing the ranks rather than to NCCL
+per call. F45 completes it: the tax is levied by **global synchronization**.
+Replacing the collective with a neighbour-coupled one does not make the delay
+disappear — the downstream rank still pays it — but it stops charging it to
+every rank. With three non-delayed ranks, an all-reduce burns 3x the delay in
+aggregate wait and a small-payload ring burns 1x.
+
+For CP this is the favourable half of the ring's structure, and it is
+independent of whether the hoist wins: ring attention's exchange is exactly this
+one-hop pattern, so a straggler costs one neighbour per step rather than the
+whole group. It also bounds the claim: at chunk sizes past the eager threshold
+(64 MiB here) the advantage halves, and a long-sequence CP run is squarely in
+that regime.
+
+### Measurement notes
+
+The delayed rank's own numbers being *lower* than its unskewed baseline is the
+signature that the injection worked: it is the one rank that never waits.
+Contamination on this shared host shows in a few med/min ratios (6.46 for
+all-reduce rank 3 at 500 us; 3.35 for ring rank 3 at 2000 us) — those are the
+F36 signature and the reason the table reports medians of 40 iterations rather
+than single samples. The deltas are 1–2 orders of magnitude above that noise.
+
+### Environment
+
+Second host, so this is also a portability check: the out-of-band CP gate
+(F40) reproduced **bit-identically** on H200 + CUDA 12.8 (`out
+4.172325134277344e-07`, `dQ 1.1920928955078125e-06`, `dK 2.86102294921875e-06`,
+`dV 1.9073486328125e-06`), and all 78 CPU tests pass. The tree there is a clone
+of `feat/tp-sharding`; commits are still made only on catalyst-fleet1.
