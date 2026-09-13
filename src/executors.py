@@ -673,6 +673,12 @@ class DagExecutor:
         mem_trace: list[tuple] = []
         ag_host_sync = os.environ.get("PIPER_AG_HOST_SYNC") == "1"
 
+        inner: dict[str, float] = {}
+
+        def _inner(uid, t0):
+            if trace_dir:
+                inner[uid] = (time.perf_counter() - t0) * 1e6
+
         for node in sorted_dag_nodes:
             if trace_dir:
                 mem_trace.append((node.uid, node.task_type.value,
@@ -1034,7 +1040,9 @@ class DagExecutor:
 
                     self._wait_for_all_gather(node)
 
+                    _t0 = time.perf_counter()
                     fwd_out = self.compute.forward(ubid, input_tensors, node_stream)
+                    _inner(node.uid, _t0)
                     self.buffers.task[node.uid] = fwd_out
                     fwd_key = (node.node_meta.get("bucket_key"), node.uid)
                     self.buffers.task[("shape_ref",) + fwd_key] = [
@@ -1129,12 +1137,14 @@ class DagExecutor:
                     if self._node_meta(node).get("zero_alloc_full_grads_before"):
                         self.params.alloc_full_grads(ubid, node_stream)
 
+                    _t0 = time.perf_counter()
                     bwd_out = self.compute.backward(
                         ubid, mb_idx, outputs_or_loss, upstream_grads,
                         pre_detach_outs, detached_outs, inp_with_grad,
                         fwd_out.get("out_with_grad"),
                         node_stream,
                     )
+                    _inner(node.uid, _t0)
                     buf = bwd_out if bwd_out is not None else {}
                     fwd_inputs_full = fwd_out.get("fwd_inputs")
                     buf["inp_grads"] = (
@@ -1294,11 +1304,11 @@ class DagExecutor:
             # the GPU rather than dispatching to it.
             last_enqueue = time.perf_counter()
             with open(path, "w") as f:
-                f.write("uid\ttask\tallocated\tmax_allocated\thost_s\n")
+                f.write("uid\ttask\tallocated\tmax_allocated\thost_s\tinner_us\n")
                 for uid, task, alloc, mx, ts in mem_trace:
-                    f.write(f"{uid}\t{task}\t{alloc}\t{mx}\t{ts:.6f}\n")
-                f.write(f"__last_enqueue__\tmarker\t0\t0\t{last_enqueue:.6f}\n")
-                f.write(f"__end__\tmarker\t0\t0\t{time.perf_counter():.6f}\n")
+                    f.write(f"{uid}\t{task}\t{alloc}\t{mx}\t{ts:.6f}\t{inner.get(uid, -1):.1f}\n")
+                f.write(f"__last_enqueue__\tmarker\t0\t0\t{last_enqueue:.6f}\t-1\n")
+                f.write(f"__end__\tmarker\t0\t0\t{time.perf_counter():.6f}\t-1\n")
         return {
             "losses": [
                 loss for result in update_results for loss in result["losses"]
