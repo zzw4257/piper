@@ -3215,3 +3215,35 @@ Why the segmented arithmetic costs 3.3x when F54 priced the boundary at
 `torch.autograd.grad`, and F54's mock had four segments where Piper has six of
 each. Matching the segment count in the mock is the cheap next step; if the
 factors then agree, the accounting is closed.
+
+### Addendum, same day: F55's open item, partly closed
+
+F55 asked why the segmented arithmetic costs 3.3x when F54 priced the boundary
+at 1.5–2.0x, and named the likely cause: F54's mock cut four boundaries where
+Piper's DAG has six compute nodes per pass. Making the segment count an axis:
+
+| machine | segments | A straight | B detached | C +gm | D +marshalling |
+|---|---|---|---|---|---|
+| B200 | 4 | 2.09 ms | 4.06 (**1.94x**) | 3.99 (1.91x) | 3.51 (1.68x) |
+| B200 | 6 | 1.90 | 4.86 (**2.56x**) | 4.21 (2.22x) | 4.53 (2.38x) |
+| H200 | 4 | 3.00 | 4.01 (**1.34x**) | 4.09 (1.36x) | 4.07 (1.36x) |
+| H200 | 6 | 2.90 | 4.04 (**1.40x**) | 4.08 (1.41x) | 4.05 (1.40x) |
+
+On B200 the factor rises with the boundary count as it should — 1.9x at four,
+2.2–2.6x at six — and at Piper's count it reaches two-thirds to three-quarters
+of Piper's 3.3x. That much of the gap is now attributed.
+
+On H200 it does not: 1.34x at four boundaries and 1.40x at six, an increment
+inside the spread. The absolute boundary cost is ~1.15 ms there against ~2.5 ms
+on B200, which is the wrong direction for a Python-side cost on a slower host
+(H200's straight variant is 2.90 ms against B200's 1.90). H200's straight arm is
+also unusually stable (min-to-median 0.09–0.17 ms against the segmented arms'
+0.23–1.65), which suggests it is sitting on a floor set by something other than
+the work — most likely launch queue behaviour — that the segmented arms then do
+not add to proportionally. Not explained; recorded.
+
+So: **the boundary cost is resolvable against the straight arithmetic on both
+machines and accounts for most of Piper's segmented-arithmetic gap on B200, it
+does not scale with boundary count on H200, and the B/C/D distinctions stay
+below the noise floor everywhere.** The `--segments` axis is in the probe for
+whoever picks this up.

@@ -71,14 +71,19 @@ def main(argv=None) -> int:
     ap.add_argument("--head-dim", type=int, default=64)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--s-local", type=int, default=256)
+    ap.add_argument("--segments", type=int, default=0,
+                    help="Boundaries to cut (default: --steps). Piper's DAG for "
+                         "this model has 6 compute nodes per pass, not 4.")
     a = ap.parse_args(argv)
     dev = torch.device("cuda", 0)
     B, H, S, D, N = a.batch_size, a.heads, a.s_local, a.head_dim, a.steps
+    NSEG = a.segments or N
     scale = 1.0 / math.sqrt(D)
     step = _step_fn(scale)
     mk = lambda: torch.randn(B, H, S, D, device=dev)
     q0, k0, v0 = mk(), mk(), mk()
-    print(f"{torch.cuda.get_device_name(0)}  steps={N} b={B} h={H} s_local={S} d={D}")
+    print(f"{torch.cuda.get_device_name(0)}  steps={N} segments={NSEG} "
+          f"b={B} h={H} s_local={S} d={D}")
 
     def straight():
         q = q0.clone().requires_grad_(True)
@@ -96,13 +101,21 @@ def main(argv=None) -> int:
             m = torch.full(q.shape[:-1], float("-inf"), device=dev)
             l = torch.zeros(q.shape[:-1], device=dev)
             saved = []
-            for _ in range(N):
+            # Cut NSEG boundaries over the same N ring steps: with NSEG > N a
+            # step is split across boundaries the way Piper's prologue and
+            # epilogue add nodes without adding arithmetic.
+            per = [N // NSEG + (1 if i < N % NSEG else 0) for i in range(NSEG)] if NSEG <= N \
+                  else [1] * N + [0] * (NSEG - N)
+            for nrep in per:
                 ins = [t.detach().clone().requires_grad_(True) for t in (q, o, m, l)]
                 qi, oi, mi, li = ins
-                if runner is None:
-                    outs = step(qi, k0, v0, oi, mi, li)
-                else:
-                    outs = runner(qi, k0, v0, oi, mi, li)
+                outs = (oi, mi, li)
+                for _ in range(max(nrep, 0)):
+                    o_, m_, l_ = outs
+                    outs = step(qi, k0, v0, o_, m_, l_) if runner is None \
+                           else runner(qi, k0, v0, o_, m_, l_)
+                if nrep == 0:      # a boundary that carries values without math
+                    outs = tuple(t * 1.0 for t in outs)
                 saved.append((ins, outs))
                 q, (o, m, l) = qi, outs
             o, m, l = saved[-1][1]
