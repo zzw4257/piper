@@ -1,0 +1,232 @@
+=== start 2026-09-13T23:47:46+08:00 host=user ===
+== [1] torchrun CP gate  cards=2,3 2026-09-13T23:48:46+08:00
+rc=0
+CP=2 ring == dense: {'out': 4.172325134277344e-07, 'dQ': 1.1920928955078125e-06, 'dK': 2.86102294921875e-06, 'dV': 1.9073486328125e-06}  | controls broke as required
+--- restarted 2026-09-13T23:59:38+08:00 with P3 memory threshold 4G (card 1 is idle with 7G)
+=== start 2026-09-13T23:59:38+08:00 host=user ===
+== [2] P3 skew topology  cards=1,2,3,5 2026-09-14T00:00:39+08:00
+-- payload 4MiB
+rc=0
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+  return func(*args, **kwargs)
+[rank0]:[W914 00:00:44.812813004 ProcessGroupNCCL.cpp:5138] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
+world=4 skewed_rank=2 payload=4.0MiB iters=40
+coll       skew_us rank  median_us   min_us med/min  role
+all_reduce       0    0       75.3     63.3    1.19  opposite
+all_reduce     100    0      128.5    123.0    1.04  opposite
+all_reduce     500    0      512.0    502.9    1.02  opposite
+all_reduce    2000    0     1948.1    886.9    2.20  opposite
+ring             0    0      116.2    102.2    1.14  opposite
+ring           100    0      109.7    101.1    1.09  opposite
+ring           500    0      109.0    102.0    1.07  opposite
+ring          2000    0      112.7    104.4    1.08  opposite
+all_reduce       0    1       75.6     62.8    1.20  neighbour
+all_reduce     100    1      128.1     80.4    1.59  neighbour
+all_reduce     500    1      511.5    503.5    1.02  neighbour
+all_reduce    2000    1     1944.6   1220.3    1.59  neighbour
+ring             0    1      104.0     98.0    1.06  neighbour
+ring           100    1      103.6     98.4    1.05  neighbour
+ring           500    1      103.6    101.0    1.03  neighbour
+ring          2000    1      108.2    100.4    1.08  neighbour
+all_reduce       0    2       76.8     60.8    1.26  SKEWED
+all_reduce     100    2       42.2     41.7    1.01  SKEWED
+all_reduce     500    2       42.3     41.7    1.01  SKEWED
+all_reduce    2000    2       42.1     41.4    1.02  SKEWED
+ring             0    2       96.3     93.9    1.03  SKEWED
+ring           100    2       35.3     34.9    1.01  SKEWED
+ring           500    2       35.4     35.0    1.01  SKEWED
+ring          2000    2       35.3     35.0    1.01  SKEWED
+all_reduce       0    3       70.8     62.9    1.13  neighbour
+all_reduce     100    3      127.4    116.3    1.10  neighbour
+all_reduce     500    3      508.8     78.8    6.46  neighbour
+all_reduce    2000    3     1946.8   1939.7    1.00  neighbour
+ring             0    3      103.4     98.2    1.05  neighbour
+ring           100    3      134.7    124.2    1.08  neighbour
+ring           500    3      518.4    513.1    1.01  neighbour
+ring          2000    3     1955.2    583.8    3.35  neighbour
+-- payload 16MiB
+rc=0
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+  return func(*args, **kwargs)
+[rank0]:[W914 00:00:53.274293949 ProcessGroupNCCL.cpp:5138] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
+world=4 skewed_rank=2 payload=16.0MiB iters=40
+coll       skew_us rank  median_us   min_us med/min  role
+all_reduce       0    0      130.7    117.8    1.11  opposite
+all_reduce     100    0      341.1    184.2    1.85  opposite
+all_reduce     500    0      572.0    551.2    1.04  opposite
+all_reduce    2000    0     2010.3   1988.8    1.01  opposite
+ring             0    0      366.7    168.9    2.17  opposite
+ring           100    0      184.2    174.0    1.06  opposite
+ring           500    0      325.4    169.1    1.92  opposite
+ring          2000    0      368.4    173.3    2.13  opposite
+all_reduce       0    1      127.2    115.8    1.10  neighbour
+all_reduce     100    1      337.2    184.0    1.83  neighbour
+all_reduce     500    1      569.8    559.9    1.02  neighbour
+all_reduce    2000    1     2007.9   1211.9    1.66  neighbour
+ring             0    1      177.2    169.2    1.05  neighbour
+ring           100    1      186.7    169.8    1.10  neighbour
+ring           500    1      174.9    170.5    1.03  neighbour
+ring          2000    1      181.7    169.9    1.07  neighbour
+all_reduce       0    2      129.8    115.6    1.12  SKEWED
+all_reduce     100    2      247.2     94.1    2.63  SKEWED
+all_reduce     500    2       96.3     94.2    1.02  SKEWED
+all_reduce    2000    2       96.6     94.0    1.03  SKEWED
+ring             0    2      184.0    172.5    1.07  SKEWED
+ring           100    2      113.6    108.6    1.05  SKEWED
+ring           500    2      112.2    111.1    1.01  SKEWED
+ring          2000    2      112.2    110.3    1.02  SKEWED
+all_reduce       0    3      119.0     99.0    1.20  neighbour
+all_reduce     100    3      105.4    101.4    1.04  neighbour
+all_reduce     500    3      337.0    105.5    3.19  neighbour
+all_reduce    2000    3     1749.5   1530.1    1.14  neighbour
+ring             0    3      114.8    112.4    1.02  neighbour
+ring           100    3      203.4    112.8    1.80  neighbour
+ring           500    3      362.4    187.8    1.93  neighbour
+ring          2000    3     1752.5   1629.8    1.08  neighbour
+-- payload 64MiB
+rc=0
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+  return func(*args, **kwargs)
+[rank0]:[W914 00:01:02.301492119 ProcessGroupNCCL.cpp:5138] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
+world=4 skewed_rank=2 payload=64.0MiB iters=40
+coll       skew_us rank  median_us   min_us med/min  role
+all_reduce       0    0      343.3    337.3    1.02  opposite
+all_reduce     100    0      390.2    383.2    1.02  opposite
+all_reduce     500    0      772.7    766.7    1.01  opposite
+all_reduce    2000    0     2215.5   2203.1    1.01  opposite
+ring             0    0      485.8    461.4    1.05  opposite
+ring           100    0      472.1    464.7    1.02  opposite
+ring           500    0      474.8    465.1    1.02  opposite
+ring          2000    0      478.9    470.8    1.02  opposite
+all_reduce       0    1      342.7    336.5    1.02  neighbour
+all_reduce     100    1      399.1    392.8    1.02  neighbour
+all_reduce     500    1      780.8    774.8    1.01  neighbour
+all_reduce    2000    1     2222.4   2214.8    1.00  neighbour
+ring             0    1      473.5    464.5    1.02  neighbour
+ring           100    1      485.3    476.3    1.02  neighbour
+ring           500    1      700.2    692.8    1.01  neighbour
+ring          2000    1     2142.9   1591.5    1.35  neighbour
+all_reduce       0    2      346.3    339.1    1.02  SKEWED
+all_reduce     100    2      322.3    317.8    1.01  SKEWED
+all_reduce     500    2      321.6    317.5    1.01  SKEWED
+all_reduce    2000    2      321.2    317.8    1.01  SKEWED
+ring             0    2      482.9    470.4    1.03  SKEWED
+ring           100    2      416.4    408.0    1.02  SKEWED
+ring           500    2      414.4    408.4    1.01  SKEWED
+ring          2000    2      415.5    407.9    1.02  SKEWED
+all_reduce       0    3      344.4    336.6    1.02  neighbour
+all_reduce     100    3      404.2    396.6    1.02  neighbour
+all_reduce     500    3      787.2    782.8    1.01  neighbour
+all_reduce    2000    3     2224.8   2215.0    1.00  neighbour
+ring             0    3      486.3    472.3    1.03  neighbour
+ring           100    3      521.1    480.5    1.08  neighbour
+ring           500    3      900.0    889.8    1.01  neighbour
+ring          2000    3     2335.6   2326.2    1.00  neighbour
+== [3] CP=4 ring  cards=2,3,5,7 2026-09-14T00:02:07+08:00
+-- cp4_ring_dp
+rc=0
+CP=1 dense (out/20260914_000255):        [0.999606, 0.999515, 0.999436, 0.999364, 0.999297]
+CP=4 rank0 [cp4_ring_dp] (out/20260914_000209): [1.00041, 1.000307, 1.000215, 1.000131, 1.000051]
+CP=4 rank1 [cp4_ring_dp] (out/20260914_000209): [1.000797, 1.00071, 1.000633, 1.000563, 1.000498]
+CP=4 rank2 [cp4_ring_dp] (out/20260914_000209): [0.999697, 0.999611, 0.999536, 0.999468, 0.999403]
+CP=4 rank3 [cp4_ring_dp] (out/20260914_000209): [0.997507, 0.997411, 0.997328, 0.997253, 0.997184]
+CP=4 mean over ranks:             [0.999603, 0.99951, 0.999428, 0.999354, 0.999284]
+  rank0 peak_memory_by_rank={'0': 3099330048} iter_times_s=[0.0327, 0.0247, 0.0278, 0.0252, 0.0253]
+  rank1 peak_memory_by_rank={'1': 3099330048} iter_times_s=[0.0294, 0.0254, 0.0253, 0.0273, 0.0255]
+  rank2 peak_memory_by_rank={'2': 3099330048} iter_times_s=[0.025, 0.0252, 0.0249, 0.0273, 0.0261]
+  rank3 peak_memory_by_rank={'3': 3099330048} iter_times_s=[0.0267, 0.0252, 0.025, 0.0268, 0.026]
+CP=4 ring == CP=1 dense across 5 iterations, worst |diff| 1.292e-05
+-- cp4_ring_dp_hoist
+rc=0
+CP=1 dense (out/20260914_000359):        [0.999606, 0.999515, 0.999436, 0.999364, 0.999297]
+CP=4 rank0 [cp4_ring_dp_hoist] (out/20260914_000316): [1.00041, 1.000307, 1.000215, 1.000131, 1.000051]
+CP=4 rank1 [cp4_ring_dp_hoist] (out/20260914_000316): [1.000797, 1.00071, 1.000633, 1.000563, 1.000498]
+CP=4 rank2 [cp4_ring_dp_hoist] (out/20260914_000316): [0.999697, 0.999611, 0.999536, 0.999468, 0.999403]
+CP=4 rank3 [cp4_ring_dp_hoist] (out/20260914_000316): [0.997507, 0.997411, 0.997328, 0.997253, 0.997184]
+CP=4 mean over ranks:             [0.999603, 0.99951, 0.999428, 0.999354, 0.999284]
+  rank0 peak_memory_by_rank={'0': 3099330048} iter_times_s=[0.0342, 0.0252, 0.0252, 0.0258, 0.026]
+  rank1 peak_memory_by_rank={'1': 3099330048} iter_times_s=[0.0241, 0.0257, 0.0252, 0.0261, 0.0254]
+  rank2 peak_memory_by_rank={'2': 3099330048} iter_times_s=[0.0341, 0.0254, 0.0256, 0.0259, 0.0253]
+  rank3 peak_memory_by_rank={'3': 3099330048} iter_times_s=[0.0304, 0.0256, 0.0252, 0.026, 0.0253]
+CP=4 ring == CP=1 dense across 5 iterations, worst |diff| 1.292e-05
+-- cp4_ring_dp_hoist_unbounded
+rc=0
+CP=1 dense (out/20260914_000506):        [0.999606, 0.999515, 0.999436, 0.999364, 0.999297]
+CP=4 rank0 [cp4_ring_dp_hoist_unbounded] (out/20260914_000421): [1.00041, 1.000307, 1.000215, 1.000131, 1.000051]
+CP=4 rank1 [cp4_ring_dp_hoist_unbounded] (out/20260914_000421): [1.000797, 1.00071, 1.000633, 1.000563, 1.000498]
+CP=4 rank2 [cp4_ring_dp_hoist_unbounded] (out/20260914_000421): [0.999697, 0.999611, 0.999536, 0.999468, 0.999403]
+CP=4 rank3 [cp4_ring_dp_hoist_unbounded] (out/20260914_000421): [0.997507, 0.997411, 0.997328, 0.997253, 0.997184]
+CP=4 mean over ranks:             [0.999603, 0.99951, 0.999428, 0.999354, 0.999284]
+  rank0 peak_memory_by_rank={'0': 3099330048} iter_times_s=[0.0338, 0.0256, 0.0255, 0.0257, 0.0246]
+  rank1 peak_memory_by_rank={'1': 3099330048} iter_times_s=[0.0276, 0.0257, 0.025, 0.0255, 0.0248]
+  rank2 peak_memory_by_rank={'2': 3099330048} iter_times_s=[0.0323, 0.0258, 0.0249, 0.026, 0.0247]
+  rank3 peak_memory_by_rank={'3': 3099330048} iter_times_s=[0.0255, 0.0254, 0.0253, 0.0253, 0.025]
+CP=4 ring == CP=1 dense across 5 iterations, worst |diff| 1.292e-05
+== [4] memory slopes  cards=2,3 2026-09-14T00:06:27+08:00
+== dp stages=2 2026-09-14T00:06:27+08:00
+rc=0 run=out/20260914_000629 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 5472522752} min_iter_s=0.0146
+  dp_rank=1 peak_memory_by_rank={'1': 5472522752} min_iter_s=0.0144
+== zero3 stages=2 2026-09-14T00:06:52+08:00
+rc=0 run=out/20260914_000654 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 5878317568} min_iter_s=0.0258
+  dp_rank=1 peak_memory_by_rank={'1': 5274337792} min_iter_s=0.0250
+== pf1 stages=2 2026-09-14T00:07:16+08:00
+rc=0 run=out/20260914_000718 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 4671930880} min_iter_s=0.0190
+  dp_rank=1 peak_memory_by_rank={'1': 5207228928} min_iter_s=0.0186
+== pf1_pool stages=2 2026-09-14T00:07:43+08:00
+rc=0 run=out/20260914_000745 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 4540858880} min_iter_s=0.0194
+  dp_rank=1 peak_memory_by_rank={'1': 4540858880} min_iter_s=0.0194
+== shipped_pool stages=2 2026-09-14T00:08:11+08:00
+rc=0 run=out/20260914_000813 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 5279056384} min_iter_s=0.0199
+  dp_rank=1 peak_memory_by_rank={'1': 5279056384} min_iter_s=0.0191
+== dp stages=4 2026-09-14T00:08:39+08:00
+rc=0 run=out/20260914_000841 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 10841235968} min_iter_s=0.0227
+  dp_rank=1 peak_memory_by_rank={'1': 10841235968} min_iter_s=0.0225
+== zero3 stages=4 2026-09-14T00:09:05+08:00
+rc=0 run=out/20260914_000907 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 9312403968} min_iter_s=0.0363
+  dp_rank=1 peak_memory_by_rank={'1': 9312403968} min_iter_s=0.0362
+== pf1 stages=4 2026-09-14T00:09:30+08:00
+rc=0 run=out/20260914_000932 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 8428454400} min_iter_s=0.0351
+  dp_rank=1 peak_memory_by_rank={'1': 8428454400} min_iter_s=0.0356
+== pf1_pool stages=4 2026-09-14T00:09:56+08:00
+rc=0 run=out/20260914_000958 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 7236747776} min_iter_s=0.0345
+  dp_rank=1 peak_memory_by_rank={'1': 7236747776} min_iter_s=0.0348
+== shipped_pool stages=4 2026-09-14T00:10:25+08:00
+rc=0 run=out/20260914_001026 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 9317122560} min_iter_s=0.0343
+  dp_rank=1 peak_memory_by_rank={'1': 9317122560} min_iter_s=0.0345
+== dp stages=8 2026-09-14T00:10:54+08:00
+rc=0 run=out/20260914_001055 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 21578662400} min_iter_s=0.0404
+  dp_rank=1 peak_memory_by_rank={'1': 21578662400} min_iter_s=0.0398
+== zero3 stages=8 2026-09-14T00:11:19+08:00
+rc=0 run=out/20260914_001121 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 18053857792} min_iter_s=0.0773
+  dp_rank=1 peak_memory_by_rank={'1': 17259037184} min_iter_s=0.0777
+== pf1 stages=8 2026-09-14T00:11:45+08:00
+rc=0 run=out/20260914_001147 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 16548626944} min_iter_s=0.0675
+  dp_rank=1 peak_memory_by_rank={'1': 15409349120} min_iter_s=0.0675
+== pf1_pool stages=8 2026-09-14T00:12:11+08:00
+rc=0 run=out/20260914_001213 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 12628525568} min_iter_s=0.0710
+  dp_rank=1 peak_memory_by_rank={'1': 12628525568} min_iter_s=0.0671
+== shipped_pool stages=8 2026-09-14T00:12:40+08:00
+rc=0 run=out/20260914_001242 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 17393254912} min_iter_s=0.0658
+  dp_rank=1 peak_memory_by_rank={'1': 17393254912} min_iter_s=0.0663
+done 2026-09-14T00:13:09+08:00

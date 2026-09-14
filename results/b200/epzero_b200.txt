@@ -1,0 +1,42 @@
+=== start 2026-09-13T20:43:49-04:00 host=catalyst-fleet1.cs.cmu.edu ===
+cards4=0,1,2,3 cards2=0,1 load: 100,13,100,99,100,100,100
+--- EP: shipped Qwen example, pp2_dp2_ep2, four cards
+  device rc=? run=out/20260913_204436 losses=NO METRICS
+  narrow rc=? run=out/20260913_204526 losses=NO METRICS
+  defer rc=? run=out/20260913_204614 losses=NO METRICS
+--- ZeRO-3: three stages, shard_params, two cards
+  device run= losses=NO METRICS
+    ValueError: param override 'l_self_modules_blocks_modules_0_modules_up_parameters_weight_' has shape (0, 512), expected (2048, 512)
+  narrow run= losses=NO METRICS
+    ValueError: param override 'l_self_modules_blocks_modules_0_modules_up_parameters_weight_' has shape (0, 512), expected (2048, 512)
+  defer run= losses=NO METRICS
+    ValueError: param override 'l_self_modules_blocks_modules_0_modules_up_parameters_weight_' has shape (0, 512), expected (2048, 512)
+done 2026-09-13T20:48:00-04:00
+=== start 2026-09-13T20:53:58-04:00 host=catalyst-fleet1.cs.cmu.edu ===
+cards4=0,1,2,3 cards2=0,1 load: 100,0,100,98,100,100,100
+--- EP: shipped Qwen example, pp2_dp2_ep2, four cards
+  device rc=? run=out/20260913_205445 losses=Traceback (most recent call last):
+  File "<stdin>", line 5, in <module>
+AttributeError: 'list' object has no attribute 'get'
+  narrow rc=? run=out/20260913_205535 losses=Traceback (most recent call last):
+  File "<stdin>", line 5, in <module>
+AttributeError: 'list' object has no attribute 'get'
+  defer rc=? run=out/20260913_205622 losses=Traceback (most recent call last):
+  File "<stdin>", line 5, in <module>
+AttributeError: 'list' object has no attribute 'get'
+--- ZeRO-3: three stages, shard_params, two cards
+  device run=out/20260913_205710 losses=[0.990699, 0.985743, 0.948609, 1.194502]
+  narrow run=out/20260913_205732 losses=[0.990699, 0.985743, 0.948609, 1.194502]
+  defer run=out/20260913_205755 losses=[0.990699, 0.985743, 0.948609, 1.194502]
+done 2026-09-13T20:58:17-04:00
+=== start 2026-09-13T20:59:51-04:00 host=catalyst-fleet1.cs.cmu.edu ===
+cards4=0,1,2,3 cards2=0,1 load: 100,0,100,100,100,100,100
+--- EP: shipped Qwen example, pp2_dp2_ep2, four cards
+  device rc=? run=out/20260913_210038 losses=[7.625, 7.625, 7.625, 7.625, 7.625, 7.625]
+  narrow rc=? run=out/20260913_210130 losses=[7.625, 7.625, 7.625, 7.625, 7.625, 7.625]
+  defer rc=? run=out/20260913_210219 losses=[7.625, 7.625, 7.625, 7.625, 7.625, 7.625]
+--- ZeRO-3: three stages, shard_params, two cards
+  device run=out/20260913_210308 losses=[0.990699, 0.985743, 0.948609, 1.194502]
+  narrow run=out/20260913_210336 losses=[0.990699, 0.985743, 0.948609, 1.194502]
+  defer run=out/20260913_210358 losses=[0.990699, 0.985743, 0.948609, 1.194502]
+done 2026-09-13T21:04:20-04:00

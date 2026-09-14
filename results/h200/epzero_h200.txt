@@ -1,0 +1,31 @@
+=== start 2026-09-14T08:48:03+08:00 host=user ===
+cards4=2,3,4,5 cards2=2,3 load: 96,0,0,0,60,99,100,100
+--- EP: shipped Qwen example, pp2_dp2_ep2, four cards
+  device rc=? run= losses=NO METRICS
+    torch._inductor.exc.InductorError: CalledProcessError: Command '['/usr/bin/gcc', '/tmp/tmppg3fx3n6/cuda_utils.c', '-O3', '-shared', '-fPIC', '-Wno-psabi', '-o', '/tmp/tmppg3fx3n6/cuda_utils.cpython-310-x86_64-linux-gnu.so', '-l:libcuda.so.1', '-L/data/home/Licheng/piper-venv/lib/python3.10/site-packages/triton/backends/nvidia/lib', '-L/lib/x86_64-linux-gnu', '-L/lib/i386-linux-gnu', '-I/data/home/Licheng/piper-venv/lib/python3.10/site-packages/triton/backends/nvidia/include', '-I/tmp/tmppg3fx3n6', '-I/usr/include/python3.10']' returned non-zero exit status 1.
+  narrow rc=? run= losses=NO METRICS
+    torch._inductor.exc.InductorError: CalledProcessError: Command '['/usr/bin/gcc', '/tmp/tmppsvwlj8s/cuda_utils.c', '-O3', '-shared', '-fPIC', '-Wno-psabi', '-o', '/tmp/tmppsvwlj8s/cuda_utils.cpython-310-x86_64-linux-gnu.so', '-l:libcuda.so.1', '-L/data/home/Licheng/piper-venv/lib/python3.10/site-packages/triton/backends/nvidia/lib', '-L/lib/x86_64-linux-gnu', '-L/lib/i386-linux-gnu', '-I/data/home/Licheng/piper-venv/lib/python3.10/site-packages/triton/backends/nvidia/include', '-I/tmp/tmppsvwlj8s', '-I/usr/include/python3.10']' returned non-zero exit status 1.
+  defer rc=? run= losses=NO METRICS
+    torch._inductor.exc.InductorError: CalledProcessError: Command '['/usr/bin/gcc', '/tmp/tmpezolojvi/cuda_utils.c', '-O3', '-shared', '-fPIC', '-Wno-psabi', '-o', '/tmp/tmpezolojvi/cuda_utils.cpython-310-x86_64-linux-gnu.so', '-l:libcuda.so.1', '-L/data/home/Licheng/piper-venv/lib/python3.10/site-packages/triton/backends/nvidia/lib', '-L/lib/x86_64-linux-gnu', '-L/lib/i386-linux-gnu', '-I/data/home/Licheng/piper-venv/lib/python3.10/site-packages/triton/backends/nvidia/include', '-I/tmp/tmpezolojvi', '-I/usr/include/python3.10']' returned non-zero exit status 1.
+--- ZeRO-3: three stages, shard_params, two cards
+  device run= losses=NO METRICS
+    ValueError: param override 'l_self_modules_blocks_modules_0_modules_up_parameters_weight_' has shape (0, 512), expected (2048, 512)
+  narrow run= losses=NO METRICS
+    ValueError: param override 'l_self_modules_blocks_modules_0_modules_up_parameters_weight_' has shape (0, 512), expected (2048, 512)
+  defer run= losses=NO METRICS
+    ValueError: param override 'l_self_modules_blocks_modules_0_modules_up_parameters_weight_' has shape (0, 512), expected (2048, 512)
+done 2026-09-14T08:51:52+08:00
+=== start 2026-09-14T08:58:20+08:00 host=user ===
+cards4=2,3,4,5 cards2=2,3 load: 94,0,0,0,60,100,100,100
+--- EP: shipped Qwen example, pp2_dp2_ep2, four cards
+=== start 2026-09-14T09:00:20+08:00 host=user ===
+cards4=2,3,4,5 cards2=2,3 load: 96,0,0,0,61,100,100,100
+--- EP: shipped Qwen example, pp2_dp2_ep2, four cards
+  device rc=? run=out/20260914_090107 losses=[7.625, 7.625, 7.625, 7.625, 7.625, 7.625]
+  narrow rc=? run=out/20260914_090212 losses=[7.625, 7.625, 7.625, 7.625, 7.625, 7.625]
+  defer rc=? run=out/20260914_090316 losses=[7.625, 7.625, 7.625, 7.625, 7.625, 7.625]
+--- ZeRO-3: three stages, shard_params, two cards
+  device run=out/20260914_090420 losses=[0.990701, 0.985589, 0.946041, 1.512695]
+  narrow run=out/20260914_090447 losses=[0.990701, 0.985589, 0.946041, 1.512695]
+  defer run=out/20260914_090516 losses=[0.990701, 0.985589, 0.946041, 1.512695]
+done 2026-09-14T09:05:43+08:00

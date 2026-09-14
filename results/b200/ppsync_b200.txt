@@ -1,0 +1,21 @@
+=== start 2026-09-13T20:26:28-04:00 host=catalyst-fleet1.cs.cmu.edu ===
+cards=0,1,2,3 load: 100,0,100,100,100,100,99
+== mode=device  TP x PP on four cards, 3 optimizer steps
+  rc=0
+    TP x PP rank0 (4 GPU, stages=2, tp=2, 1f1b): [44.384819, 44.384819, 44.384819, 44.384819, 23.111044, 23.111044, 23.111044, 23.111044]
+    TP x PP rank1 (4 GPU, stages=2, tp=2, 1f1b): [44.384819, 44.384819, 44.384819, 44.384819, 23.111044, 23.111044, 23.111044, 23.111044]
+    PASS  TP x PP matches the baseline (worst |diff| 3.81e-05)
+    PASS  TP=2 matches TP=1 across 3 iterations (worst |diff| 7.15e-07), both TP ranks agree, and removing the directive breaks it
+== mode=narrow  TP x PP on four cards, 3 optimizer steps
+  rc=0
+    TP x PP rank0 (4 GPU, stages=2, tp=2, 1f1b): [44.384819, 44.384819, 44.384819, 44.384819, 23.111044, 23.111044, 23.111044, 23.111044]
+    TP x PP rank1 (4 GPU, stages=2, tp=2, 1f1b): [44.384819, 44.384819, 44.384819, 44.384819, 23.111044, 23.111044, 23.111044, 23.111044]
+    PASS  TP x PP matches the baseline (worst |diff| 3.81e-05)
+    PASS  TP=2 matches TP=1 across 3 iterations (worst |diff| 7.15e-07), both TP ranks agree, and removing the directive breaks it
+== mode=defer  TP x PP on four cards, 3 optimizer steps
+  rc=0
+    TP x PP rank0 (4 GPU, stages=2, tp=2, 1f1b): [44.384819, 44.384819, 44.384819, 44.384819, 23.111044, 23.111044, 23.111044, 23.111044]
+    TP x PP rank1 (4 GPU, stages=2, tp=2, 1f1b): [44.384819, 44.384819, 44.384819, 44.384819, 23.111044, 23.111044, 23.111044, 23.111044]
+    PASS  TP x PP matches the baseline (worst |diff| 3.81e-05)
+    PASS  TP=2 matches TP=1 across 3 iterations (worst |diff| 7.15e-07), both TP ranks agree, and removing the directive breaks it
+done 2026-09-13T20:33:00-04:00

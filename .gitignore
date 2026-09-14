@@ -8,7 +8,9 @@ out/
 ec2-trust-policy.json
 
 # Piper-TP
-results/
+# results/ now holds curated evidence (see results/README.md); only bulk dumps stay out
+results/**/*.nsys-rep
+results/**/*.sqlite
 logs/
 *.nsys-rep
 *.sqlite

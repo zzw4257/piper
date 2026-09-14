@@ -1,0 +1,23 @@
+start 2026-09-13T04:47:03-04:00
+cards=0,3 2026-09-13T04:48:33-04:00
+== zero3_trace stages=4 2026-09-13T04:48:33-04:00
+rc=0 run=out/20260913_044834 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 11171922432}
+  dp_rank=1 peak_memory_by_rank={'1': 10567942656}
+== pf1_trace stages=4 2026-09-13T04:48:56-04:00
+rc=0 run=out/20260913_044857 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 9158656512}
+  dp_rank=1 peak_memory_by_rank={'1': 9762636288}
+== pf1_hostsync stages=2 2026-09-13T04:49:19-04:00
+rc=0 run=out/20260913_044920 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 4398645760}
+  dp_rank=1 peak_memory_by_rank={'1': 4398645760}
+== pf1_hostsync stages=4 2026-09-13T04:49:41-04:00
+rc=0 run=out/20260913_044943 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 7094534656}
+  dp_rank=1 peak_memory_by_rank={'1': 7094534656}
+== pf1_hostsync stages=8 2026-09-13T04:50:06-04:00
+rc=0 run=out/20260913_045007 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 12486312448}
+  dp_rank=1 peak_memory_by_rank={'1': 12486312448}
+done 2026-09-13T04:50:29-04:00

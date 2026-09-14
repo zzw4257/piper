@@ -1,0 +1,58 @@
+=== start 2026-09-13T18:25:46-04:00 host=catalyst-fleet1.cs.cmu.edu ===
+cards2=0,1 cards4=0,1,2,3
+== torchrun TP math (no Piper) 2026-09-13T18:25:46-04:00
+rc=1
+== torchrun CP math (no Piper) 2026-09-13T18:25:53-04:00
+rc=0
+CP=2 ring == dense: {'out': 4.172325134277344e-07, 'dQ': 1.1920928955078125e-06, 'dK': 2.86102294921875e-06, 'dV': 1.9073486328125e-06}  | controls broke as required
+== in-Piper TP=2 vs TP=1 (shipped path, 3 optimizer steps, with negative control) 2026-09-13T18:26:03-04:00
+rc=0
+TP=1 (out/20260913_182628): [2.95143, 1.893224, 1.588651]
+TP=2 rank0 (out/20260913_182605): [2.95143, 1.893223, 1.588651]
+TP=2 rank1 (out/20260913_182605): [2.95143, 1.893223, 1.588651]
+control (no directive, out/20260913_182648): [1.902967, 1.328529, 1.043335]  max|diff| vs TP=1 1.103e+00
+PASS  TP=2 matches TP=1 across 3 iterations (worst |diff| 7.15e-07), both TP ranks agree, and removing the directive breaks it
+== in-Piper CP=2 vs dense (with negative control) 2026-09-13T18:27:08-04:00
+rc=0
+CP=2 rank0 [cp2_ring_dp] (out/20260913_182709): [0.998436, 0.994217, 0.990225]
+CP=2 rank1 [cp2_ring_dp] (out/20260913_182709): [1.006162, 1.001945, 0.997937]
+CP=2 mean over ranks:             [1.002299, 0.998081, 0.994081]
+CP=2 ring == CP=1 dense across 3 iterations, worst |diff| 1.729e-06
+negative control (no ring) differs by 3.220e-03: the comparison can fail
+== in-Piper CP=4, spliced and hoisted 2026-09-13T18:28:20-04:00
+  cp4_ring_dp rc=0
+CP=4 ring == CP=1 dense across 5 iterations, worst |diff| 1.293e-05
+  cp4_ring_dp_hoist rc=0
+CP=4 ring == CP=1 dense across 5 iterations, worst |diff| 1.293e-05
+== node timings, interleaved A/B against the saved pre-change executor 2026-09-13T18:30:04-04:00
+  rep1 after rc=0
+    after backward                   6       962       837          125      87%
+    after forward                    6       594       523           71      88%
+    after forward_ring_exchange      3       402       nan          402     nan%
+    after per iteration: 21.46 ms total, 17.18 ms inside compute.* (80%), 4.27 ms executor
+  rep1 before rc=0
+    before backward                   6       906       791          115      87%
+    before forward                    6       363       322           41      89%
+    before forward_ring_exchange      3       266       nan          266     nan%
+    before per iteration: 16.51 ms total, 12.96 ms inside compute.* (79%), 3.55 ms executor
+  rep2 after rc=0
+    after backward                   6       816       702          114      86%
+    after forward                    6       320       285           36      89%
+    after forward_ring_exchange      3       243       nan          243     nan%
+    after per iteration: 24.14 ms total, 21.39 ms inside compute.* (89%), 2.75 ms executor
+  rep2 before rc=0
+    before backward                   6       934       796          138      85%
+    before forward                    6       362       322           40      89%
+    before forward_ring_exchange      3       265       nan          265     nan%
+    before per iteration: 14.58 ms total, 11.51 ms inside compute.* (79%), 3.07 ms executor
+  rep3 after rc=0
+    after backward                   6       757       684           73      90%
+    after forward                    6       379       337           42      89%
+    after forward_ring_exchange      3       276       nan          276     nan%
+    after per iteration: 20.12 ms total, 17.40 ms inside compute.* (87%), 2.71 ms executor
+  rep3 before rc=0
+    before backward                   6       733       642           91      88%
+    before forward                    6       362       323           39      89%
+    before forward_ring_exchange      3       285       nan          285     nan%
+    before per iteration: 20.12 ms total, 17.28 ms inside compute.* (86%), 2.84 ms executor
+done 2026-09-13T18:33:10-04:00
