@@ -23,6 +23,18 @@ _FWD_BOUNDARY_COMM_TASKS = (TaskType.FWD_A2A, TaskType.FWD_TP_ALL_REDUCE, TaskTy
 _BWD_BOUNDARY_COMM_TASKS = (TaskType.BWD_A2A, TaskType.BWD_TP_ALL_REDUCE, TaskType.BWD_RING_EXCHANGE)
 
 
+def flush_pending_losses(executor) -> list[float]:
+    """Convert whatever `defer` mode is still holding. Called at the end of a run."""
+    pending = getattr(executor, "_pending_losses", None)
+    if not pending:
+        return []
+    evt = getattr(executor, "_step_done", None)
+    if evt is not None:
+        evt.synchronize()
+    executor._pending_losses = []
+    return _drain_losses(pending)
+
+
 def _drain_losses(loss_buffer: list) -> list[float]:
     """Empty the loss buffer into plain floats. Call only after a synchronize."""
     losses = [
@@ -679,12 +691,36 @@ class DagExecutor:
         assert dag is not None, "load_training_dag() must be called before run_dag()"
         assert sorted_dag_nodes is not None, "load_training_dag() must initialize sorted node order"
 
+        self._loss_events = []
+        if self.SYNC_MODE != "device":
+            prev = getattr(self, "_step_done", None)
+            if prev is not None:
+                # Stream-ordered, so the host does not block: every stream of
+                # this step queues behind the previous step's optimizer.
+                for st in self.runtime.streams.values():
+                    st.wait_event(prev)
+                # The host does have to block before reading last step's losses,
+                # but by now its GPU work has had a full Ray round trip to finish.
+                if self.SYNC_MODE == "defer":
+                    # Only `defer` has host-side reading to do here; `narrow`
+                    # has already converted its losses and needs the ordering
+                    # alone, which the stream waits above provide.
+                    prev.synchronize()
+                self._step_done = None
+            if self.SYNC_MODE == "defer":
+                self._carried_losses = _drain_losses(getattr(self, "_pending_losses", []))
+                self._pending_losses = []
+
         self.params.drain_pending_frees()
         debug_enabled = self.logger.isEnabledFor(logging.DEBUG)
 
         self.buffers.reset()
         self.events.reset()
-        self.params.clear_param_grads()
+        self.params.clear_param_grads(
+            in_flight_streams=(
+                self.runtime.streams.values() if self.SYNC_MODE != "device" else None
+            )
+        )
         default_stream = self.runtime.default_stream()
         self.params.zero_grad_buffers(default_stream)
         zero_evt = torch.cuda.Event()
@@ -1122,6 +1158,12 @@ class DagExecutor:
                         # dispatch loop mid-DAG and perturb the schedule being measured.
                         # _update converts after its existing synchronize().
                         loss_buffer.append(outputs_or_loss[0].detach())
+                        # The loss is the only value _update needs on the host.
+                        # Recording its readiness lets the narrow mode wait for
+                        # it instead of for the whole device (log F56/F59/F60).
+                        _levt = torch.cuda.Event()
+                        _levt.record(node_stream)
+                        self._loss_events.append(_levt)
                         upstream_grads = None
                     elif recv_pred is not None:
                         upstream_grads = self.buffers.task[recv_pred.uid]
@@ -1355,6 +1397,23 @@ class DagExecutor:
             ],
         }
 
+    # How the host waits at the end of a step. `narrow` is the default: it is
+    # contract-identical to `device` and measurably faster, and was verified on
+    # TP, CP=2, CP=4, TP x PP, EP and ZeRO-3, on two machines, with negative
+    # controls and across optimizer steps (log F60).
+    #
+    # device : block the host until every stream is idle. Upstream behaviour,
+    #          kept so the old timing can be reproduced exactly.
+    # narrow : block only until the loss values exist. The optimizer and the
+    #          trailing collectives stay in flight and the host returns early,
+    #          so Ray's round trip and the next step's dispatch overlap this
+    #          step's GPU tail. No change to what any caller observes.
+    # defer  : do not block at all; hand the losses to the next step, which
+    #          converts them after waiting on this step's completion event.
+    #          Fastest and steadiest, but losses lag one step, so a caller must
+    #          call piper_flush_losses() at the end of its loop.
+    SYNC_MODE = os.environ.get("PIPER_SYNC_MODE", "narrow")
+
     def _update(self, stream: torch.cuda.Stream, loss_buffer: list):
         _parts = self._upd_parts = {} if os.environ.get("PIPER_TIME_TRACE") else None
         _t = time.perf_counter() if _parts is not None else 0.0
@@ -1364,8 +1423,27 @@ class DagExecutor:
             _parts["_t"] = time.perf_counter()
         if self.params.has_zero_shard_optimizers():
             self.params.step_zero_shard_optimizers(stream, self.events.reduce_scatter)
-            torch.cuda.synchronize()
-            return {"losses": _drain_losses(loss_buffer)}
+            # This path returned before the sync-mode branch below, so ZeRO-3
+            # kept the device-wide block whatever PIPER_SYNC_MODE said. Give it
+            # the same three modes (log F61).
+            mode = self.SYNC_MODE
+            if mode == "device":
+                torch.cuda.synchronize()
+                return {"losses": _drain_losses(loss_buffer)}
+            evt = torch.cuda.Event()
+            evt.record(stream)
+            self._step_done = evt
+            if mode == "narrow":
+                for e in self._loss_events:
+                    e.synchronize()
+                self._loss_events.clear()
+                return {"losses": _drain_losses(loss_buffer)}
+            self._pending_losses = list(loss_buffer)
+            loss_buffer.clear()
+            self._loss_events.clear()
+            out = {"losses": self._carried_losses}
+            self._carried_losses = []
+            return out
 
         for ar_evt in self.events.all_reduce.values():
             stream.wait_event(ar_evt)
@@ -1386,7 +1464,34 @@ class DagExecutor:
                     self._upd_parts["n_buckets"] = self._upd_parts.get("n_buckets", 0) + 1
 
         _ts = time.perf_counter() if getattr(self, "_upd_parts", None) is not None else 0.0
-        torch.cuda.synchronize()
+        mode = self.SYNC_MODE
+        if mode != "device":
+            # The step's completion, for the next iteration's streams to queue
+            # behind. Required in *both* non-device modes: `narrow` waits on the
+            # loss events, and a rank that computes no loss -- every non-final PP
+            # stage -- has none, so without this the host would enter the next
+            # iteration and free grads the optimizer is still reading.
+            evt = torch.cuda.Event()
+            evt.record(stream)
+            self._step_done = evt
+        if mode == "defer":
+            self._pending_losses = list(loss_buffer)
+            loss_buffer.clear()
+            self._loss_events.clear()
+            out = {"losses": self._carried_losses}
+            self._carried_losses = []
+            if getattr(self, "_upd_parts", None) is not None:
+                self._upd_parts["final_sync"] = (time.perf_counter() - _ts) * 1e6
+                self._upd_parts["loop"] = (_ts - self._upd_parts.pop("_t", _ts)) * 1e6
+            return out
+        if mode == "narrow":
+            # .item() copies on the current stream, so the loss's producing
+            # stream has to be waited on first -- but only that one.
+            for e in self._loss_events:
+                e.synchronize()
+            self._loss_events.clear()
+        else:
+            torch.cuda.synchronize()
         if getattr(self, "_upd_parts", None) is not None:
             # A full device sync sits at the end of the update node, so this
             # node absorbs whatever GPU work is still outstanding. Separating it

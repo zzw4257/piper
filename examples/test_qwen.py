@@ -3,6 +3,7 @@ import ray
 import torch
 import argparse
 import time
+import json
 import os
 
 from src.compile import piper_setup
@@ -16,7 +17,7 @@ from torchtitan.models.qwen3.model.model import precompute_rope_cache
 logger = create_logger("test_qwen", LOG_LEVEL)
 
 
-def _raw_metrics(args, iter_times, peak_memory_stats):
+def _raw_metrics(args, iter_times, peak_memory_stats, losses=None):
     """Assemble raw per-dp-rank measurements + run config for the harness.
 
     No derived statistics are computed here; the harness summarizes the metrics
@@ -36,6 +37,7 @@ def _raw_metrics(args, iter_times, peak_memory_stats):
         "num_microbatches": int(info.get("num_microbatches", 1)),
         "seq_len": args.seq_len,
         "iter_times_s": [float(t) for t in iter_times],
+        "losses": [float(x) for x in (losses or [])],
         "peak_memory_by_rank": {
             int(rank): int(max_alloc) for rank, max_alloc in peak_memory_stats
         },
@@ -93,9 +95,10 @@ def main(args, pg):
     logger.info(f"Running {args.iters} timed iterations")
     ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
     iter_times = []
+    losses = []
     for _ in range(args.iters):
         start = time.perf_counter()
-        piper_exec_dag(loss_fn, log_stats=True)
+        losses.extend(piper_exec_dag(loss_fn, log_stats=True) or [])
         end = time.perf_counter()
         iter_times.append(end - start)
         if args.iteration_sleep > 0:
@@ -105,7 +108,16 @@ def main(args, pg):
         [actor.get_and_reset_peak_memory_stats.remote() for actor in actors.values()]
     )
 
-    metrics = _raw_metrics(args, iter_times, peak_memory_stats)
+    metrics = _raw_metrics(args, iter_times, peak_memory_stats, losses)
+    # Write a per-dp-rank artifact as the MLP and ring examples do. The harness
+    # only summarizes into results.csv, so without this there is nothing to
+    # compare two runs of the EP example against (log F8's point, still true).
+    artifact = os.path.join(
+        getattr(piper_metadata, "artifact_dir", "out"),
+        f"qwen_metrics_dp{metrics['dp_rank']}.json",
+    )
+    with open(artifact, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, sort_keys=True)
 
     if args.pytorch_profiler:
         profile_dir = getattr(args, "profile_dir", "") or os.path.join(

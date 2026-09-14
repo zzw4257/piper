@@ -252,11 +252,26 @@ class ParamStorage:
     pending_param_frees: dict[Any, Future] = field(default_factory=dict)
     pending_grad_frees: dict[Any, Future] = field(default_factory=dict)
 
-    def clear_param_grads(self) -> None:
+    def clear_param_grads(self, in_flight_streams=None) -> None:
+        """Drop parameter gradients.
+
+        With a non-device sync mode the host reaches this point while the
+        previous step's optimizer may still be reading these buffers. Freeing
+        them returns the block to the pool of the stream they were allocated
+        on, which is only safe for reuse *on that stream*; a reader on any
+        other stream needs `record_stream`, or the allocator may hand the block
+        to a new kernel while the optimizer is still in it. Pass the streams
+        that could still hold them (log F61).
+        """
+        streams = list(in_flight_streams) if in_flight_streams else []
         for bucket in self.stages.buckets.values():
             for idx in bucket.trainable_param_idxs:
                 param = bucket.forward_args[idx]
                 if param is not None:
+                    grad = param.grad
+                    if grad is not None and streams:
+                        for st in streams:
+                            grad.record_stream(st)
                     param.grad = None
 
     def zero_grad_buffers(self, stream: torch.cuda.Stream) -> None:
