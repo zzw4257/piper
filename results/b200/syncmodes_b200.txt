@@ -1,0 +1,46 @@
+=== start 2026-09-13T19:29:35-04:00 host=catalyst-fleet1.cs.cmu.edu ===
+=== start 2026-09-13T20:06:07-04:00 host=catalyst-fleet1.cs.cmu.edu ===
+cards4=0,1,2,3 cards2=0,1
+load at start: 0:100% 1:0% 2:100% 3:100% 4:100% 5:100% 6:100% 
+--- correctness, every mode, every check, with negative controls
+== mode=device
+  tp rc=0
+    control (no directive, out/20260913_200744): [1.902967, 1.328529, 1.043335]  max|diff| vs TP=1 1.103e+00
+    PASS  TP=2 matches TP=1 across 3 iterations (worst |diff| 7.15e-07), both TP ranks agree, and removing the directive breaks it
+  cp2 rc=0
+    CP=2 ring == CP=1 dense across 3 iterations, worst |diff| 1.729e-06
+    negative control (no ring) differs by 3.220e-03: the comparison can fail
+  cp4 rc=0
+    CP=4 ring == CP=1 dense across 5 iterations, worst |diff| 1.293e-05
+== mode=narrow
+  tp rc=0
+    control (no directive, out/20260913_201131): [1.902967, 1.328529, 1.043335]  max|diff| vs TP=1 1.103e+00
+    PASS  TP=2 matches TP=1 across 3 iterations (worst |diff| 7.15e-07), both TP ranks agree, and removing the directive breaks it
+  cp2 rc=0
+    CP=2 ring == CP=1 dense across 3 iterations, worst |diff| 1.729e-06
+    negative control (no ring) differs by 3.220e-03: the comparison can fail
+  cp4 rc=0
+    CP=4 ring == CP=1 dense across 5 iterations, worst |diff| 1.293e-05
+== mode=defer
+  tp rc=0
+    control (no directive, out/20260913_201642): [1.902967, 1.328529, 1.043335]  max|diff| vs TP=1 1.103e+00
+    PASS  TP=2 matches TP=1 across 3 iterations (worst |diff| 7.15e-07), both TP ranks agree, and removing the directive breaks it
+  cp2 rc=0
+    CP=2 ring == CP=1 dense across 3 iterations, worst |diff| 1.729e-06
+    negative control (no ring) differs by 3.220e-03: the comparison can fail
+  cp4 rc=0
+    CP=4 ring == CP=1 dense across 5 iterations, worst |diff| 1.293e-05
+--- timing, interleaved over modes, 4 reps
+  rep1 device driver_min=13.14ms mean_final_sync=20461us
+  rep1 narrow driver_min=15.96ms mean_final_sync=4762us
+  rep1 defer driver_min=10.75ms mean_final_sync=8us
+  rep2 device driver_min=18.47ms mean_final_sync=12312us
+  rep2 narrow driver_min=17.59ms mean_final_sync=6242us
+  rep2 defer driver_min=12.88ms mean_final_sync=9us
+  rep3 device driver_min=13.25ms mean_final_sync=9790us
+  rep3 narrow driver_min=10.10ms mean_final_sync=1441us
+  rep3 defer driver_min=10.24ms mean_final_sync=8us
+  rep4 device driver_min=22.28ms mean_final_sync=10808us
+  rep4 narrow driver_min=14.46ms mean_final_sync=5831us
+  rep4 defer driver_min=12.20ms mean_final_sync=8us
+done 2026-09-13T20:25:26-04:00

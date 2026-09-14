@@ -1,0 +1,14 @@
+=== start 2026-09-14T02:47:44+08:00 host=user ===
+cards=2,3,4,5
+  seq=1024 rc=0 piper_ms=14.22
+  seq=2048 rc=0 piper_ms=15.46
+  seq=4096 rc=0 piper_ms=25.62
+  seq=8192 rc=0 piper_ms=93.74
+piper_ms=14.22,15.46,25.62,93.74
+NVIDIA H200  dim=512 heads=8 steps=4 batch=8
+    seq  s_local  GPU math ms  rel work   Piper ms  GPU frac
+   1024      256         3.89      1.00      14.22     27.4%
+   2048      512         4.67      1.20      15.46     30.2%
+   4096     1024        14.68      3.77      25.62     57.3%
+   8192     2048        52.58     13.51      93.74     56.1%
+done 2026-09-14T02:51:14+08:00

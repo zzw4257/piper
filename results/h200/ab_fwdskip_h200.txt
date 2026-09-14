@@ -1,0 +1,33 @@
+=== start 2026-09-14T06:36:28+08:00 host=user ===
+cards=2,3,5,6
+rep1 before rc=0 per iteration: 13.51 ms total, 10.92 ms inside compute.* (81%), 2.59 ms executor
+  before backward                   6      1124      1053           71      94%
+  before forward                    6       385       343           42      89%
+rep1 after rc=0 per iteration: 13.41 ms total, 9.71 ms inside compute.* (72%), 3.70 ms executor
+  after backward                   6      1221      1138           83      93%
+  after forward                    6       454       398           56      88%
+rep2 before rc=0 per iteration: 20.77 ms total, 16.70 ms inside compute.* (80%), 4.07 ms executor
+  before backward                   6      1358      1220          138      90%
+  before forward                    6       457       404           53      88%
+rep2 after rc=0 per iteration: 18.01 ms total, 13.83 ms inside compute.* (77%), 4.19 ms executor
+  after backward                   6      1121       964          157      86%
+  after forward                    6       473       419           54      89%
+rep3 before rc=0 per iteration: 17.38 ms total, 13.53 ms inside compute.* (78%), 3.86 ms executor
+  before backward                   6      1441      1344           97      93%
+  before forward                    6       462       405           56      88%
+rep3 after rc=0 per iteration: 12.80 ms total, 9.07 ms inside compute.* (71%), 3.73 ms executor
+  after backward                   6       769       644          125      84%
+  after forward                    6       489       435           55      89%
+rep4 before rc=0 per iteration: 13.09 ms total, 9.16 ms inside compute.* (70%), 3.93 ms executor
+  before backward                   6      1164      1032          133      89%
+  before forward                    6       450       398           51      89%
+rep4 after rc=0 per iteration: 16.17 ms total, 12.56 ms inside compute.* (78%), 3.61 ms executor
+  after backward                   6      1020       914          106      90%
+  after forward                    6       463       410           54      88%
+rep5 before rc=0 per iteration: 14.04 ms total, 11.29 ms inside compute.* (80%), 2.76 ms executor
+  before backward                   6       913       800          113      88%
+  before forward                    6       338       298           40      88%
+rep5 after rc=0 per iteration: 13.69 ms total, 9.68 ms inside compute.* (71%), 4.02 ms executor
+  after backward                   6      1140      1007          133      88%
+  after forward                    6       463       411           52      89%
+done 2026-09-14T06:44:43+08:00

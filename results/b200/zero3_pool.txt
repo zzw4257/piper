@@ -1,0 +1,95 @@
+start 2026-09-13T05:02:47-04:00
+cards=0,3 2026-09-13T05:04:17-04:00
+== pf1_pool stages=2 2026-09-13T05:04:17-04:00
+rc=1 run= per_stage_bytes=671088640
+ray.exceptions.RayTaskError(RuntimeError): [36mray::PiperActor.run_dag()[39m (pid=564866, ip=144.121.226.170, actor_id=17a22e787dcd93a54b7bb2b601000000, repr=
+RuntimeError: shape '[16384, 4096]' is invalid for input of size 0
+== pf1_pool stages=4 2026-09-13T05:04:41-04:00
+rc=1 run= per_stage_bytes=671088640
+ray.exceptions.RayTaskError(RuntimeError): [36mray::PiperActor.run_dag()[39m (pid=584308, ip=144.121.226.170, actor_id=34eb8d7b6dfdaac0bd0c236701000000, repr=
+RuntimeError: shape '[16384, 4096]' is invalid for input of size 0
+== pf1_pool stages=8 2026-09-13T05:05:04-04:00
+rc=1 run= per_stage_bytes=671088640
+ray.exceptions.RayTaskError(RuntimeError): [36mray::PiperActor.run_dag()[39m (pid=605342, ip=144.121.226.170, actor_id=cdb4868204543ac10e2654ec01000000, repr=
+RuntimeError: shape '[16384, 4096]' is invalid for input of size 0
+== shipped_pool stages=2 2026-09-13T05:05:31-04:00
+rc=1 run= per_stage_bytes=671088640
+ray.exceptions.RayTaskError(RuntimeError): [36mray::PiperActor.run_dag()[39m (pid=628273, ip=144.121.226.170, actor_id=c3a9d3629f241fd6c9f0c55d01000000, repr=
+RuntimeError: shape '[4096, 4096]' is invalid for input of size 0
+== shipped_pool stages=4 2026-09-13T05:05:54-04:00
+rc=1 run= per_stage_bytes=671088640
+ray.exceptions.RayTaskError(RuntimeError): [36mray::PiperActor.run_dag()[39m (pid=651917, ip=144.121.226.170, actor_id=85a607e833b31428ccb9b62601000000, repr=
+RuntimeError: shape '[4096, 4096]' is invalid for input of size 0
+== shipped_pool stages=8 2026-09-13T05:06:17-04:00
+rc=1 run= per_stage_bytes=671088640
+ray.exceptions.RayTaskError(RuntimeError): [36mray::PiperActor.run_dag()[39m (pid=680399, ip=144.121.226.170, actor_id=fdd33e88af03c3fb11f22f3e01000000, repr=
+RuntimeError: shape '[4096, 4096]' is invalid for input of size 0
+== pf1_pool_ab stages=8 2026-09-13T05:06:41-04:00
+rc=1 run= per_stage_bytes=671088640
+ray.exceptions.RayTaskError(RuntimeError): [36mray::PiperActor.run_dag()[39m (pid=710144, ip=144.121.226.170, actor_id=79965c17bb9075a8464f0a1501000000, repr=
+RuntimeError: shape '[16384, 4096]' is invalid for input of size 0
+== pf1_hostsync_ab stages=8 2026-09-13T05:07:06-04:00
+rc=0 run=out/20260913_050707 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 12615811584} min_iter_s=0.1835 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+  dp_rank=1 peak_memory_by_rank={'1': 12486312448} min_iter_s=0.1783 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+== pf1_plain_ab stages=8 2026-09-13T05:07:30-04:00
+rc=0 run=out/20260913_050732 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 18553897472} min_iter_s=0.1218 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+  dp_rank=1 peak_memory_by_rank={'1': 19157877248} min_iter_s=0.1186 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+== pf1_pool_ab stages=8 2026-09-13T05:07:58-04:00
+rc=1 run= per_stage_bytes=671088640
+ray.exceptions.RayTaskError(RuntimeError): [36mray::PiperActor.run_dag()[39m (pid=816700, ip=144.121.226.170, actor_id=97113af6e7fc39f3a523affd01000000, repr=
+RuntimeError: shape '[16384, 4096]' is invalid for input of size 0
+== pf1_hostsync_ab stages=8 2026-09-13T05:08:27-04:00
+rc=0 run=out/20260913_050829 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 12486312448} min_iter_s=0.0946 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+  dp_rank=1 peak_memory_by_rank={'1': 12486312448} min_iter_s=0.0959 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+== pf1_plain_ab stages=8 2026-09-13T05:08:56-04:00
+rc=0 run=out/20260913_050857 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 20168180224} min_iter_s=0.1369 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+  dp_rank=1 peak_memory_by_rank={'1': 19897647616} min_iter_s=0.1264 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+done 2026-09-13T05:09:27-04:00
+--- rerun 2026-09-13T05:12:31-04:00: pool v3 (object replacement on release)
+start 2026-09-13T05:12:31-04:00
+cards=0,3 2026-09-13T05:14:01-04:00
+== pf1_pool stages=2 2026-09-13T05:14:01-04:00
+rc=0 run=out/20260913_051403 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 4465754624} min_iter_s=0.0244 losses=[28347.9492, 29295.9531, 40457.0977]
+  dp_rank=1 peak_memory_by_rank={'1': 4465754624} min_iter_s=0.0247 losses=[28347.9492, 29295.9531, 40457.0977]
+== pf1_pool stages=4 2026-09-13T05:14:27-04:00
+rc=0 run=out/20260913_051428 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 7161643520} min_iter_s=0.0631 losses=[1583684864.0, 680252538880.0, 683661262848.0]
+  dp_rank=1 peak_memory_by_rank={'1': 7161643520} min_iter_s=0.0628 losses=[1583684864.0, 680252538880.0, 683661262848.0]
+== pf1_pool stages=8 2026-09-13T05:14:51-04:00
+rc=0 run=out/20260913_051453 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 12553421312} min_iter_s=0.0976 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+  dp_rank=1 peak_memory_by_rank={'1': 12553421312} min_iter_s=0.0967 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+== shipped_pool stages=2 2026-09-13T05:15:19-04:00
+rc=0 run=out/20260913_051521 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 5203952128} min_iter_s=0.0317 losses=[28347.9492, 29295.9531, 40457.0977]
+  dp_rank=1 peak_memory_by_rank={'1': 5203952128} min_iter_s=0.0297 losses=[28347.9492, 29295.9531, 40457.0977]
+== shipped_pool stages=4 2026-09-13T05:15:45-04:00
+rc=0 run=out/20260913_051546 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 9242018304} min_iter_s=0.0593 losses=[1583684864.0, 680252538880.0, 683661262848.0]
+  dp_rank=1 peak_memory_by_rank={'1': 9242018304} min_iter_s=0.0544 losses=[1583684864.0, 680252538880.0, 683661262848.0]
+== shipped_pool stages=8 2026-09-13T05:16:14-04:00
+rc=0 run=out/20260913_051616 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 17318150656} min_iter_s=0.1351 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+  dp_rank=1 peak_memory_by_rank={'1': 17318150656} min_iter_s=0.1342 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+== pf1_pool_ab stages=8 2026-09-13T05:16:48-04:00
+rc=0 run=out/20260913_051650 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 12553421312} min_iter_s=0.0965 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+  dp_rank=1 peak_memory_by_rank={'1': 12553421312} min_iter_s=0.0834 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+== pf1_hostsync_ab stages=8 2026-09-13T05:17:15-04:00
+rc=0 run=out/20260913_051717 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 12615811584} min_iter_s=0.1090 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+  dp_rank=1 peak_memory_by_rank={'1': 12486312448} min_iter_s=0.1219 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+== pf1_pool_ab stages=8 2026-09-13T05:17:44-04:00
+rc=0 run=out/20260913_051746 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 12553421312} min_iter_s=0.0949 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+  dp_rank=1 peak_memory_by_rank={'1': 12553421312} min_iter_s=0.0942 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+== pf1_hostsync_ab stages=8 2026-09-13T05:18:09-04:00
+rc=0 run=out/20260913_051810 per_stage_bytes=671088640
+  dp_rank=0 peak_memory_by_rank={'0': 12486312448} min_iter_s=0.1756 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+  dp_rank=1 peak_memory_by_rank={'1': 12486312448} min_iter_s=0.1842 losses=[1.4824351064077107e+18, 1.5878980910481596e+27, 2.2822246835454318e+27]
+done 2026-09-13T05:18:35-04:00

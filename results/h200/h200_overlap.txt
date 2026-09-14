@@ -1,0 +1,32 @@
+=== start 2026-09-14T00:13:18+08:00 ===
+=== start 2026-09-14T00:26:17+08:00 ===
+cards=1,2,3,5
+-- s_local=256  (seq=1024)
+  cp4_ring_dp seq=1024 rc=0 min_iter=14.93ms peak=398MiB
+  cp4_ring_dp_hoist seq=1024 rc=0 min_iter=16.38ms peak=398MiB
+  cp4_ring_dp seq=1024 rc=0 min_iter=15.97ms peak=398MiB
+  cp4_ring_dp_hoist seq=1024 rc=0 min_iter=15.85ms peak=398MiB
+  cp4_ring_dp seq=1024 rc=0 min_iter=14.92ms peak=398MiB
+  cp4_ring_dp_hoist seq=1024 rc=0 min_iter=14.23ms peak=398MiB
+-- s_local=512  (seq=2048)
+  cp4_ring_dp seq=2048 rc=0 min_iter=15.12ms peak=988MiB
+  cp4_ring_dp_hoist seq=2048 rc=0 min_iter=16.02ms peak=988MiB
+  cp4_ring_dp seq=2048 rc=0 min_iter=17.87ms peak=988MiB
+  cp4_ring_dp_hoist seq=2048 rc=0 min_iter=14.18ms peak=988MiB
+  cp4_ring_dp seq=2048 rc=0 min_iter=13.86ms peak=988MiB
+  cp4_ring_dp_hoist seq=2048 rc=0 min_iter=13.52ms peak=988MiB
+-- s_local=1024  (seq=4096)
+  cp4_ring_dp seq=4096 rc=1 
+  cp4_ring_dp_hoist seq=4096 rc=1 
+  cp4_ring_dp seq=4096 rc=1 
+  cp4_ring_dp_hoist seq=4096 rc=1 
+  cp4_ring_dp seq=4096 rc=1 
+  cp4_ring_dp_hoist seq=4096 rc=1 
+-- s_local=2048  (seq=8192)
+  cp4_ring_dp seq=8192 rc=1 
+  cp4_ring_dp_hoist seq=8192 rc=1 
+  cp4_ring_dp seq=8192 rc=1 
+  cp4_ring_dp_hoist seq=8192 rc=1 
+  cp4_ring_dp seq=8192 rc=1 
+  cp4_ring_dp_hoist seq=8192 rc=1 
+done 2026-09-14T00:40:38+08:00

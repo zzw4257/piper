@@ -1,0 +1,95 @@
+start 2026-09-13T01:42:54-04:00
+--- restarted 2026-09-13T01:54:31-04:00 (old runner used a direct call that would have failed)
+start 2026-09-13T01:54:31-04:00
+--- restarted 2026-09-13T02:08:51-04:00 with relaxed gate (util<10%, used<100GB)
+start 2026-09-13T02:08:51-04:00
+--- restarted 2026-09-13T02:09:23-04:00: gate actually relaxed this time (used<100GB)
+start 2026-09-13T02:09:23-04:00
+--- restarted 2026-09-13T02:12:44-04:00 with zero3_pf1 arm
+start 2026-09-13T02:12:44-04:00
+--- restarted 2026-09-13T02:19:45-04:00: util gate relaxed for memory/numerics (timing stays <10%)
+start 2026-09-13T02:19:45-04:00
+--- restarted 2026-09-13T02:29:50-04:00: memory-only gate for memory/numerics runs
+start 2026-09-13T02:29:50-04:00
+cards=1,3 2026-09-13T02:31:21-04:00
+== zero3 stages=2 2026-09-13T02:31:21-04:00
+rc=2 run= per_stage_bytes=536870912
+== zero3 stages=4 2026-09-13T02:31:23-04:00
+rc=2 run= per_stage_bytes=536870912
+== zero3 stages=8 2026-09-13T02:31:24-04:00
+rc=2 run= per_stage_bytes=536870912
+== zero3_pf1 stages=2 2026-09-13T02:31:26-04:00
+rc=2 run= per_stage_bytes=536870912
+== zero3_pf1 stages=4 2026-09-13T02:31:28-04:00
+rc=2 run= per_stage_bytes=536870912
+== zero3_pf1 stages=8 2026-09-13T02:31:29-04:00
+rc=2 run= per_stage_bytes=536870912
+== dp stages=2 2026-09-13T02:31:31-04:00
+rc=2 run= per_stage_bytes=536870912
+== dp stages=4 2026-09-13T02:31:33-04:00
+rc=2 run= per_stage_bytes=536870912
+== dp stages=8 2026-09-13T02:31:34-04:00
+rc=2 run= per_stage_bytes=536870912
+done 2026-09-13T02:31:36-04:00
+--- 2026-09-13T02:32:39-04:00: the nine rc=2 rows above are a shell bug in mk (unbound n), not runs; restarted
+start 2026-09-13T02:32:39-04:00
+cards=1,3 2026-09-13T02:34:09-04:00
+== zero3 stages=2 2026-09-13T02:34:09-04:00
+rc=1 run= per_stage_bytes=536870912
+== zero3 stages=4 2026-09-13T02:34:34-04:00
+rc=1 run= per_stage_bytes=536870912
+== zero3 stages=8 2026-09-13T02:35:07-04:00
+rc=1 run= per_stage_bytes=536870912
+== zero3_pf1 stages=2 2026-09-13T02:35:52-04:00
+rc=1 run= per_stage_bytes=536870912
+== zero3_pf1 stages=4 2026-09-13T02:36:24-04:00
+rc=1 run= per_stage_bytes=536870912
+== zero3_pf1 stages=8 2026-09-13T02:36:58-04:00
+rc=1 run= per_stage_bytes=536870912
+== dp stages=2 2026-09-13T02:37:41-04:00
+rc=1 run= per_stage_bytes=536870912
+== dp stages=4 2026-09-13T02:38:07-04:00
+rc=1 run= per_stage_bytes=536870912
+== dp stages=8 2026-09-13T02:38:38-04:00
+rc=1 run= per_stage_bytes=536870912
+done 2026-09-13T02:39:21-04:00
+--- restarted 2026-09-13T02:43:42-04:00: rc=1 rows were fixed-init slicing with tp=1 / rc=2 rows were an --extra argparse bug
+start 2026-09-13T02:43:42-04:00
+cards=1,3 2026-09-13T02:45:13-04:00
+== zero3 stages=2 2026-09-13T02:45:13-04:00
+rc=0 run=out/20260913_024514 per_stage_bytes=536870912
+  dp_rank=0 peak_memory_by_rank={'0': 5203952128}
+  dp_rank=1 peak_memory_by_rank={'1': 5203952128}
+== zero3 stages=4 2026-09-13T02:45:32-04:00
+rc=0 run=out/20260913_024533 per_stage_bytes=536870912
+  dp_rank=0 peak_memory_by_rank={'0': 10569515520}
+  dp_rank=1 peak_memory_by_rank={'1': 11104289280}
+== zero3 stages=8 2026-09-13T02:45:56-04:00
+rc=0 run=out/20260913_024557 per_stage_bytes=536870912
+  dp_rank=0 peak_memory_by_rank={'0': 18693882368}
+  dp_rank=1 peak_memory_by_rank={'1': 19963183616}
+== zero3_pf1 stages=2 2026-09-13T02:46:17-04:00
+rc=0 run=out/20260913_024618 per_stage_bytes=536870912
+  dp_rank=0 peak_memory_by_rank={'0': 4597875200}
+  dp_rank=1 peak_memory_by_rank={'1': 4596826624}
+== zero3_pf1 stages=4 2026-09-13T02:46:38-04:00
+rc=0 run=out/20260913_024639 per_stage_bytes=536870912
+  dp_rank=0 peak_memory_by_rank={'0': 9695527424}
+  dp_rank=1 peak_memory_by_rank={'1': 9762636288}
+== zero3_pf1 stages=8 2026-09-13T02:47:02-04:00
+rc=0 run=out/20260913_024703 per_stage_bytes=536870912
+  dp_rank=0 peak_memory_by_rank={'0': 20634272256}
+  dp_rank=1 peak_memory_by_rank={'1': 20500054528}
+== dp stages=2 2026-09-13T02:47:32-04:00
+rc=0 run=out/20260913_024734 per_stage_bytes=536870912
+  dp_rank=0 peak_memory_by_rank={'0': 5397418496}
+  dp_rank=1 peak_memory_by_rank={'1': 5397418496}
+== dp stages=4 2026-09-13T02:47:56-04:00
+rc=0 run=out/20260913_024757 per_stage_bytes=536870912
+  dp_rank=0 peak_memory_by_rank={'0': 10766131712}
+  dp_rank=1 peak_memory_by_rank={'1': 10766131712}
+== dp stages=8 2026-09-13T02:48:19-04:00
+rc=0 run=out/20260913_024820 per_stage_bytes=536870912
+  dp_rank=0 peak_memory_by_rank={'0': 21503558144}
+  dp_rank=1 peak_memory_by_rank={'1': 21503558144}
+done 2026-09-13T02:48:42-04:00

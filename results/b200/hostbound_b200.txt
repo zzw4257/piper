@@ -1,0 +1,14 @@
+=== start 2026-09-13T12:40:19-04:00 host=catalyst-fleet1.cs.cmu.edu ===
+cards=0,1,2,3
+  seq=1024 rc=0 piper_ms=11.08
+  seq=2048 rc=0 piper_ms=12.64
+  seq=4096 rc=0 piper_ms=32.04
+  seq=8192 rc=0 piper_ms=109.70
+piper_ms=11.08,12.64,32.04,109.70
+NVIDIA B200  dim=512 heads=8 steps=4 batch=8
+    seq  s_local  GPU math ms  rel work   Piper ms  GPU frac
+   1024      256         1.35      1.00      11.08     12.2%
+   2048      512         5.89      4.36      12.64     46.6%
+   4096     1024        24.01     17.76      32.04     75.0%
+   8192     2048        91.57     67.71     109.70     83.5%
+done 2026-09-13T12:42:50-04:00
