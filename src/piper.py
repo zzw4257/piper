@@ -245,6 +245,23 @@ def piper(gm, example_inputs, **kwargs):
     return callback
 
 
+def piper_flush_losses() -> list:
+    """Drain any losses the deferred-sync mode is still holding (log F60).
+
+    With PIPER_SYNC_MODE=defer a step hands its losses to the next one, so the
+    final step's are still on the device when the loop ends. Harmless to call in
+    any mode; returns [] unless something is pending.
+    """
+    actors = piper_metadata.actors
+    if not actors:
+        return []
+    out = []
+    for result in ray.get([a.flush_losses.remote() for a in actors.values()]):
+        if result:
+            out.extend(result)
+    return out
+
+
 def piper_exec_dag(loss_fn, log_stats: bool = False) -> list:
     """Execute one training step using the loaded per-rank TrainingDAG."""
     actors = piper_metadata.actors

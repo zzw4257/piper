@@ -793,6 +793,12 @@ class PiperActor:
     def reset_step_timestamps(self) -> None:
         self.step_timestamps = []
 
+    def flush_losses(self) -> list:
+        """Losses PIPER_SYNC_MODE=defer is still holding after the last step."""
+        from .executors import flush_pending_losses
+        ex = getattr(self, "dag_executor", None) or getattr(self, "executor", None)
+        return flush_pending_losses(ex) if ex is not None else []
+
     def run_dag(self, loss_fn=None):
         # Mark the entire iteration boundary for the NVTX timeline.
         iter_idx = getattr(self, "_iter_counter", 0)

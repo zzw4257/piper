@@ -3571,3 +3571,113 @@ flight. That is a change to `piper_exec_dag` and `_update` together, it changes
 the observable contract (losses lag by one step), and its benefit is between
 1.15x and 2.6x depending on the machine. Recorded as specified rather than
 built; the three numbers above are what a decision would need.
+
+## 2026-09-14 — F60: the host-side wait at the end of a step becomes a knob, `narrow` becomes the default, and `defer` is 1.25–1.38x
+
+### What was built
+
+`PIPER_SYNC_MODE`, three ways for the host to wait at the end of `_update`:
+
+* **device** — `torch.cuda.synchronize()`, upstream behaviour, kept so old
+  timings reproduce exactly;
+* **narrow** — wait only on the events that mark the loss values as ready.
+  The optimizer and the trailing collectives stay in flight and the host
+  returns early, so Ray's round trip and the next step's dispatch overlap this
+  step's GPU tail. **Nothing any caller observes changes.** Now the default.
+* **defer** — no host wait at all. The step records its completion as an event
+  the next step's streams queue behind, and hands its loss tensors to that step
+  to convert. Fastest and steadiest; losses lag one step, so a caller must call
+  `piper_flush_losses()` when its loop ends.
+
+F59 specified this as a change to `piper_exec_dag` *and* `_update`, with the
+driver keeping two steps in flight. That was over-specified: the driver needs no
+change at all. Once the actor stops blocking, `ray.get` returns early and the
+round trip overlaps the GPU on its own. The constraint was never "the host must
+not wait" but "the host must not wait on *the whole device*".
+
+### Coverage
+
+Every cell is losses compared across the three modes; the TP and CP cells also
+carry negative controls (removing the directive moves the loss by 1.103 and
+3.2e-03) and span optimizer steps, where a gradient counted wrong leaves
+iteration 0 correct and diverges from iteration 1.
+
+| configuration | B200 | H200 |
+|---|---|---|
+| TP=2 vs TP=1, 3 steps | 7.15e-07, all modes | 5.96e-07, all modes |
+| CP=2 vs dense, 3 steps | 1.729e-06, all modes | 1.729e-06, all modes |
+| CP=4, 5 steps | 1.293e-05, all modes | 1.292e-05, all modes |
+| TP x PP, four cards, 1f1b | 3.81e-05, all modes | 1.56e-04, all modes |
+| EP, shipped Qwen, pp2_dp2_ep2 | identical, all modes | identical, all modes |
+| ZeRO-3, three stages, shard_params | identical, all modes | identical, all modes |
+| out-of-band TP and CP math | unchanged | unchanged |
+| CPU suite | 82 passed | 82 passed |
+
+Two of those cells only exist because of holes found while testing, not by
+testing:
+
+* **ZeRO-3 bypassed the modes entirely.** `_update` returns inside the
+  `has_zero_shard_optimizers()` branch, *before* the sync-mode code, so ZeRO-3
+  kept the device-wide block whatever the variable said. Without reading that
+  branch the matrix would have shown "ZeRO-3: all modes agree" while ZeRO-3 had
+  never run a new path. Now that branch has the three modes too.
+* **`narrow` was unsafe on any rank that computes no loss** — every non-final PP
+  stage — because its wait is over the loss events and there are none. It would
+  have returned immediately and the next step's `clear_param_grads` would free
+  buffers the optimizer was still reading. The completion event and the
+  next-step stream waits now apply to `narrow` as well as `defer`, and the
+  TP x PP cell is there to prove it.
+
+And one hazard was fixed rather than documented: `clear_param_grads` now takes
+the in-flight streams and calls `record_stream` on each gradient before dropping
+the host's reference. Freeing returns a block to the pool of the stream it was
+allocated on, which is only safe to reuse *on that stream*; a reader on any
+other stream needs this, or the allocator can hand the block to a new kernel
+while the optimizer is still in it.
+
+### Timing, interleaved, four reps, both machines
+
+`final_sync` is the host's own block, measured directly:
+
+| | B200 (six of seven cards busy) | H200 (four cards idle) |
+|---|---|---|
+| device | 13.14 ms min, sync 9790–20461 us | 17.59 ms min, sync 2241–7431 us |
+| narrow | 10.10 ms min, sync **1441–6242 us** | 14.05 ms min, sync **11–254 us** |
+| defer | 10.24 ms min, sync **8–9 us** | 14.23 ms min, sync **11–12 us** |
+
+By median: device 15.9 / narrow 14.5 / defer **11.5** on B200; 1.38x. On H200
+the ordering holds at 1.25x. `defer` is also far steadier (10.2–12.9 against
+`narrow`'s 10.1–17.6).
+
+### A conclusion the second machine reversed
+
+Measured on H200 alone, `narrow` and `defer` were indistinguishable and the
+entry would have read "`defer` is over-engineering; `narrow` gets the whole
+benefit". B200 shows `narrow` still blocking 1441–6242 us: on a contended
+machine the loss is *not* ready when `_update` runs. The quiet machine hid the
+difference. Third time in this project that running on both machines reversed a
+conclusion (F47, F51, here).
+
+### The default, decided
+
+**`narrow`.** It is contract-identical to `device` — no lag, no flush, no change
+to any example — it is verified across six configurations on two machines with
+negative controls, and it is faster on both by median and by minimum.
+`PIPER_SYNC_MODE=device` restores the old behaviour byte for byte, and
+`defer` is there for callers who will take a one-step lag for another ~10% and a
+third of the variance.
+
+Choosing `device` as the default would have been the cautious call and it is not
+the better one: `narrow` differs from it only in *which* stream the host waits
+on, and every observable in the matrix above is identical.
+
+### What the EP cell does and does not prove
+
+It confirms the three modes agree on the shipped Qwen example, but its loss is
+bf16 and constant at 7.625 across all six iterations, so it would catch a gross
+corruption and not a 1e-3 one. It is the weakest cell in the matrix. Also: that
+example reported no loss at all until this entry — `_raw_metrics` carried time
+and memory only, and `piper_exec_dag`'s return value was discarded — so there
+was nothing to compare two EP runs against. F8's finding, still true in the one
+example this project had not touched. It now collects losses and writes
+`qwen_metrics_dp*.json` like the other two examples.

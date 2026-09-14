@@ -24,7 +24,7 @@ import ray
 import torch
 
 from src.compile import piper_setup
-from src.piper import piper_exec_dag
+from src.piper import piper_exec_dag, piper_flush_losses
 from src.state import LOG_LEVEL, create_logger, piper_metadata
 
 from models.ring_attn import RingAttn, global_weights
@@ -99,6 +99,11 @@ def main(args, pg):
     for _ in range(args.warmup):
         piper_exec_dag(loss_fn, log_stats=True)
 
+    # PIPER_SYNC_MODE=defer hands a step's losses to the next one, so warm-up
+    # would otherwise deliver its loss into the first timed step. Discard it;
+    # a no-op in the other modes.
+    piper_flush_losses()
+
     ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
     logger.info(f"Running {args.iters} timed iterations")
     iter_times, losses = [], []
@@ -107,6 +112,8 @@ def main(args, pg):
         step_losses = piper_exec_dag(loss_fn, log_stats=True)
         iter_times.append(time.perf_counter() - start)
         losses.extend(step_losses or [])
+
+    losses.extend(piper_flush_losses())
 
     peak_memory_stats = ray.get(
         [actor.get_and_reset_peak_memory_stats.remote() for actor in actors.values()]
