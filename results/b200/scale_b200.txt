@@ -1,0 +1,43 @@
+=== start 2026-09-14T09:05:25-04:00 host=catalyst-fleet1.cs.cmu.edu ===
+cards=0,1,2,3 load: 20,0,100,99,0,100,99
+-- seq=1024 batch=8 (s_local=256)
+   rep1 device drained=23.59ms per-iter-min=22.46ms sync=11760us
+   rep1 narrow drained=14.02ms per-iter-min=10.53ms sync=1472us
+   rep1 defer drained=17.28ms per-iter-min=10.36ms sync=7us
+   rep2 device drained=20.15ms per-iter-min=13.99ms sync=9524us
+   rep2 narrow drained=14.91ms per-iter-min=11.27ms sync=3003us
+   rep2 defer drained=17.27ms per-iter-min=10.32ms sync=7us
+   rep3 device drained=20.28ms per-iter-min=14.73ms sync=7957us
+   rep3 narrow drained=13.43ms per-iter-min=10.28ms sync=1367us
+   rep3 defer drained=14.61ms per-iter-min=10.35ms sync=7us
+-- seq=2048 batch=8 (s_local=512)
+   rep1 device drained=15.34ms per-iter-min=14.19ms sync=3791us
+   rep1 narrow drained=12.25ms per-iter-min=10.45ms sync=817us
+   rep1 defer drained=14.19ms per-iter-min=10.71ms sync=7us
+   rep2 device drained=17.42ms per-iter-min=14.20ms sync=5377us
+   rep2 narrow drained=17.18ms per-iter-min=11.97ms sync=3249us
+   rep2 defer drained=14.50ms per-iter-min=11.58ms sync=7us
+   rep3 device drained=16.27ms per-iter-min=14.36ms sync=4478us
+   rep3 narrow drained=14.79ms per-iter-min=12.66ms sync=1200us
+   rep3 defer drained=20.86ms per-iter-min=11.64ms sync=9us
+-- seq=4096 batch=4 (s_local=1024)
+   rep1 device drained=24.11ms per-iter-min=19.45ms sync=8255us
+   rep1 narrow drained=24.93ms per-iter-min=18.03ms sync=4658us
+   rep1 defer drained=20.27ms per-iter-min=11.66ms sync=8us
+   rep2 device drained=28.78ms per-iter-min=19.94ms sync=16022us
+   rep2 narrow drained=20.83ms per-iter-min=17.97ms sync=7984us
+   rep2 defer drained=21.10ms per-iter-min=11.61ms sync=6us
+   rep3 device drained=21.34ms per-iter-min=19.84ms sync=9876us
+   rep3 narrow drained=23.62ms per-iter-min=17.97ms sync=7983us
+   rep3 defer drained=18.75ms per-iter-min=13.01ms sync=8us
+-- seq=8192 batch=2 (s_local=2048)
+   rep1 device drained=34.00ms per-iter-min=32.50ms sync=19578us
+   rep1 narrow drained=40.23ms per-iter-min=30.22ms sync=8842us
+   rep1 defer drained=32.67ms per-iter-min=15.37ms sync=9us
+   rep2 device drained=36.62ms per-iter-min=32.61ms sync=23787us
+   rep2 narrow drained=37.43ms per-iter-min=31.10ms sync=17050us
+   rep2 defer drained=31.82ms per-iter-min=12.91ms sync=7us
+   rep3 device drained=34.43ms per-iter-min=32.56ms sync=21489us
+   rep3 narrow drained=35.14ms per-iter-min=30.25ms sync=18319us
+   rep3 defer drained=36.29ms per-iter-min=20.25ms sync=8us
+done 2026-09-14T09:22:44-04:00

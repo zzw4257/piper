@@ -1,0 +1,45 @@
+=== start 2026-09-14T00:14:54-04:00 host=catalyst-fleet1.cs.cmu.edu ===
+no cards
+=== start 2026-09-14T04:04:49-04:00 host=catalyst-fleet1.cs.cmu.edu ===
+cards=0,1,2,3 load: 0,100,100,100,0,100,100
+-- seq=1024 batch=8 (s_local=256)
+   rep1 device 15.44ms sync=12741us
+   rep1 narrow 18.40ms sync=8357us
+   rep1 defer 10.28ms sync=8us
+   rep2 device 13.02ms sync=9026us
+   rep2 narrow 11.76ms sync=5065us
+   rep2 defer 10.62ms sync=10us
+   rep3 device 13.63ms sync=1616us
+   rep3 narrow 11.44ms sync=4933us
+   rep3 defer 14.30ms sync=7us
+-- seq=2048 batch=8 (s_local=512)
+   rep1 device 14.20ms sync=3581us
+   rep1 narrow 13.42ms sync=5412us
+   rep1 defer 11.12ms sync=7us
+   rep2 device 14.07ms sync=6720us
+   rep2 narrow 11.97ms sync=3170us
+   rep2 defer 11.19ms sync=6us
+   rep3 device 14.07ms sync=5040us
+   rep3 narrow 11.38ms sync=3363us
+   rep3 defer 11.58ms sync=7us
+-- seq=4096 batch=4 (s_local=1024)
+   rep1 device 19.62ms sync=11455us
+   rep1 narrow 18.00ms sync=12399us
+   rep1 defer 13.06ms sync=12us
+   rep2 device 22.46ms sync=18058us
+   rep2 narrow 23.14ms sync=12621us
+   rep2 defer 12.23ms sync=7us
+   rep3 device 19.74ms sync=12923us
+   rep3 narrow 15.44ms sync=7208us
+   rep3 defer 11.91ms sync=7us
+-- seq=8192 batch=2 (s_local=2048)
+   rep1 device 32.75ms sync=20926us
+   rep1 narrow 28.55ms sync=15126us
+   rep1 defer 12.93ms sync=8us
+   rep2 device 32.43ms sync=20071us
+   rep2 narrow 28.55ms sync=16999us
+   rep2 defer 11.43ms sync=7us
+   rep3 device 32.20ms sync=21464us
+   rep3 narrow 31.02ms sync=19373us
+   rep3 defer 11.37ms sync=7us
+done 2026-09-14T04:21:46-04:00
