@@ -793,6 +793,38 @@ class PiperActor:
     def reset_step_timestamps(self) -> None:
         self.step_timestamps = []
 
+    def drain(self) -> None:
+        """Block until this rank's device is idle.
+
+        Needed to time a mode that does not block per step: without it the
+        clock stops while the GPU is still working (log F61).
+        """
+        torch.cuda.synchronize()
+
+    def param_checksum(self) -> dict:
+        """A fingerprint of this rank's trainable parameters, in fp64.
+
+        Loss is a weak equivalence test. The shipped EP example reports a bf16
+        loss on inputs drawn once and reused, which comes out 7.625 whatever
+        the model did, so two runs agreeing on it agree on nothing (log F61).
+        Parameters carry every gradient that has ever been applied, so one
+        misapplied gradient shows up here in the eighth digit.
+        """
+        total = sq = 0.0
+        n = 0
+        for bucket in self.stages.buckets.values():
+            args = getattr(bucket, "forward_args", None) or []
+            for idx in getattr(bucket, "trainable_param_idxs", None) or []:
+                p = args[idx] if idx < len(args) else None
+                if p is None:
+                    continue
+                d = p.detach().double()
+                total += float(d.sum())
+                sq += float((d * d).sum())
+                n += d.numel()
+        return {"rank": int(self.runtime.global_rank), "n_params": n,
+                "sum": total, "sumsq": sq}
+
     def flush_losses(self) -> list:
         """Losses PIPER_SYNC_MODE=defer is still holding after the last step."""
         from .executors import flush_pending_losses

@@ -7,7 +7,7 @@ import json
 import os
 
 from src.compile import piper_setup
-from src.piper import piper_exec_dag
+from src.piper import piper_exec_dag, piper_param_checksums
 from src.schedule import load_schedule_directives
 from src.state import piper_metadata, create_logger, LOG_LEVEL
 
@@ -104,11 +104,14 @@ def main(args, pg):
         if args.iteration_sleep > 0:
             time.sleep(args.iteration_sleep)
 
+    param_checksums = piper_param_checksums()
+
     peak_memory_stats = ray.get(
         [actor.get_and_reset_peak_memory_stats.remote() for actor in actors.values()]
     )
 
     metrics = _raw_metrics(args, iter_times, peak_memory_stats, losses)
+    metrics["param_checksums"] = param_checksums
     # Write a per-dp-rank artifact as the MLP and ring examples do. The harness
     # only summarizes into results.csv, so without this there is nothing to
     # compare two runs of the EP example against (log F8's point, still true).

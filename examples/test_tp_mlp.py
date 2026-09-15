@@ -23,7 +23,7 @@ import ray
 import torch
 
 from src.compile import piper_setup
-from src.piper import piper_exec_dag, piper_flush_losses
+from src.piper import piper_exec_dag, piper_flush_losses, piper_param_checksums
 from src.state import LOG_LEVEL, create_logger, piper_metadata
 
 from models.tp_mlp import TPMlp, global_weights, shard_weights
@@ -33,7 +33,7 @@ logger = create_logger("test_tp_mlp", LOG_LEVEL)
 _DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 
 
-def _raw_metrics(args, iter_times, losses, peak_memory_stats):
+def _raw_metrics(args, iter_times, losses, peak_memory_stats, total_timed_s=0.0):
     info = dict(getattr(piper_metadata, "schedule_info", {}) or {})
     return {
         "dp_rank": int(os.environ["PIPER_DP_RANK"]),
@@ -52,6 +52,8 @@ def _raw_metrics(args, iter_times, losses, peak_memory_stats):
         "stages": args.stages,
         "tp": args.tp,
         "iter_times_s": [float(t) for t in iter_times],
+        "total_timed_s": float(total_timed_s),
+        "timed_iters": int(len(iter_times)),
         "losses": [float(l) for l in losses],
         "peak_memory_by_rank": {
             int(rank): int(max_alloc) for rank, max_alloc in peak_memory_stats
@@ -120,6 +122,7 @@ def main(args, pg):
     ray.get([actor.reset_step_timestamps.remote() for actor in actors.values()])
     logger.info(f"Running {args.iters} timed iterations")
     iter_times, losses = [], []
+    timed_start = time.perf_counter()
     for _ in range(args.iters):
         start = time.perf_counter()
         step_losses = piper_exec_dag(loss_fn, log_stats=True)
@@ -127,6 +130,12 @@ def main(args, pg):
         losses.extend(step_losses or [])
 
     losses.extend(piper_flush_losses())
+    # Drain the device before stopping the clock: a mode that lets the host run
+    # ahead would otherwise report a per-iteration time smaller than the work.
+    ray.get([actor.drain.remote() for actor in actors.values()])
+    total_timed_s = time.perf_counter() - timed_start
+
+    param_checksums = piper_param_checksums()
 
     peak_memory_stats = ray.get(
         [actor.get_and_reset_peak_memory_stats.remote() for actor in actors.values()]
@@ -134,7 +143,8 @@ def main(args, pg):
     step_timestamps = ray.get(
         [actor.get_step_timestamps.remote() for actor in actors.values()]
     )
-    metrics = _raw_metrics(args, iter_times, losses, peak_memory_stats)
+    metrics = _raw_metrics(args, iter_times, losses, peak_memory_stats, total_timed_s)
+    metrics["param_checksums"] = param_checksums
     # Wall-clock, so samples from other driver processes line up: TP peers live
     # in different processes (one per dp_rank), so skew can only be seen by
     # joining these across the per-dp_rank artifacts.
