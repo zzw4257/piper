@@ -1,0 +1,27 @@
+=== start 2026-09-15T12:16:17-04:00 host=catalyst-fleet1.cs.cmu.edu cards=3,4,5,6 ===
+load: 0, 62,1, 100,3, 0,4, 0,5, 0,6, 0
+-- order (1f1b vs gpipe) : pp2_tp2_mb4_1f1b  vs  pp2_tp2_mb4_gpipe  (4卡)
+   rep1  pp2_tp2_mb4_1f1b=NAms  pp2_tp2_mb4_gpipe=NAms
+   rep2  pp2_tp2_mb4_1f1b=NAms  pp2_tp2_mb4_gpipe=NAms
+   rep3  pp2_tp2_mb4_1f1b=NAms  pp2_tp2_mb4_gpipe=NAms
+   rep4  pp2_tp2_mb4_1f1b=NAms  pp2_tp2_mb4_gpipe=NAms
+   rep5  pp2_tp2_mb4_1f1b=NAms  pp2_tp2_mb4_gpipe=NAms
+-- fusion under 1f1b : pp2_tp2_mb4_1f1b  vs  pp2_tp2_mb4_1f1b_fused  (4卡)
+   rep1  pp2_tp2_mb4_1f1b=NAms  pp2_tp2_mb4_1f1b_fused=NAms
+   rep2  pp2_tp2_mb4_1f1b=NAms  pp2_tp2_mb4_1f1b_fused=NAms
+   rep3  pp2_tp2_mb4_1f1b=NAms  pp2_tp2_mb4_1f1b_fused=NAms
+   rep4  pp2_tp2_mb4_1f1b=NAms  pp2_tp2_mb4_1f1b_fused=NAms
+   rep5  pp2_tp2_mb4_1f1b=NAms  pp2_tp2_mb4_1f1b_fused=NAms
+-- fusion single-stage : s2_tp2_mb4  vs  tp2_mb4_fused  (2卡)
+   rep1  s2_tp2_mb4=NAms  tp2_mb4_fused=NAms
+   rep2  s2_tp2_mb4=NAms  tp2_mb4_fused=NAms
+   rep3  s2_tp2_mb4=NAms  tp2_mb4_fused=NAms
+   rep4  s2_tp2_mb4=NAms  tp2_mb4_fused=NAms
+   rep5  s2_tp2_mb4=NAms  tp2_mb4_fused=NAms
+-- microbatch sweep (固定总工作量)
+   rep1  s2_tp2_mb1=NAms  s2_tp2_mb2=NAms  s2_tp2_mb4=NAms  s2_tp2_mb8=NAms
+   rep2  s2_tp2_mb1=NAms  s2_tp2_mb2=NAms  s2_tp2_mb4=NAms  s2_tp2_mb8=NAms
+   rep3  s2_tp2_mb1=NAms  s2_tp2_mb2=NAms  s2_tp2_mb4=NAms  s2_tp2_mb8=NAms
+   rep4  s2_tp2_mb1=NAms  s2_tp2_mb2=NAms  s2_tp2_mb4=NAms  s2_tp2_mb8=NAms
+   rep5  s2_tp2_mb1=NAms  s2_tp2_mb2=NAms  s2_tp2_mb4=NAms  s2_tp2_mb8=NAms
+done 2026-09-15T12:32:00-04:00

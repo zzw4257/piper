@@ -3753,3 +3753,53 @@ in there — and all three examples record it.
 
 `logs/scale_b200_BOGUS_per_iter.txt` keeps the wrong run rather than deleting
 it, per the project's rule on retractions.
+
+## 2026-09-15 — F62: the canonical machine's CUDA runtime failed, and idle utilization was the wrong signal for it
+
+### What happened
+
+`nvidia-smi` on catalyst-fleet1 showed four cards at 0% with 178\,GB free each —
+the quiet window this project had waited for since F36, where a strict
+whole-machine-quiet waiter ran eleven hours without firing. A clean re-validation
+of the paper's headline directive numbers was launched into it and every run
+returned `NA`.
+
+The cause is one line of `nvidia-smi` output that was scrolled past:
+
+    Unable to determine the device handle for GPU2: 0000:52:00.0: Unknown Error
+
+With that device in a bad state the whole CUDA runtime is unusable on the host:
+
+    CUDA_VISIBLE_DEVICES=3,4,5,6 → torch.cuda.device_count() == 0
+    CUDA_VISIBLE_DEVICES=0,1     → 0
+    by UUID, skipping GPU2       → 0
+    CUDA_DEVICE_ORDER=PCI_BUS_ID → 0
+
+`_join_process_groups` then divides by `device_count` and raises
+`ZeroDivisionError`, which is how it surfaced. Recovering needs a driver reset
+and root, which this project does not have.
+
+**The cards were idle because nobody could use them.** Utilization was not just
+a weak signal here, it was an inverted one.
+
+### The check that should have been made, and now is
+
+Availability is `torch.cuda.device_count() > 0`, not `utilization == 0`. Every
+gate script in `experiments/` polls utilization and free memory; on this host,
+in this state, all of them would report a perfect window forever. A one-line
+CUDA probe in the gate would have failed in two seconds instead of producing
+twenty `NA` rows over sixteen minutes.
+
+### Consequence for the project
+
+The B200 half of the two-machine method (F47, F51, F60) is unavailable until
+someone resets that host. Everything it produced is preserved: `results/b200/`
+holds the raw measurements, and the repository is byte-identical on the H200
+host, which is healthy (`device_count == 8`). Work continues there.
+
+What is lost is the specific thing the window was for: the paper's directive
+numbers — `order` worth 16% under PP=2, fusion 12–19% on a single stage,
+`stream` 1.06x at four microbatches — were all measured under contention, and
+re-validating them on a quiet machine is still owed. H200 does not currently
+have four quiet cards either. The claim stands as originally measured, with the
+contention noted in the paper, and the re-validation stays open.
