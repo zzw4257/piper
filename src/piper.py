@@ -245,6 +245,19 @@ def piper(gm, example_inputs, **kwargs):
     return callback
 
 
+def piper_param_checksums() -> list:
+    """Per-rank fp64 parameter fingerprints (log F61).
+
+    More discriminating than the loss when comparing two runs: every applied
+    gradient is in here, whereas a bf16 loss on a fixed input can be identical
+    for runs that computed different things.
+    """
+    actors = piper_metadata.actors
+    if not actors:
+        return []
+    return [r for r in ray.get([a.param_checksum.remote() for a in actors.values()]) if r]
+
+
 def piper_flush_losses() -> list:
     """Drain any losses the deferred-sync mode is still holding (log F60).
 
