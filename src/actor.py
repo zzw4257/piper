@@ -812,16 +812,33 @@ class PiperActor:
         """
         total = sq = 0.0
         n = 0
+
+        def _accumulate(t):
+            nonlocal total, sq, n
+            if t is None:
+                return False
+            # ZeRO-3 frees a full parameter by resizing its storage to zero
+            # (log F43); the tensor keeps its shape, so reading it would be an
+            # illegal access. Storage size is the only safe thing to ask.
+            try:
+                if t.untyped_storage().size() == 0:
+                    return False
+            except Exception:
+                return False
+            d = t.detach().double()
+            total += float(d.sum())
+            sq += float((d * d).sum())
+            n += d.numel()
+            return True
+
         for bucket in self.stages.buckets.values():
+            # Under ZeRO-3 the shard is what persists between steps and is what
+            # the optimizer updates; the full parameter is transient.
+            if _accumulate(getattr(bucket, "shard_param", None)):
+                continue
             args = getattr(bucket, "forward_args", None) or []
             for idx in getattr(bucket, "trainable_param_idxs", None) or []:
-                p = args[idx] if idx < len(args) else None
-                if p is None:
-                    continue
-                d = p.detach().double()
-                total += float(d.sum())
-                sq += float((d * d).sum())
-                n += d.numel()
+                _accumulate(args[idx] if idx < len(args) else None)
         return {"rank": int(self.runtime.global_rank), "n_params": n,
                 "sum": total, "sumsq": sq}
 
