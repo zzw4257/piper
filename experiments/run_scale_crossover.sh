@@ -8,7 +8,8 @@ R=$1; V=$2; T=$3; TAG=$4; REPS=${5:-3}
 export PATH=$V:$PATH; cd $R; mkdir -p logs
 OUT=logs/scale_${TAG}.txt
 echo "=== start $(date -Is) host=$(hostname) ===" >> $OUT
-pick() { local ok=""; for s in 1 2 3; do
+cuda_ok() { python -c 'import torch,sys; sys.exit(0 if torch.cuda.device_count()>0 else 1)' >/dev/null 2>&1; }
+pick() { cuda_ok || return 1; local ok=""; for s in 1 2 3; do
   ok=$(nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader,nounits \
        | awk -F', ' '($3-$2)/1024>25 {print $1}' | head -4 | paste -sd,)
   [ "$(echo $ok | tr ',' '\n' | grep -c .)" -lt 4 ] && return 1; sleep 15; done; echo "$ok"; }
