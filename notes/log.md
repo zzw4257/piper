@@ -3681,3 +3681,75 @@ and memory only, and `piper_exec_dag`'s return value was discarded — so there
 was nothing to compare two EP runs against. F8's finding, still true in the one
 example this project had not touched. It now collects losses and writes
 `qwen_metrics_dp*.json` like the other two examples.
+
+## 2026-09-15 — F61: the sync-mode win shrinks with scale, not grows — the 2.83x was a clock that stopped before the GPU did
+
+### The wrong number, and how it was made
+
+The scale sweep first reported `defer` beating `device` by 1.27x, 1.65x and
+**2.83x** as the model grew, i.e. the benefit *growing* with problem size. The
+opposite was predicted (a bigger model is GPU-bound, so a host-side wait should
+matter less), and the prediction was right.
+
+`defer` is defined by the host not waiting for the device. So
+`piper_exec_dag` returns while the GPU is still working, the per-iteration timer
+stops early, and `min(iter_times_s)` selects whichever iteration the host ran
+furthest ahead on. The same run's own numbers give it away: at seq=8192 `defer`
+reported 12.91 ms per iteration while the whole timed loop, drained, took
+31.82 ms per iteration — the host was about 2.5 steps ahead.
+
+Fixed by measuring the wall time of the entire timed loop with
+`torch.cuda.synchronize()` on every rank at the end (`actor.drain()`,
+`total_timed_s`). That metric is fair to all three modes because it contains
+the GPU tail.
+
+### The honest curve
+
+Drained wall time per iteration, minimum of three interleaved reps, four B200s:
+
+| seq (s_local) | device | narrow | defer | best vs device |
+|---|---|---|---|---|
+| 1024 (256) | 20.15 ms | **13.43** | 14.61 | 1.50x |
+| 2048 (512) | 15.34 | **12.25** | 14.19 | 1.25x |
+| 4096 (1024) | 21.34 | 20.83 | **18.75** | 1.14x |
+| 8192 (2048) | 34.00 | 35.14 | **31.82** | 1.07x |
+
+The win falls from 1.50x to 1.07x as the step becomes GPU-bound, which is what
+F50's criterion says it must: a knob that removes host-side waiting is worth
+`waiting / iteration`, and that ratio collapses as the arithmetic grows. The
+host block itself (`final_sync`) behaves as designed at every size — 8–24 ms for
+`device`, 0.8–18 ms for `narrow`, and 6–9 **us** for `defer` throughout.
+
+`narrow` wins at the small end and `defer` at the large end, which follows from
+the same mechanism: `narrow` waits for the loss, and the bigger the model the
+later the loss is ready.
+
+### What this changes about F60's claim
+
+F60 reported 1.25x on a quiet machine and 1.38x on a loaded one, both at
+s_local=256 — the host-bound end of this curve. That is where the number came
+from, and it should be quoted with its condition. The defensible statement is:
+**the sync mode is worth up to 1.5x while the step is host-bound and about 1.07x
+once it is not.** The default (`narrow`) is unaffected: it is contract-identical
+and never slower than `device` by more than noise at any size measured.
+
+### Why this is the same failure this project keeps finding
+
+An instrument that reports a number for a configuration it cannot actually
+measure. Piper's shipped examples reported throughput and memory while training
+on zero inputs (F9) because nothing they printed depended on the arithmetic. A
+per-iteration timer reports a time for a mode whose defining property is that
+the iteration is not over when the timer stops. In both cases the output is
+well-formed, plausible, and about something other than what it claims.
+
+Two instruments were added rather than one, because the same audit found the
+other: the EP cell of F60's matrix compared a **bf16 loss on inputs drawn once
+and reused**, which is 7.625 whatever the model computed. Three modes agreeing
+on it agreed on nothing. `actor.param_checksum()` now returns an fp64 sum and
+sum-of-squares over every trainable parameter — every gradient ever applied is
+in there — and all three examples record it.
+
+### Retained
+
+`logs/scale_b200_BOGUS_per_iter.txt` keeps the wrong run rather than deleting
+it, per the project's rule on retractions.
