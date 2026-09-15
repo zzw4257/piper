@@ -9,6 +9,10 @@ R=$1; V=$2; T=$3; TAG=$4; CARDS=$5; REPS=${6:-5}
 export PATH=$V:$PATH; cd $R; mkdir -p logs
 OUT=logs/cleanperf_${TAG}.txt
 echo "=== start $(date -Is) host=$(hostname) cards=$CARDS ===" >> $OUT
+# F62: a host whose CUDA runtime has failed shows every card idle. Availability
+# is device_count > 0; refuse rather than produce a page of NA.
+python -c 'import torch,sys; sys.exit(0 if torch.cuda.device_count()>0 else 1)' 2>/dev/null \
+  || { echo "CUDA runtime unavailable on this host (F62); refusing" | tee -a $OUT; exit 1; }
 echo "load: $(nvidia-smi --query-gpu=index,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | paste -sd,)" >> $OUT
 
 run() {  # run <schedule> <n_cards> <extra...>

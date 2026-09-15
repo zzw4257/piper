@@ -4,7 +4,8 @@ R=$1; V=$2; TAG=$3
 export PATH=$V:$PATH; cd $R; mkdir -p logs
 OUT=logs/xfer_${TAG}.txt
 echo "=== start $(date -Is) host=$(hostname) ===" >> $OUT
-pick() { local ok=""; for s in 1 2 3; do
+cuda_ok() { python -c 'import torch,sys; sys.exit(0 if torch.cuda.device_count()>0 else 1)' >/dev/null 2>&1; }
+pick() { cuda_ok || return 1; local ok=""; for s in 1 2 3; do
   ok=$(nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits \
        | awk -F', ' '$2<20 && ($4-$3)/1024>6 {print $1}' | head -4 | paste -sd,)
   [ "$(echo $ok | tr ',' '\n' | grep -c .)" -lt 4 ] && return 1; sleep 20; done; echo "$ok"; }

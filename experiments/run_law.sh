@@ -7,7 +7,8 @@ export PATH=$V:$PATH
 cd $R; mkdir -p logs
 OUT=logs/law_${TAG}.txt
 echo "=== start $(date -Is) host=$(hostname) ===" >> $OUT
-pick() { local n=$1 ok=""
+cuda_ok() { python -c 'import torch,sys; sys.exit(0 if torch.cuda.device_count()>0 else 1)' >/dev/null 2>&1; }
+pick() { cuda_ok || return 1; local n=$1 ok=""
   for s in 1 2 3; do
     ok=$(nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits \
          | awk -F', ' '$2<20 && ($4-$3)/1024>6 {print $1}' | head -$n | paste -sd,)
