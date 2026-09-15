@@ -53,8 +53,12 @@ def main(args, pg):
         or _derive_num_stages(args.schedule_directives_file)
     )
 
-    x = torch.randint(0, config.vocab_size, (batch_size, args.seq_len))
-    y = torch.randint(0, config.vocab_size, (batch_size, args.seq_len))
+    # Seeded so two runs of the same configuration see the same data. Without
+    # this the example's own outputs are incomparable between runs, which is
+    # what made the EP cell of F60's matrix vacuous (log F61).
+    _g = torch.Generator().manual_seed(getattr(args, "seed", 1234))
+    x = torch.randint(0, config.vocab_size, (batch_size, args.seq_len), generator=_g)
+    y = torch.randint(0, config.vocab_size, (batch_size, args.seq_len), generator=_g)
 
     _ce = torch.nn.CrossEntropyLoss()
     loss_fn = lambda output, labels: _ce(output.view(-1, output.size(-1)), labels.view(-1))
