@@ -3873,6 +3873,42 @@ of four measurement combinations, and the published 16% for 1F1B does not
 reproduce. What is not yet solid: the exact magnitude. A waiter is queued to
 rerun on four idle cards if a window opens.
 
+### Confirmation, 2026-09-16: six independent comparisons, GPipe never slower
+
+The magnitude F63 left open is still open; the direction is not. Across two
+clean-window sessions on different card sets, two sync modes and both metrics:
+
+| session | cards | mode / metric | 1F1B | GPipe |
+|---|---|---|---|---|
+| revalidation 1 | 0,1,2,4 | drained | 13.33 | **11.44** |
+| isolation 1 | 0,1,2,4 | device, drained | 14.56 | **12.37** |
+| isolation 1 | 0,1,2,4 | narrow, drained | 12.71 | **12.58** |
+| isolation 2 | 0,1,2,3 | device, drained | 11.23 | **10.45** |
+| isolation 2 | 0,1,2,3 | narrow, drained | 12.17 | **10.23** |
+| revalidation 2 | 0,1,2,3 | drained | 10.95 | **10.80** |
+
+GPipe is not slower in any of the six, by 1.4% to 19%. Read by the metric the
+original claim used — the minimum per-iteration time — the same holds: 9.58
+against 8.32 under `device`, 10.50 against 8.52 under `narrow`.
+
+**The published 16% for 1F1B did not reproduce in any measurement taken on this
+machine over two days.** What remains undetermined is how much faster GPipe is:
+the within-arm spread is 11.2–22.3 ms, and in every session another tenant
+appeared on one of the four cards partway through. The direction is supported by
+six comparisons; the magnitude by none of them individually.
+
+The other three claims, from the same two sessions:
+
+| claim as published | session 1 | session 2 | verdict |
+|---|---|---|---|
+| fusion under 1F1B: indistinguishable | 13.01 vs 12.93 | 14.56 vs 14.45 | confirmed twice |
+| fusion single-stage: 12–19% | 13.7% | 28% | direction confirmed, magnitude wider |
+| microbatch 1→8: 2.6x worse | 3.8x | 4.6x | direction confirmed, magnitude larger |
+
+So of four published numbers: one confirmed exactly, two confirmed in direction
+with larger magnitudes, and one that does not reproduce and whose sign is
+reversed in every measurement.
+
 ## 2026-09-16 — F64: the selection prototype ranks correctly once it carries the terms this project measured
 
 ### What changed

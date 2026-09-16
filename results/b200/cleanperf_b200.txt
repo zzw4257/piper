@@ -1,27 +1,27 @@
-=== start 2026-09-15T23:50:43-04:00 host=catalyst-fleet1.cs.cmu.edu cards=0,1,2,4 ===
-load: 0,0,0,20,0,0
+=== start 2026-09-16T03:24:16-04:00 host=catalyst-fleet1.cs.cmu.edu cards=0,1,2,3 ===
+load: 0,0,0,91,0,99
 -- order 1f1b vs gpipe : pp2_tp2_mb4_1f1b vs pp2_tp2_mb4_gpipe (4卡 stages=2 tp=2)
-   rep1  pp2_tp2_mb4_1f1b=13.39ms  pp2_tp2_mb4_gpipe=12.39ms
-   rep2  pp2_tp2_mb4_1f1b=14.10ms  pp2_tp2_mb4_gpipe=11.98ms
-   rep3  pp2_tp2_mb4_1f1b=13.33ms  pp2_tp2_mb4_gpipe=11.44ms
-   rep4  pp2_tp2_mb4_1f1b=14.77ms  pp2_tp2_mb4_gpipe=15.36ms
-   rep5  pp2_tp2_mb4_1f1b=13.47ms  pp2_tp2_mb4_gpipe=11.57ms
+   rep1  pp2_tp2_mb4_1f1b=14.82ms  pp2_tp2_mb4_gpipe=10.80ms
+   rep2  pp2_tp2_mb4_1f1b=23.90ms  pp2_tp2_mb4_gpipe=16.19ms
+   rep3  pp2_tp2_mb4_1f1b=10.95ms  pp2_tp2_mb4_gpipe=13.69ms
+   rep4  pp2_tp2_mb4_1f1b=18.99ms  pp2_tp2_mb4_gpipe=12.59ms
+   rep5  pp2_tp2_mb4_1f1b=14.32ms  pp2_tp2_mb4_gpipe=12.15ms
 -- fusion under 1f1b : pp2_tp2_mb4_1f1b vs pp2_tp2_mb4_1f1b_fused (4卡 stages=2 tp=2)
-   rep1  pp2_tp2_mb4_1f1b=14.40ms  pp2_tp2_mb4_1f1b_fused=13.20ms
-   rep2  pp2_tp2_mb4_1f1b=13.01ms  pp2_tp2_mb4_1f1b_fused=14.16ms
-   rep3  pp2_tp2_mb4_1f1b=13.52ms  pp2_tp2_mb4_1f1b_fused=13.35ms
-   rep4  pp2_tp2_mb4_1f1b=14.43ms  pp2_tp2_mb4_1f1b_fused=12.93ms
-   rep5  pp2_tp2_mb4_1f1b=13.03ms  pp2_tp2_mb4_1f1b_fused=13.16ms
+   rep1  pp2_tp2_mb4_1f1b=15.83ms  pp2_tp2_mb4_1f1b_fused=15.00ms
+   rep2  pp2_tp2_mb4_1f1b=15.52ms  pp2_tp2_mb4_1f1b_fused=15.77ms
+   rep3  pp2_tp2_mb4_1f1b=15.63ms  pp2_tp2_mb4_1f1b_fused=17.86ms
+   rep4  pp2_tp2_mb4_1f1b=14.56ms  pp2_tp2_mb4_1f1b_fused=17.62ms
+   rep5  pp2_tp2_mb4_1f1b=15.38ms  pp2_tp2_mb4_1f1b_fused=14.45ms
 -- fusion single-stage : tp2_mb4 vs tp2_mb4_fused (2卡 stages=1 tp=2)
-   rep1  tp2_mb4=11.46ms  tp2_mb4_fused=8.71ms
-   rep2  tp2_mb4=12.30ms  tp2_mb4_fused=11.00ms
-   rep3  tp2_mb4=9.19ms  tp2_mb4_fused=10.01ms
-   rep4  tp2_mb4=10.12ms  tp2_mb4_fused=8.08ms
-   rep5  tp2_mb4=10.98ms  tp2_mb4_fused=10.29ms
+   rep1  tp2_mb4=14.52ms  tp2_mb4_fused=8.83ms
+   rep2  tp2_mb4=16.35ms  tp2_mb4_fused=12.95ms
+   rep3  tp2_mb4=10.62ms  tp2_mb4_fused=12.75ms
+   rep4  tp2_mb4=12.52ms  tp2_mb4_fused=7.67ms
+   rep5  tp2_mb4=10.91ms  tp2_mb4_fused=11.68ms
 -- microbatch sweep, 固定总工作量 (2卡 stages=2 tp=2)
-   rep1  mb1=7.45ms  mb2=21.56ms  mb4=14.72ms  mb8=30.17ms
-   rep2  mb1=7.49ms  mb2=10.64ms  mb4=19.12ms  mb8=28.34ms
-   rep3  mb1=8.33ms  mb2=11.88ms  mb4=23.57ms  mb8=33.96ms
-   rep4  mb1=7.84ms  mb2=9.80ms  mb4=18.09ms  mb8=30.80ms
-   rep5  mb1=7.79ms  mb2=10.86ms  mb4=21.21ms  mb8=36.10ms
-done 2026-09-16T00:07:53-04:00
+   rep1  mb1=8.17ms  mb2=17.47ms  mb4=23.81ms  mb8=41.97ms
+   rep2  mb1=11.51ms  mb2=16.53ms  mb4=23.19ms  mb8=31.04ms
+   rep3  mb1=8.08ms  mb2=9.77ms  mb4=16.64ms  mb8=43.66ms
+   rep4  mb1=6.30ms  mb2=10.35ms  mb4=18.21ms  mb8=28.96ms
+   rep5  mb1=8.60ms  mb2=8.53ms  mb4=15.29ms  mb8=36.24ms
+done 2026-09-16T03:44:51-04:00

@@ -1,0 +1,16 @@
+=== start 2026-09-16T03:13:19-04:00 cards=0,1,2,3 load=100,0,0,0,0,0 ===
+-- sync=device  (drained/per-iter-min)
+   rep1 1f1b=14.50/11.19  gpipe=12.97/9.98
+   rep2 1f1b=16.01/14.01  gpipe=13.40/10.49
+   rep3 1f1b=13.48/10.07  gpipe=14.87/12.29
+   rep4 1f1b=20.24/15.70  gpipe=13.04/10.05
+   rep5 1f1b=11.23/9.58  gpipe=13.73/11.93
+   rep6 1f1b=16.07/14.87  gpipe=10.45/8.32
+-- sync=narrow  (drained/per-iter-min)
+   rep1 1f1b=14.24/10.97  gpipe=11.82/8.63
+   rep2 1f1b=12.17/10.50  gpipe=10.34/8.91
+   rep3 1f1b=22.29/18.29  gpipe=12.01/10.59
+   rep4 1f1b=13.46/11.38  gpipe=10.23/9.51
+   rep5 1f1b=14.62/13.02  gpipe=10.32/8.52
+   rep6 1f1b=12.57/10.98  gpipe=14.23/11.02
+done 2026-09-16T03:24:14-04:00
