@@ -3803,3 +3803,72 @@ numbers — `order` worth 16% under PP=2, fusion 12–19% on a single stage,
 re-validating them on a quiet machine is still owed. H200 does not currently
 have four quiet cards either. The claim stands as originally measured, with the
 contention noted in the paper, and the re-validation stays open.
+
+## 2026-09-16 — F63: on a quiet machine the `order` claim does not reproduce, and its sign reverses
+
+### Tested
+
+The paper's four directive numbers, re-measured on catalyst-fleet1 during the
+first genuinely idle window this project has seen (F36 recorded a strict waiter
+running eleven hours without firing; F62 recorded a false window caused by a
+dead CUDA runtime). Drained clock (F61), arms interleaved, five reps, minimum
+per arm.
+
+| claim as published | re-measured | verdict |
+|---|---|---|
+| `order`: 1F1B beats GPipe by **16%** (PP=2) | GPipe 11.44\,ms vs 1F1B 13.33 — **GPipe faster by 16.5%** | **reversed** |
+| fusion under 1F1B: indistinguishable | 12.93 vs 13.01 | confirmed |
+| fusion on a single stage: 12–19% | 8.08 vs 9.19 — 13.7% | confirmed |
+| microbatch 1→8 at fixed work: 2.6x worse | 7.45 → 28.34 — 3.8x | same direction, larger |
+
+### Ruling out our own change
+
+Three things differed from the original measurement: the machine's load, the
+drained clock, and this project's own change of the default host-sync mode
+(F60). The last is the one that would invalidate the comparison, so the
+`order` pair was rerun under both sync modes and read by both metrics:
+
+| | 1F1B | GPipe |
+|---|---|---|
+| `sync=device` (upstream), drained | 14.56\,ms | **12.37** |
+| `sync=device`, per-iteration min (the original metric) | 11.57 | **10.28** |
+| `sync=narrow` (new default), drained | 12.71 | **12.58** |
+| `sync=narrow`, per-iteration min | 10.28 | **9.64** |
+
+GPipe is never slower in any of the four combinations. **The reversal is not
+ours.**
+
+### Mechanism, and why it makes the paper's thesis sharper rather than weaker
+
+1F1B exists to fill pipeline bubbles. F50 established that at this model size
+the iteration is host-dispatch-bound — the GPU finishes what it is given and
+waits — so there are no GPU bubbles to fill, and 1F1B's extra ordering
+constraints are pure additional host work. Contention on the original
+measurement's machine would have slowed the GPU relative to the host, moving
+the step toward GPU-bound, which is the regime where 1F1B's bubble-filling
+pays.
+
+So the published claim and this one are both true, of different machines. The
+paper argues that a directive's value depends on the structure of the schedule;
+this says the same directive, in the same schedule, on the same code, **changes
+sign with how busy the machine is**. That is a stronger statement of the same
+thesis and an uncomfortable one for any static search over schedules: the
+quantity being optimised is not a property of the program.
+
+### What this does to the auto-TP conclusion
+
+The project's limitation section says automatic TP selection must model the
+runtime rather than the hardware, and F48 refined the reason: cost is
+`a + b·bytes + skew`, with the skew term belonging to the runtime. F63 adds the
+term that is not even that: **the sign of a directive's benefit depends on
+contention from other tenants**, which no model of this program can see. A
+search run on an idle machine would pick GPipe here and be wrong on a busy one.
+
+### Confidence, stated
+
+The window closed before a confirmation run on four *fully* idle cards — one of
+the four cards in the reported run was at 100% from another tenant, and the
+spread within an arm is 12.4–18.0\,ms. What is solid: GPipe is not slower in any
+of four measurement combinations, and the published 16% for 1F1B does not
+reproduce. What is not yet solid: the exact magnitude. A waiter is queued to
+rerun on four idle cards if a window opens.

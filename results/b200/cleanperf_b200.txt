@@ -1,0 +1,27 @@
+=== start 2026-09-15T23:50:43-04:00 host=catalyst-fleet1.cs.cmu.edu cards=0,1,2,4 ===
+load: 0,0,0,20,0,0
+-- order 1f1b vs gpipe : pp2_tp2_mb4_1f1b vs pp2_tp2_mb4_gpipe (4卡 stages=2 tp=2)
+   rep1  pp2_tp2_mb4_1f1b=13.39ms  pp2_tp2_mb4_gpipe=12.39ms
+   rep2  pp2_tp2_mb4_1f1b=14.10ms  pp2_tp2_mb4_gpipe=11.98ms
+   rep3  pp2_tp2_mb4_1f1b=13.33ms  pp2_tp2_mb4_gpipe=11.44ms
+   rep4  pp2_tp2_mb4_1f1b=14.77ms  pp2_tp2_mb4_gpipe=15.36ms
+   rep5  pp2_tp2_mb4_1f1b=13.47ms  pp2_tp2_mb4_gpipe=11.57ms
+-- fusion under 1f1b : pp2_tp2_mb4_1f1b vs pp2_tp2_mb4_1f1b_fused (4卡 stages=2 tp=2)
+   rep1  pp2_tp2_mb4_1f1b=14.40ms  pp2_tp2_mb4_1f1b_fused=13.20ms
+   rep2  pp2_tp2_mb4_1f1b=13.01ms  pp2_tp2_mb4_1f1b_fused=14.16ms
+   rep3  pp2_tp2_mb4_1f1b=13.52ms  pp2_tp2_mb4_1f1b_fused=13.35ms
+   rep4  pp2_tp2_mb4_1f1b=14.43ms  pp2_tp2_mb4_1f1b_fused=12.93ms
+   rep5  pp2_tp2_mb4_1f1b=13.03ms  pp2_tp2_mb4_1f1b_fused=13.16ms
+-- fusion single-stage : tp2_mb4 vs tp2_mb4_fused (2卡 stages=1 tp=2)
+   rep1  tp2_mb4=11.46ms  tp2_mb4_fused=8.71ms
+   rep2  tp2_mb4=12.30ms  tp2_mb4_fused=11.00ms
+   rep3  tp2_mb4=9.19ms  tp2_mb4_fused=10.01ms
+   rep4  tp2_mb4=10.12ms  tp2_mb4_fused=8.08ms
+   rep5  tp2_mb4=10.98ms  tp2_mb4_fused=10.29ms
+-- microbatch sweep, 固定总工作量 (2卡 stages=2 tp=2)
+   rep1  mb1=7.45ms  mb2=21.56ms  mb4=14.72ms  mb8=30.17ms
+   rep2  mb1=7.49ms  mb2=10.64ms  mb4=19.12ms  mb8=28.34ms
+   rep3  mb1=8.33ms  mb2=11.88ms  mb4=23.57ms  mb8=33.96ms
+   rep4  mb1=7.84ms  mb2=9.80ms  mb4=18.09ms  mb8=30.80ms
+   rep5  mb1=7.79ms  mb2=10.86ms  mb4=21.21ms  mb8=36.10ms
+done 2026-09-16T00:07:53-04:00
