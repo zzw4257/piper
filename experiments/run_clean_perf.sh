@@ -30,7 +30,7 @@ PY
 
 pair() {  # pair <label> <A> <B> <n> <stages> <tp>
   local L=$1 A=$2 B=$3 N=$4 ST=$5 TP=$6
-  echo "-- $L : $A vs $B (${N}卡 stages=$ST tp=$TP)" >> $OUT
+  echo "-- $L : $A vs $B (${N} cards, stages=$ST tp=$TP)" >> $OUT
   for i in $(seq 1 $REPS); do
     a=$(run $A $N $ST $TP); b=$(run $B $N $ST $TP)
     echo "   rep$i  $A=${a}ms  $B=${b}ms" >> $OUT
@@ -41,7 +41,7 @@ pair "order 1f1b vs gpipe"  pp2_tp2_mb4_1f1b pp2_tp2_mb4_gpipe       4 2 2
 pair "fusion under 1f1b"    pp2_tp2_mb4_1f1b pp2_tp2_mb4_1f1b_fused  4 2 2
 pair "fusion single-stage"  tp2_mb4          tp2_mb4_fused           2 1 2
 
-echo "-- microbatch sweep, 固定总工作量 (2卡 stages=2 tp=2)" >> $OUT
+echo "-- microbatch sweep at fixed total work (2 cards, stages=2 tp=2)" >> $OUT
 for i in $(seq 1 $REPS); do
   line="   rep$i"
   for S in s2_tp2_mb1 s2_tp2_mb2 s2_tp2_mb4 s2_tp2_mb8; do
