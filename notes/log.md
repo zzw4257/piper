@@ -3872,3 +3872,69 @@ spread within an arm is 12.4–18.0\,ms. What is solid: GPipe is not slower in a
 of four measurement combinations, and the published 16% for 1F1B does not
 reproduce. What is not yet solid: the exact magnitude. A waiter is queued to
 rerun on four idle cards if a window opens.
+
+## 2026-09-16 — F64: the selection prototype ranks correctly once it carries the terms this project measured
+
+### What changed
+
+`experiments/tp_search.py` was written at Stage F with constants fitted from
+F11–F13: a peak-FLOPS figure, a single all-reduce bandwidth, an overlap fraction
+and a per-node dispatch cost. Its own ranking check reported that it could pick
+the fastest configuration but could not order the rest — "treat it as a filter,
+not a ranking".
+
+Three days of measurement supplied the terms it was missing. The communication
+model is now the one F48/F51 measured rather than a bandwidth:
+
+    per collective:  fixed + per-MiB·bytes + host-dispatch + skew
+      fixed          41.7 us (B200) / 44.5 us (H200)      -- software
+      per MiB        2.49 us (B200) / 4.51 us (H200)      -- fabric
+      host dispatch  ~150 us per tensor touched (F55)
+      skew           ~200 us, additive not max (F49)
+
+### Result
+
+| | before | after |
+|---|---|---|
+| picks the fastest configuration | yes | yes |
+| orders the rest | **no** | **yes** |
+| predicted order | — | `[one GPU, pp=2, tp=2]` |
+| measured order | — | `[one GPU, pp=2, tp=2]` |
+| per-configuration error | 1.00x / 1.13x / 0.99x | same |
+| calibration check (in-sample) | 2% | 4% |
+
+The out-of-sample ranking went from wrong to right while the in-sample fit got
+slightly worse, which is the trade one wants: the old model fitted its
+calibration shape by absorbing communication into a bandwidth that did not
+generalise.
+
+This closes the question the project opened with. The limitation section said a
+roofline "ranked three measured configurations backwards" and concluded that
+automatic selection must model the runtime rather than the hardware. It does —
+and the runtime terms are three numbers that one sweep measures.
+
+### Why the ranking transfers between machines, and why that is not reassuring
+
+Run with each host's constants, the two produce **identical rankings**. Not
+because the model is robust: at TP payloads the fixed, host-dispatch and skew
+terms dominate, and those are software constants that differ by 7% between
+machines, while the per-byte term that differs by 1.81x barely participates.
+
+So the ranking transfers across hardware for the same reason F51 found the
+intercept transfers — the deciding quantities are properties of the software
+stack. The one thing that would break it is contention, and that is precisely
+what `--limits` now says it cannot see:
+
+> Contention flips signs, not just magnitudes. On a quiet machine GPipe beat
+> 1F1B by 16.5% on the very configuration where the contended measurement had
+> 1F1B ahead by 16% (F63). Nothing in this program can see how busy the machine
+> will be.
+
+### Status against the original goals
+
+The brief asked for four things: understand the IR/compiler/runtime boundaries;
+add TP; start from the smallest correct two-GPU example; and only afterwards
+explore a very lightweight automatic TP-selection prototype. The fourth existed
+from Stage F but carried a cost model that predated everything measured since.
+It now carries it, ranks correctly out of sample, and states its own blind spot
+rather than leaving it to be found.

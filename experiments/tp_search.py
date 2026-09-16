@@ -41,7 +41,25 @@ import itertools
 import sys
 
 ACHIEVED_TFLOPS = 1320.0        # bf16, per GPU, from F12's mb1 batch-8192 run
-ALLREDUCE_GBPS = 360.0          # 2-rank NVLink all-reduce, from F11
+ALLREDUCE_GBPS = 360.0          # kept only for the F11/F12 calibration check
+
+# Measured after this model was first written, on four idle cards of each host
+# (F48, F51). A collective costs a fixed part plus a per-byte part, and the two
+# behave differently across machines: the fixed part is software (41.7 vs
+# 44.5 us on hosts whose bandwidths differ by 1.81x) while the slope is the
+# fabric. Carrying the pair is what lets a calibration transfer at all.
+COLL = {"b200": (41.7, 2.49), "h200": (44.5, 4.51)}   # (fixed us, us per MiB)
+
+# Each collective also costs host time to issue, roughly per tensor it touches,
+# and at TP and CP payloads that exceeds the transfer: a ring node moving 1 MiB
+# per tensor costs ~400 us of host time against ~44 us on the wire (F55).
+COLL_HOST_US_PER_TENSOR = 150.0
+
+# Arrival skew is paid per collective and ADDS to the transfer rather than
+# hiding under it (F49: differencing the waiting rank against the late one is
+# constant to 0.3% across a 32x payload range). Zero asks what a perfectly
+# synchronized group would cost.
+SKEW_PER_COLLECTIVE_US = 200.0
 OVERLAP_FRACTION = 0.90         # of communication, when mb >= 2 (F12)
 DISPATCH_US_PER_NODE = 19.0     # per DAG node, from F12's idle-timeline fit
 
@@ -75,7 +93,8 @@ def _block_flops(batch: int, dim: int, hidden_local: int) -> float:
     return 2.0 * batch * (dim * dim + dim * hidden_local + hidden_local * dim + dim * dim)
 
 
-def estimate(*, gpus, pp, tp, mb, global_batch, dim, hidden, stages, dtype):
+def estimate(*, gpus, pp, tp, mb, global_batch, dim, hidden, stages, dtype,
+             machine="b200"):
     """Return (step_us, breakdown) for one configuration, or None if invalid."""
     if pp * tp > gpus or stages % pp or hidden % tp:
         return None
@@ -96,7 +115,10 @@ def estimate(*, gpus, pp, tp, mb, global_batch, dim, hidden, stages, dtype):
         0.0 if tp == 1
         else 2.0 * micro_batch * dim * BYTES[dtype] * stages_per_rank * mb
     )
-    tp_us = tp_bytes / (ALLREDUCE_GBPS * 1e9) * 1e6
+    _f, _b = COLL[machine]
+    n_tp_colls = 2 * stages_per_rank * mb if tp > 1 else 0
+    tp_us = n_tp_colls * (_f + _b * (tp_bytes / max(n_tp_colls, 1)) / 2**20
+                          + COLL_HOST_US_PER_TENSOR + SKEW_PER_COLLECTIVE_US)
     tp_exposed = tp_us * (1.0 - OVERLAP_FRACTION) if mb >= 2 else tp_us
 
     # PP point-to-point: one activation each way per boundary crossing.
@@ -104,7 +126,9 @@ def estimate(*, gpus, pp, tp, mb, global_batch, dim, hidden, stages, dtype):
         0.0 if pp == 1
         else 2.0 * micro_batch * dim * BYTES[dtype] * mb
     )
-    pp_us = pp_bytes / (ALLREDUCE_GBPS * 1e9) * 1e6
+    n_pp_colls = 2 * mb if pp > 1 else 0
+    pp_us = n_pp_colls * (_f + _b * (pp_bytes / max(n_pp_colls, 1)) / 2**20
+                          + COLL_HOST_US_PER_TENSOR + SKEW_PER_COLLECTIVE_US)
     pp_exposed = pp_us * (1.0 - OVERLAP_FRACTION) if mb >= 2 else pp_us
 
     # Dispatch: nodes per rank grow with microbatches and owned stages.
@@ -166,6 +190,9 @@ RANKING_CASES = [
 ]
 
 
+MACHINE = "b200"
+
+
 def ranking_check():
     """Does the model rank parallel strategies correctly once overheads are in?
 
@@ -179,7 +206,8 @@ def ranking_check():
     got = []
     for label, pp, tp, mb, measured in RANKING_CASES:
         step, _ = estimate(gpus=4, pp=pp, tp=tp, mb=mb, global_batch=8192,
-                           dim=4096, hidden=16384, stages=2, dtype="bf16")
+                           dim=4096, hidden=16384, stages=2, dtype="bf16",
+                           machine=MACHINE)
         got.append((step, label, measured))
         print(f"{label:<10s}{step:>11.0f}{measured:>10.0f}{step / measured:>7.2f}x")
     pred_order = [l for _, l, _ in sorted(got)]
@@ -234,6 +262,29 @@ def calibration_check():
     return 0 if worst < 0.25 else 1
 
 
+LIMITS = """
+What this cannot know, stated rather than left to be discovered:
+
+  * Contention flips signs, not just magnitudes. On a quiet machine GPipe beat
+    1F1B by 16.5% on the very configuration where the contended measurement had
+    1F1B ahead by 16% (F63). 1F1B fills pipeline bubbles; when the step is
+    host-dispatch-bound there are none to fill and its extra ordering is pure
+    host work. Nothing in this program can see how busy the machine will be, so
+    a ranking produced here does not transfer to a machine under load.
+  * Peak memory under ZeRO-3 is likewise not a property of the program but of
+    the host-dispatch to GPU-execution ratio (F47), unless the bounded buffer
+    pool is on.
+  * `tp` is not a schedule-level choice. Piper's IR carries no partition
+    information, so changing it rebuilds and retraces the model (F1). Anything
+    here that varies `tp` is proposing a different program, not a different
+    schedule.
+  * The compute term is a roofline fitted at one shape. It held to 2% on the
+    shape it was fitted to and is unvalidated elsewhere.
+
+Use it to exclude configurations, not to choose between close ones.
+"""
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -243,10 +294,19 @@ def main(argv=None) -> int:
     ap.add_argument("--hidden", type=int, default=32768)
     ap.add_argument("--stages", type=int, default=1)
     ap.add_argument("--dtype", choices=sorted(BYTES), default="bf16")
+    ap.add_argument("--machine", choices=sorted(COLL), default="b200",
+                    help="which host's measured collective constants to use")
+    ap.add_argument("--limits", action="store_true",
+                    help="print what the model cannot know, and stop")
     ap.add_argument("--calibration-check", action="store_true")
     ap.add_argument("--ranking-check", action="store_true",
                     help="Out-of-sample: rank three parallel strategies against F16.")
     args = ap.parse_args(argv)
+    global MACHINE
+    MACHINE = getattr(args, "machine", "b200")
+    if getattr(args, "limits", False):
+        print(LIMITS)
+        return 0
     if args.calibration_check:
         return calibration_check()
     if args.ranking_check:
