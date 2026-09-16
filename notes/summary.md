@@ -1,6 +1,6 @@
 # Piper-TP: status
 
-Branch `feat/tp-sharding` on `zzw4257/piper`, 53 commits off `uw-syfi/main@439e960b`.
+Branch `feat/tp-sharding` on `zzw4257/piper`, 98 commits off `uw-syfi/main@439e960b`.
 Addresses upstream issue [#15 "CP/TP support"](https://github.com/uw-syfi/piper/issues/15):
 TP is done and verified (Stages A–F); CP is built and CPU-verified, GPU rungs
 queued (Stage G, at the end of this page). Detail and evidence for every claim

@@ -8,7 +8,7 @@ same knob, no new mechanism). 74 CPU tests green. GPU rungs queued behind the
 card gate: `measure_zero3_peak.sh` → `run_cp_gate.sh` → `run_cp_hoist.sh`.
 F38 found while composing with `replicate`.
 Marks follow the project rule —
-**[code]** verified by reading `src/` at `0b65fb3`, **[intent]** from upstream
+**[code]** verified by reading `src/` at `20e2037`, **[intent]** from upstream
 issue #15 / README, **[proposed]** mine.
 
 ---
@@ -214,8 +214,8 @@ nothing. *Exit:* dump the segments and assert the placeholder property, or
 record that it fails and stop.
 
 **G-1 (CPU) — done.** Boundary `outputs[]` with a forwarded flag (G-1a,
-`2e480d3`) and `ring_exchange` spliced on the edge, no hoisting (G-1b,
-`2995530`). Lowered order is `CP_i -> ring -> CP_{i+1}` both ways. The pass
+`7708d4d`) and `ring_exchange` spliced on the edge, no hoisting (G-1b,
+`1887833`). Lowered order is `CP_i -> ring -> CP_{i+1}` both ways. The pass
 acts on edges *between* matched regions, the exact set `shard_tensor` skips.
 
 **G-2 (2 GPU) — done (log F40, F41).** Ring P2P executor over `ep_group` + numerics. Gate first,
