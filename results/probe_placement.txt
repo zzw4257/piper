@@ -1,0 +1,35 @@
+
+=== lattice: spmd
+case                 agree, comm  agree, param   agree, none        missed      spurious    wrong kind
+TP=2                           2             0             3             0             0             0
+CP=2 + DP                      0             2             5             4             0             0
+    s0.seg1 -> s0.seg2  [None]  predicted none, found permute
+    s0.seg2 -> s0.seg3  [None]  predicted none, found permute
+    s0.seg2.bwd -> s0.seg1.bwd  [None]  predicted none, found permute
+    s0.seg3.bwd -> s0.seg2.bwd  [None]  predicted none, found permute
+ZeRO-3, 3 stages               0            26            17             0             0             0
+TP=2 x PP=2                   16             0            20             8             0             0
+    s0.seg2 -> s1.seg3  [None]  predicted none, found send_recv
+    s0.seg2.splitMB1 -> s1.seg3.splitMB1  [None]  predicted none, found send_recv
+    s0.seg2.splitMB2 -> s1.seg3.splitMB2  [None]  predicted none, found send_recv
+    s0.seg2.splitMB3 -> s1.seg3.splitMB3  [None]  predicted none, found send_recv
+    ... 4 more
+
+=== lattice: perm
+case                 agree, comm  agree, param   agree, none        missed      spurious    wrong kind
+TP=2                           2             0             3             0             0             0
+CP=2 + DP                      4             2             5             0             0             0
+ZeRO-3, 3 stages               0            26            17             0             0             0
+TP=2 x PP=2                   16             0            20             8             0             0
+    s0.seg2 -> s1.seg3  [None]  predicted none, found send_recv
+    s0.seg2.splitMB1 -> s1.seg3.splitMB1  [None]  predicted none, found send_recv
+    s0.seg2.splitMB2 -> s1.seg3.splitMB2  [None]  predicted none, found send_recv
+    s0.seg2.splitMB3 -> s1.seg3.splitMB3  [None]  predicted none, found send_recv
+    ... 4 more
+
+=== lattice: perm+group
+case                 agree, comm  agree, param   agree, none        missed      spurious    wrong kind
+TP=2                           2             0             3             0             0             0
+CP=2 + DP                      4             2             5             0             0             0
+ZeRO-3, 3 stages               0            26            17             0             0             0
+TP=2 x PP=2                   24             0            20             0             0             0

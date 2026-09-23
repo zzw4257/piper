@@ -3974,3 +3974,58 @@ explore a very lightweight automatic TP-selection prototype. The fourth existed
 from Stage F but carried a cost model that predated everything measured since.
 It now carries it, ranks correctly out of sample, and states its own blind spot
 rather than leaving it to be found.
+
+---
+
+## 2026-09-23 — F65: a placement lattice with device permutation and device group predicts all 66 communication nodes in four lowerings; plain SPMD misses the ring hops and the stage crossings
+
+### Tested
+
+`experiments/probe_placement.py`, CPU only. Four lowerings (TP=2, CP=2 with DP, ZeRO-3 over
+three stages, TP=2 x PP=2 under 1F1B), scored on the per-rank DAGs that execute. Communication
+nodes are spliced out first; each remaining compute-to-compute edge gets a prediction from the
+tags of its two ends, the forward segment's own boundary record, and what the schedule
+declares. The kind of a spliced node is never read. Parameter-side nodes are predicted from the
+ZeRO and replication flags, with ZeRO backward gathers conditioned on the forward's
+free-after flag.
+
+### Predictions, written in the probe's docstring before the run
+
+TP, DP and ZeRO predicted by plain SPMD; CP rings missed by SPMD and predicted once S carries a
+device permutation; stage crossings predicted only once placement carries a device group; ZeRO
+backward gathers follow the free-after flag.
+
+### Result
+
+| lattice | TP=2 | CP=2 + DP | ZeRO-3 | TP=2 x PP=2 |
+|---|---|---|---|---|
+| SPMD (R, S, P) | 2/2 | 2/6, ring hops missed | 26/26 | 16/32, stage crossings missed |
+| + device permutation | 2/2 | 6/6 | 26/26 | 16/32 |
+| + permutation + device group | 2/2 | 6/6 | 26/26 | 32/32 |
+
+The 45 compute edges carrying no communication are predicted empty under every lattice; no
+lattice predicts a collective that is not there.
+
+### Three defects in the first version, fixed before these numbers
+
+The first draft assigned each node's placement from the node's own kind, which makes agreement
+circular; it was rewritten to predict from the compute ends only. The TP region was read from
+the tag, which the MLP carries even at tp=1; it is now read from the `shard_tensor` directive.
+Stage crossings were read from the PP index; three ZeRO stages share one device set and need no
+transfer, so the group is now the device set. Scoring the global DAG over-counted one ZeRO
+gather that the per-stage lifetime pass prunes, and missed every send/recv, which have no edge
+between them; scoring now uses the executed per-rank DAGs with each send paired to its recv.
+
+### What this says about Direction A
+
+The lattice Piper needs is layout x device assignment x device group, with buffer lifetime
+supplied by the schedule. With a permutation in the layout, a ring hop is a collective permute
+and is determined by placement; what remains a schedule choice is expressing an all-gather as
+n-1 permutes and when each issues.
+
+### Boundary
+
+Placements come from region-level rules written from the declared layouts, not from op-level
+propagation; the probe shows such placements suffice to predict communication, not that they
+can be inferred. EP is not covered (the dump tool cannot trace the Qwen example), tied weights
+are not lowered here, and all four models are small.
