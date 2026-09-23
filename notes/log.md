@@ -4075,3 +4075,38 @@ is visible to a ring.
 Reachability first ignored the cross-device edges, because a send and its recv carry no edge
 between them; the first run printed "parallel" beside boundary records that showed the chain.
 Sends are now paired to recvs by index, as in F65.
+
+---
+
+## 2026-09-23 — F67: F64 retracted — the selection prototype was checked against F16, which F17 had already withdrawn; against F17 it picks the wrong configuration
+
+### How it was found
+
+Writing the handbook, each number was traced to its source. F64 reported that the prototype
+ranks three configurations correctly. Its `--ranking-check` compared against `RANKING_CASES`,
+which held F16's single samples. F17 retracted F16 as contention on the same day F16 was
+written.
+
+### Re-checked against the right sample
+
+| configuration | predicted | F16, retracted | F17, interleaved minimum |
+|---|---|---|---|
+| one GPU | 18694 us | 18720 | 16490 |
+| pp=2 | 26354 | 23364 | **11960** |
+| tp=2 | 26387 | 26523 | 16620 |
+
+Against F17 the prototype ranks pp=2 last where it measured first, and over-predicts the two
+multi-GPU steps by 2.20x and 1.59x. The one-GPU prediction matches F16 only because
+`DRIVER_OVERHEAD_US` was fitted to that run.
+
+### What stands and what does not
+
+The per-collective law (F48, F49) was measured cleanly and stands. What fails is composing it
+into an end-to-end step. F64's sentence "the out-of-sample ranking went from wrong to right"
+is withdrawn. `--ranking-check` now compares against F17 and reports FAIL, which is the true
+state. F16's samples stay in the file as `RANKING_CASES_F16_RETRACTED`, with the reason.
+
+### Next
+
+A composition that holds on F17 must be validated on a sample it was not fitted to; tuning the
+constants until F17 ranks right would repeat F64's error.

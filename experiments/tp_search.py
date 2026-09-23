@@ -181,9 +181,19 @@ def search(args):
 
 
 RANKING_CASES = [
-    # (label, pp, tp, mb, measured end-to-end iter time us) -- F16, 2xB200,
-    # global batch 8192, dim 4096, hidden 16384, stages 2, bf16. Wall clock from
-    # results.csv, so it includes the driver and skew terms.
+    # (label, pp, tp, mb, measured end-to-end iter time us) -- F17, 2xB200,
+    # global batch 8192, dim 4096, hidden 16384, stages 2, bf16. The three
+    # configurations interleaved three times, minimum per configuration.
+    ("one GPU", 1, 1, 4, 16490.0),
+    ("pp=2",    2, 1, 4, 11960.0),
+    ("tp=2",    1, 2, 4, 16620.0),
+]
+
+# F16's single samples of the same three configurations. F17 retracted them as
+# contention (the NVLink runs drifted by up to 2x), yet this check compared
+# against them until F67, which is how F64 came to report a correct ranking.
+# DRIVER_OVERHEAD_US is still fitted to F16's one-GPU run.
+RANKING_CASES_F16_RETRACTED = [
     ("one GPU", 1, 1, 4, 18720.0),
     ("pp=2",    2, 1, 4, 23364.0),
     ("tp=2",    1, 2, 4, 26523.0),
@@ -200,8 +210,8 @@ def ranking_check():
     were fitted on GPU-side kernel time at a different shape, and here the model
     has to order three different parallel strategies by end-to-end step time.
     """
-    print("ranking check against F16 (2xB200, global batch 8192, dim 4096, "
-          "hidden 16384, stages 2, bf16)\n")
+    print("ranking check against F17 (2xB200, global batch 8192, dim 4096, "
+          "hidden 16384, stages 2, bf16, interleaved minimum)\n")
     print(f"{'config':<10s}{'predicted':>11s}{'measured':>10s}{'ratio':>8s}")
     got = []
     for label, pp, tp, mb, measured in RANKING_CASES:
@@ -240,7 +250,7 @@ def calibration_check():
 
     Only a consistency check: these are the same measurements the constants came
     from, so agreement shows the arithmetic is right, not that the model
-    generalizes. The out-of-sample test is the ranking in F16.
+    generalizes. The out-of-sample test is the ranking against F17.
     """
     cases = [
         # (label, mb, global_batch, measured GPU span us)
