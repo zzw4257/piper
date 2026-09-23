@@ -1,0 +1,11 @@
+forward compute nodes: {'s0.seg0': (0, [0]), 's1.seg1': (1, [1]), 's2.seg2': (2, [2])}
+  s0.seg0 boundary outputs: [('l_x_txt_', 'forwarded'), ('a', 'produced')]
+  s1.seg1 boundary outputs: [('a', 'forwarded'), ('b', 'produced')]
+
+image encoder (s0.seg0) reaches text encoder (s1.seg1) along data edges: True
+text encoder's own input threaded through the image encoder's segment: True
+image encoder reaches decoder (s2.seg2): True
+forward sends (node, from stage, to stage): [('send.0', 0, 1), ('send.1', 1, 2)]
+per-stage split: ValueError: expected distinct device sets across split components, got [(0,), (1,), (2,), (0,), (1,)].
+
+verdict: branches CHAINED through the text encoder

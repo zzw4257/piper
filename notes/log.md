@@ -4029,3 +4029,49 @@ Placements come from region-level rules written from the declared layouts, not f
 propagation; the probe shows such placements suffice to predict communication, not that they
 can be inferred. EP is not covered (the dump tool cannot trace the Qwen example), tied weights
 are not lowered here, and all four models are small.
+
+---
+
+## 2026-09-23 — F66: two independent branches lower as a chain; the frontend threads every crossing value through the segments in between, the text encoder's own input included
+
+### Tested
+
+`experiments/probe_branches.py`, CPU only. Two encoders that share no data feed one decoder;
+each is its own PP scope placed on its own device (0, 1, 2). The training DAG is inspected
+before the per-stage split.
+
+### Prediction, written in the probe's docstring before the run
+
+Chained: contiguous segments plus threading of crossing values would add a stage 0 -> stage 1
+data edge the model does not have.
+
+### Result
+
+| check | result |
+|---|---|
+| image encoder reaches text encoder along data edges | yes |
+| text encoder's own input `x_txt` forwarded through the image encoder's segment | yes |
+| image encoder's output `a` forwarded through the text encoder's segment | yes |
+| forward sends | stage 0 -> 1 and 1 -> 2 only; none from 0 to 2 |
+
+The text encoder cannot start until the image encoder has finished and forwarded its input.
+The ordering is created by segmentation, so no `order` directive can remove it. The per-stage
+split then refuses the schedule for want of an `order` directive, as F14 requires for pp > 1;
+the chain is already in the data edges before that point.
+
+The prediction held and understated the effect: the independent branch's own input is threaded
+too, not only the other branch's output.
+
+### The same rule, seen twice
+
+Threading a crossing value through the segments in between is what makes a CP ring's payload
+ready at segment start (F58, the hoist). The rule that lets the ring issue early is the rule
+that chains the branches. A DAG-shaped schedule needs the frontend to route a crossing value
+from its producer to its consumers directly, which would also change where a forwarded tensor
+is visible to a ring.
+
+### Probe bug fixed before the verdict
+
+Reachability first ignored the cross-device edges, because a send and its recv carry no edge
+between them; the first run printed "parallel" beside boundary records that showed the chain.
+Sends are now paired to recvs by index, as in F65.
