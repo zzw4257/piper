@@ -88,3 +88,52 @@ def test_regather_false_keeps_one_gather_per_segment(tmp_path) -> None:
     assert shipped == {("ALL_GATHER_COMM", "F"): 9, ("ALL_GATHER_COMM", "B"): 8, ("REDUCE_SCATTER_COMM", "B"): 9}
     # Holding each forward's parameters until its backward leaves exactly what placement derives.
     assert kept == {("ALL_GATHER_COMM", "F"): 9, ("REDUCE_SCATTER_COMM", "B"): 9}
+
+
+# ----------------------------------------------------------------------------- CP (log F70)
+def _lower_ring(schedule, tmp_path, steps):
+    from models.ring_attn import RingAttn
+
+    path = tmp_path / "r.json"
+    path.write_text(json.dumps(schedule))
+    directives = load_schedule_directives(str(path))
+    piper_metadata.schedule_directives = directives
+    piper_metadata.schedule_info = derive_schedule_info(directives, str(path))
+    piper_metadata.visualize_dag = False
+    _reset_annotation_state()
+    with torch.device("meta"):
+        model = RingAttn(64, 2, steps)
+        xs = tuple(torch.empty(2, 8, 64, device="meta") for _ in range(3))
+    torch._dynamo.reset()
+    torch.compile(model, backend=piper, fullgraph=True)(*xs)
+    (dag,) = piper_metadata.per_pp_training_dags
+    return dag
+
+
+def _ring_edges(dag):
+    """Every edge touching a ring node, plus the ring nodes' payload and direction."""
+    ring = {u for u, n in dag.nodes.items() if n.node_kind == "RING_COMM"}
+    edges = {(e.src_uid, e.dst_uid, e.dep_kind) for e in dag.edges if e.src_uid in ring or e.dst_uid in ring}
+    meta = {(u, tuple(dag.nodes[u].node_meta["ring_tensor_idxs"]), dag.nodes[u].node_meta["ring_shift"]) for u in ring}
+    return edges, meta
+
+
+@pytest.mark.parametrize("ranks,hoist", [(2, False), (2, True), (4, False), (4, True)])
+def test_derived_ring_payload_matches_named_tensors(tmp_path, ranks, hoist) -> None:
+    devices = list(range(ranks))
+    base = [{"op": "place", "filter": {"PP": 0}, "devices": devices}, _split(1)]
+    ring = {"op": "ring_exchange", "filter": {"CP": "*"}, "devices": devices, "stream": "cp_stream",
+            "hoist": hoist, "distance": 1}
+    named = _lower_ring(base[:1] + [{**ring, "tensors": ["k", "v"]}] + base[1:], tmp_path, ranks)
+    derived = _lower_ring(base[:1] + [{**ring, "derive": {"seq_dim": 2}}] + base[1:], tmp_path, ranks)
+    assert _ring_edges(derived) == _ring_edges(named)
+    # the gather of K/V over n ranks, split into n-1 forward hops (and n-1 backward)
+    fwd = [n for n in derived.nodes.values() if n.node_kind == "RING_COMM" and n.tag.get("PASS") == "F"]
+    assert len(fwd) == ranks - 1
+
+
+def test_ring_derivation_refuses_a_region_with_nothing_to_gather(tmp_path) -> None:
+    # Split the TP MLP along the batch: a linear layer needs nothing gathered, so no ring payload.
+    ring = {"op": "ring_exchange", "filter": {"TP": "*"}, "devices": [0, 1], "derive": {"seq_dim": 0}}
+    with pytest.raises(Exception, match="no single ring payload"):
+        _lower([PLACE, ring, _split(1)], tmp_path)

@@ -1455,6 +1455,7 @@ def _insert_ring_exchange_comm_nodes(
     comm_stream: str | None = None,
     hoist: bool = False,
     distance: int = 1,
+    derive_seq_dim: int | None = None,
 ) -> None:
     """Rotate forwarded tensors one hop around the group between consecutive matched regions.
 
@@ -1490,6 +1491,11 @@ def _insert_ring_exchange_comm_nodes(
     edge on purpose, for measuring exactly that. At ``distance=1`` the edge is
     also what orders the ring's buffer reuse after the consumer's read; for
     larger distances the consumer's ``record_stream`` carries that instead.
+
+    With ``derive_seq_dim`` in place of ``tensors``, the tensors are not named: every
+    region input is placed ``Shard(derive_seq_dim)`` and the ones DTensor must gather
+    become the payload (``src/placement.py``). The ring is then that all-gather split
+    into n-1 hops, one per consecutive pair of regions (log F70).
     """
     expected = sorted(int(d) for d in devices)
     if len(set(expected)) < 2:
@@ -1497,6 +1503,22 @@ def _insert_ring_exchange_comm_nodes(
             f"ring_exchange requires at least two distinct devices, got devices={devices}; "
             f"a one-rank ring has nothing to rotate with"
         )
+    if derive_seq_dim is not None and not tensors:
+        from .placement import derive_gathered_inputs
+
+        per_region = {}
+        for uid, node in sorted(dag.nodes.items()):
+            if (node.node_kind == "COMPUTE" and node.compute_subkind == "FWD"
+                    and any(_match_filter(node.tag, flt) for flt in filters)):
+                m = node.node_meta
+                per_region[uid] = tuple(derive_gathered_inputs(
+                    m["gm"], m["graphargs"], m["input_idxs"], int(derive_seq_dim), len(set(expected))))
+        payloads = set(per_region.values())
+        if len(payloads) != 1 or not next(iter(payloads)):
+            raise ValueError(
+                f"ring_exchange(derive seq_dim={derive_seq_dim}): regions need different or no "
+                f"gathered inputs, so there is no single ring payload: {per_region}")
+        tensors = list(next(iter(payloads)))
     if not isinstance(tensors, list) or not tensors:
         raise ValueError(
             "ring_exchange requires a non-empty `tensors` list naming the boundary "
@@ -2265,6 +2287,7 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
             _insert_ring_exchange_comm_nodes(
                 training_dag, filters, devices, tensors=raw.get("tensors"), comm_stream=stream,
                 hoist=bool(raw.get("hoist", False)), distance=int(raw.get("distance", 1)),
+                derive_seq_dim=(raw.get("derive") or {}).get("seq_dim"),
             )
         elif op == "shard_tensor":
             _insert_tp_all_reduce_comm_nodes(

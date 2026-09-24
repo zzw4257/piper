@@ -4168,3 +4168,23 @@ Derived vs rule: 0. Derived vs TP=1: 1.0e-6. regather=false vs shipped: 0. Peak 
 **Claim boundary.** One TP pattern and one 3-stage ZeRO-3 model; the derivation covers boundary all-reduces only. The fake process group lives in `torch.testing._internal`.
 
 **Next.** Decomposition as a schedule transform: derive CP's K/V all-gather and lower it to the n-1 ring hops `ring_exchange` inserts today (`notes/abstraction-zh.md` in the local notes, step 3). Discuss with Stephanie before building.
+
+---
+
+## 2026-09-23 — F70: CP's ring payload is derived instead of named; the ring is one decomposition of a K/V all-gather, and DTensor picks a different plan at real sizes
+
+**Question.** Placement rules derive TP's and ZeRO-3's boundary collectives (F68, F69). What is special about CP, and can its ring be derived too?
+
+**Semantics are derivable.** With plain DTensor rules and no CP special case, 4 ranks, q/k/v all `Shard(seq)`, math attention: forward 2 all-gathers (K and V), backward 2 all-gathers + 2 reduce-scatters; output stays `Shard(seq)` (`notes/experiments/dtensor_cp_plain_rules.py` in the local notes). Piper's CP=4 lowering has 3 forward hops, each moving one K/V chunk: the same bytes as a 4-rank all-gather, in n-1 steps. So CP's collective is "gather K and V"; the ring is a decomposition of it that needs (1) the op split into n per-chunk steps, (2) a per-step placement that rotates by a device permutation, and (3) a combine rule (online softmax). None of the three is a placement on an edge; DTensor hides them in SDPA, Piper has the model write the steps as CP regions and `ring_exchange` the permutation.
+
+**Changed.** `ring_exchange` accepts `"derive": {"seq_dim": 2}` in place of `"tensors"`. `derive_gathered_inputs` (`src/placement.py`) finds the inputs a region needs whole when its inputs and outputs are split along the sequence: perturb one position of an input and check whether any *other* output position changes. For every CP region of the ring model that is exactly `_xseg_k`, `_xseg_v`; q, o, m, l stay split. The existing ring lowering then runs with those names.
+
+**First attempt, and why it was replaced.** The derivation first asked DTensor which inputs it redistributes Shard -> Replicate. It matched `["k", "v"]` on the CPU test sizes and was refused on the real example (dim 256, heads 4, local seq 32): there DTensor gathers K (`(16, 64, 16) S(2) -> R`) but moves the probabilities instead of V (`(16, 16, 32) S(1) -> S(2)`, an all-to-all to key-sharding), and reduce-scatters the partial output (`P -> S(2)`), because that moves fewer bytes. So the placement rules admit several communication plans for CP and DTensor's cost model picks one; the ring is the plan that gathers both K and V. Deriving the ring needs the dependency rule, not DTensor's choice, and choosing the ring over the all-to-all plan is a schedule decision.
+
+**Tested.**
+- CPU (`test/test_placement_derivation.py`, 11 tests; suite 93 passed): derived and named rings are identical in every ring-touching edge, payload index and shift for CP=2 and CP=4, hoist on and off; forward hops = n-1. A region with nothing to gather (TP MLP split along the batch) is refused.
+- GPU (`experiments/check_cp_equivalence.py`, `cp2_ring_dp_derived`, `cp4_ring_dp_hoist_derived`, 22:19 ET, shared cards): CP=2 vs dense 1.729e-6, CP=4 hoisted vs dense 2.563e-6, both identical to the named-tensor runs of 9/22; negative controls (no ring) 3.2e-3 and 8.6e-3.
+
+**What this says about the abstraction.** Placement decides *which* collective CP needs (gather K/V, derivable). How it is carried out is a second-layer choice: one all-gather, a ring of n-1 hops (needs a combine rule, lets Piper hoist and bound each hop), or DTensor's all-to-all plan. Piper can now take the first from a rule and keep the second explicit.
+
+**Claim boundary.** One ring-attention model; the dependency test is a single perturbation of position 0 in float64, which would miss a dependence that is exactly zero at that point. EP routing untouched.
