@@ -4110,3 +4110,27 @@ state. F16's samples stay in the file as `RANKING_CASES_F16_RETRACTED`, with the
 
 A composition that holds on F17 must be validated on a sample it was not fitted to; tuning the
 constants until F17 ranks right would repeat F64's error.
+
+---
+
+## 2026-09-23 — F68: DTensor placements derive exactly the boundary collectives that shard_tensor inserts, and all of ZeRO-3's except the backward regathers, which are a lifetime choice
+
+**Context.** At the 9/23 1:1, Stephanie pointed to DTensor as related to making placement an IR concept, and asked what is special about CP. Question here: if a region states only how its parameters and batch are placed, do DTensor's sharding rules derive the collectives our directives hand-insert?
+
+**Tested.** `experiments/derive_boundary_comm.py`, CPU, `fake` 2-rank process group, torch 2.10.0. For each region, the region alone is placed with DTensor, compiled through AOT autograd, and the `_c10d_functional` collectives in the forward and backward aten graphs are located by which graph outputs they reach. Those are mapped onto the region's out-edges in the baseline DAG (no comm directive) and compared with the lowering that uses the directive.
+
+**Result.**
+- TP (`up` Colwise, `down` Rowwise): DTensor gives one forward all-reduce on the region output and one backward all-reduce on the region-input gradient. Mapped onto Piper edges: `(F, s0.seg1 -> s0.seg2)` and `(B, s0.seg1.bwd -> s0.seg0.bwd)`. `shard_tensor` inserts exactly these two. MATCH.
+- ZeRO-3 (weights `Shard(0)`, batch `Shard(0)`), 3 stages x 3 segments: DTensor gives, per region, one forward all-gather and one backward reduce-scatter. 18 of 18 predicted nodes are in Piper's lowering. Piper has 8 more: a backward all-gather on every segment except `s2.seg8`.
+- Negative controls: other placements derive other collectives. `up` Colwise with `down` unsharded gives a forward all-gather *inside* the region and a backward all-reduce; both Colwise gives two all-gathers and two all-reduces. Neither maps onto `shard_tensor`'s nodes.
+
+**Interpretation.** The 8 extra gathers are ZeRO-3 freeing parameters after the forward and gathering them again; DTensor keeps the gathered weight saved for backward. The one segment where Piper does not regather, `s2.seg8`, is the one `_prune_zero_lifetime_metadata` handles (F65's lifetime flag). So placement determines *which* collectives exist; whether a parameter is re-gathered is a buffer-lifetime decision, which placement does not carry. Same split as F65.
+
+**Related observations (same day, `notes/dtensor-study-zh.md` in the local notes).**
+- Under Dynamo, a DTensor program shows `redistribute` calls with placements closed over, not collectives; collectives appear only at the aten level.
+- `Shard(0) -> Shard(1)` lowers to `_dtensor.shard_dim_alltoall` on CUDA; the CPU backend falls back to all-gather plus chunk. It is a dense reshard; EP's data-dependent routing is not expressible as a placement change.
+- DTensor's CP installs a `Shard(seq)` rule for SDPA only while CP is active; the rule needs no redistribution, and the ring runs inside the attention op: 2 ranks, one SDPA call, all-gather mode = forward 1 all-gather, backward 1 all-gather + 2 all-to-all; all-to-all mode = forward 1, backward 3. Nothing is exposed as a separate node, so none of it can be ordered or hoisted. `redistribute_local_tensor` carries a TODO for permute reshuffles.
+
+**Claim boundary.** One TP pattern and one ZeRO-3 model, derived per region in isolation; EP and CP not derived. Uses `torch.testing._internal` fake PG.
+
+**Next.** Keep derivation for boundary collectives (TP, ZeRO, dense reshards) and keep EP routing, CP rings and all timing explicit in Piper. A prototype would replace the hand-written edge rule of `shard_tensor` with this derivation and add the lifetime flag as a schedule input.
