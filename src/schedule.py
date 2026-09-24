@@ -80,6 +80,9 @@ def _validate_directive_shape(directive: dict, idx: int) -> None:
             raise ValueError(f"{op} directive[{idx}] requires object field 'filter': {directive}")
         if "filters" in directive:
             raise ValueError(f"{op} directive[{idx}] does not accept field 'filters': {directive}")
+    elif op == "route":
+        if directive.get("mode", "thread") not in ("thread", "consumers"):
+            raise ValueError(f"route directive[{idx}] mode must be 'thread' or 'consumers': {directive}")
     elif op == "order":
         filters = directive.get("filters")
         if not isinstance(filters, list) or not filters:

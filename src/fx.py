@@ -340,6 +340,9 @@ class AnnotationSegment:
     graphargs: list[Any]
     placeholders: list[fx.Node]
     a2a_boundary_after: dict[str, Any] | None = None
+    # Consumer routing (``{"op": "route", "mode": "consumers"}``) only: for each
+    # runtime-input slot, ("seg", supplier_segment, output_index) or ("model", i).
+    input_sources: list[tuple[str, int, int]] | None = None
 
 
 def _inject_piper_annotation(node: fx.Node, name: str, index: int, uid: int) -> None:
@@ -512,6 +515,20 @@ def _select_boundary_tensor_idx(nodes: list[fx.Node]) -> int | None:
     return 0 if nodes else None
 
 
+def _routing_mode() -> str:
+    """"thread" (upstream: every crossing value passes through each segment in between)
+    or "consumers" (a value passes only through the segments that read it)."""
+    from .state import piper_metadata
+
+    for d in getattr(piper_metadata, "schedule_directives", None) or []:
+        if isinstance(d, dict) and d.get("op") == "route":
+            mode = d.get("mode", "thread")
+            if mode not in ("thread", "consumers"):
+                raise ValueError(f"route: unknown mode {mode!r}; expected 'thread' or 'consumers'")
+            return mode
+    return "thread"
+
+
 def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[AnnotationSegment]]:
     """Split a GraphModule into contiguous subgraphs by Piper annotation stack.
 
@@ -589,13 +606,39 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
         node_max_user_seg[node] = max(user_segs) if user_segs else seg
 
     seg_cross_in: list[list[fx.Node]] = [[] for _ in range(n_segs)]
-    for node in nodes:
-        if node not in value_seg:
-            continue
-        seg = value_seg[node]
-        max_seg = node_max_user_seg[node]
-        for target_seg in range(seg + 1, max_seg + 1):
-            seg_cross_in[target_seg].append(node)
+    route_consumers = _routing_mode() == "consumers"
+    # consumer routing: supplier of (segment, value), and each segment's outputs in order
+    supplier: dict[tuple[int, fx.Node], int] = {}
+    seg_outputs: list[list[fx.Node]] = [[] for _ in range(n_segs)]
+    if not route_consumers:
+        for node in nodes:
+            if node not in value_seg:
+                continue
+            seg = value_seg[node]
+            max_seg = node_max_user_seg[node]
+            for target_seg in range(seg + 1, max_seg + 1):
+                seg_cross_in[target_seg].append(node)
+    else:
+        # A value is handed only to the segments that read it, in order: its producer
+        # (or the model input) supplies the first consumer, each consumer the next.
+        # Values read by a contiguous run of segments -- CP's K and V -- are threaded
+        # exactly as before; a value that skips segments no longer passes through them,
+        # so independent branches stop depending on each other (log F66, F71).
+        for node in nodes:
+            if node not in value_seg:
+                continue
+            producer = -1 if node in runtime_placeholders else value_seg[node]
+            consumers = sorted({
+                c for user in node.users for c in [_consumer_seg(user)]
+                if c is not None and c > producer
+            })
+            prev = producer
+            for c in consumers:
+                seg_cross_in[c].append(node)
+                supplier[(c, node)] = prev
+                if prev >= 0:
+                    seg_outputs[prev].append(node)
+                prev = c
 
     segments: list[AnnotationSegment] = []
     output_node = next((node for node in nodes if node.op == "output"), None)
@@ -624,7 +667,11 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 new_graphargs.append(_grapharg_for_placeholder(node))
             pos += 1
 
-        if seg == 0:
+        if route_consumers:
+            for node in seg_cross_in[seg]:
+                name = node.name if node in runtime_placeholders else f"_xseg_{node.name}"
+                _add_placeholder(node, name, is_runtime_input=True)
+        elif seg == 0:
             for node in nodes:
                 if node in runtime_placeholders:
                     _add_placeholder(node, node.name, is_runtime_input=True)
@@ -680,10 +727,11 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 sub_g.output(fx.map_arg(output_node.args[0], lambda x: remap[x]))
             boundary_after = None
         else:
-            out_nodes = [remap[node] for node in seg_cross_in[seg + 1]]
+            crossing = seg_outputs[seg] if route_consumers else seg_cross_in[seg + 1]
+            out_nodes = [remap[node] for node in crossing]
             sub_g.output(tuple(out_nodes) if len(out_nodes) != 1 else out_nodes[0])
             boundary_after = {
-                "tensor_idx": _select_boundary_tensor_idx(seg_cross_in[seg + 1]),
+                "tensor_idx": _select_boundary_tensor_idx(crossing),
                 # Every boundary output, and whether this segment produced it or
                 # merely forwards it (its node in the sub-graph is a placeholder).
                 # A collective on a forwarded tensor is ready at segment *start*,
@@ -691,13 +739,24 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 "outputs": [
                     {"idx": i, "name": r.name, "src_name": n.name,
                      "forwarded": r.op == "placeholder"}
-                    for i, (n, r) in enumerate(zip(seg_cross_in[seg + 1], out_nodes))
+                    for i, (n, r) in enumerate(zip(crossing, out_nodes))
                 ],
                 "reshape_input": None,
                 "reshape_output": None,
                 "from_tag": _tag_from_stack(segment_stacks[seg]),
                 "to_tag": _tag_from_stack(segment_stacks[seg + 1]),
             }
+
+        input_sources = None
+        if route_consumers:
+            model_inputs = [n for n in nodes if n in runtime_placeholders]
+            input_sources = []
+            for node in seg_cross_in[seg]:
+                src = supplier[(seg, node)]
+                if src < 0:
+                    input_sources.append(("model", model_inputs.index(node), 0))
+                else:
+                    input_sources.append(("seg", src, seg_outputs[src].index(node)))
 
         sub_g.lint()
         seg_gm = fx.GraphModule(gm, sub_g)
@@ -714,6 +773,7 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 graphargs=new_graphargs,
                 placeholders=placeholders,
                 a2a_boundary_after=boundary_after,
+                input_sources=input_sources,
             )
         )
 

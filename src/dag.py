@@ -133,8 +133,16 @@ def build_training_dag(
         )
         dag.add_node(node)
 
+        if segment.input_sources is not None:
+            # Consumer routing: one edge per segment this one reads from.
+            suppliers = sorted({src for kind, src, _ in segment.input_sources if kind == "seg"})
+            for src in suppliers:
+                src_seg = annotation_segments[src]
+                src_uid = f"s{src_seg.stage_id}.seg{src_seg.segment_id}"
+                dag.add_edge(TrainingDAGEdge(src_uid=src_uid, dst_uid=uid, dep_kind="data"))
+            node.node_meta["input_sources"] = list(segment.input_sources)
         # Explicit activation-flow ordering in annotation segment order.
-        if global_prev_uid is not None:
+        elif global_prev_uid is not None:
             dag.add_edge(TrainingDAGEdge(src_uid=global_prev_uid, dst_uid=uid, dep_kind="data"))
         global_prev_uid = uid
 

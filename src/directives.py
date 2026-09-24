@@ -2252,7 +2252,7 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
 
     for i, raw in enumerate(directives):
         if isinstance(raw, dict) and raw.get("op") in (
-            "place", "split", "order", "fuse_collectives"
+            "place", "split", "order", "fuse_collectives", "route"
         ):
             continue
         op, filters, devices, stream, gather_stream, reduce_stream, shard_params, shard_grads, bucket_size = _normalize_filter_devices_directive(raw)
