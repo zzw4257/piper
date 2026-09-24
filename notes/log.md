@@ -4134,3 +4134,37 @@ constants until F17 ranks right would repeat F64's error.
 **Claim boundary.** One TP pattern and one ZeRO-3 model, derived per region in isolation; EP and CP not derived. Uses `torch.testing._internal` fake PG.
 
 **Next.** Keep derivation for boundary collectives (TP, ZeRO, dense reshards) and keep EP routing, CP rings and all timing explicit in Piper. A prototype would replace the hand-written edge rule of `shard_tensor` with this derivation and add the lifetime flag as a schedule input.
+
+---
+
+## 2026-09-23 — F69: shard_tensor can take parameter placements and derive its collectives; ZeRO-3 regathering becomes a schedule field. Both train identically on GPU
+
+**Context.** F68 showed, outside Piper, that placements derive the boundary collectives the directives hand-insert, and that ZeRO-3's extra backward gathers are a lifetime choice. This entry moves both into the compiler as optional fields; without them nothing changes.
+
+**Changed.**
+- `src/placement.py`: `derive_boundary_placements` runs a segment's own GraphModule once under DTensor on a fake mesh, with parameters placed as declared, and returns the placement of each output and of each runtime-input gradient. A Partial result needs an all-reduce on the boundary. Any `redistribute_input` inside the segment (recorded with `torch.utils._debug_mode.DebugMode`) is refused, because Piper runs the segment on the declared shards and would skip it.
+- `shard_tensor` accepts `"params": {"up": "colwise", "down": "rowwise"}`. With it, the pass inserts TP_COMM only on out-edges whose tensor derives as Partial, instead of assuming the f/g rule.
+- `replicate(shard_params)` accepts `"regather": false`. It adds a temporal edge from each forward to its own backward, so `_prune_zero_lifetime_metadata` treats them as one chain and keeps the forward's gather, exactly as it already did for the last stage. The edge adds no ordering.
+
+**Tested.**
+- CPU (`test/test_placement_derivation.py`, 6 tests; full suite 88 passed): derived TP nodes equal the rule's at 1 and 4 microbatches, including `tp_tensor_idx`; replicated parameters derive no collective; `regather=false` gives 9 forward gathers and 0 backward gathers against shipped 9 + 8, with 9 reduce-scatters in both.
+- Refusals: `up` rowwise / `down` colwise needs an all-reduce between the layers (gelu on a partial sum); `up` colwise / `down` declared whole is silently re-split by DTensor (`redistribute_input(1, R -> S(0))`, no collective), which only the DebugMode check catches.
+- GPU (`experiments/check_derived_and_lifetime.py`, GPUs 0 and 2, shared, 22:05 ET):
+
+| run | losses (3 steps) |
+|---|---|
+| TP=1 | 2.95143, 1.893224, 1.588651 |
+| TP=2 rule | 2.95143, 1.893223, 1.588651 (both ranks) |
+| TP=2 derived | 2.95143, 1.893223, 1.588651 (both ranks) |
+| ZeRO-3 shipped | 0.985743, 0.948609, 1.194502 |
+| ZeRO-3 regather=false | 0.985743, 0.948609, 1.194502 |
+
+Derived vs rule: 0. Derived vs TP=1: 1.0e-6. regather=false vs shipped: 0. Peak allocated (rank 0, one run, shared card): 137.8 MB shipped, 148.7 MB with parameters held.
+
+**Unexpected.** A mixed placement (`up` colwise, `down` whole) is not refused by counting collectives: DTensor prefers a negative-cost local chunk of the whole weight and ends with a partial sum, which looks exactly like rowwise. Derivation has to check that DTensor ran the placements as declared, not only that it did not communicate.
+
+**Also.** `--init fixed` in the TP example slices weights by `PIPER_DP_RANK` as a TP rank, so a ZeRO run with dp=2 and tp=1 crashes with a (0, 512) shard. The ZeRO pair here uses `--init random`, deterministic per rank and identical across the two runs.
+
+**Claim boundary.** One TP pattern and one 3-stage ZeRO-3 model; the derivation covers boundary all-reduces only. The fake process group lives in `torch.testing._internal`.
+
+**Next.** Decomposition as a schedule transform: derive CP's K/V all-gather and lower it to the n-1 ring hops `ring_exchange` inserts today (`notes/abstraction-zh.md` in the local notes, step 3). Discuss with Stephanie before building.

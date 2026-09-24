@@ -1199,6 +1199,7 @@ def _insert_tp_all_reduce_comm_nodes(
     filters: list[dict[str, Any]],
     devices: list[int],
     comm_stream: str | None = None,
+    params: dict[str, str] | None = None,
 ) -> None:
     """Insert TP activation all-reduces at the boundary of a tensor-parallel region.
 
@@ -1218,6 +1219,11 @@ def _insert_tp_all_reduce_comm_nodes(
     Unlike ``replicate``, no parameter-gradient collective is inserted: TP weight
     gradients are already shard-local. Composing this with ``replicate`` on the same
     region is rejected rather than silently resolved.
+
+    With ``params`` (module name -> "colwise" / "rowwise" / "replicate"), the rule
+    above is not assumed: each region runs once under DTensor, and an all-reduce goes
+    only where an output, or the gradient of an input, comes out as a partial sum
+    (``src/placement.py``, log F68).
     """
     expected = sorted(int(d) for d in devices)
     if len(set(expected)) < 2:
@@ -1293,10 +1299,37 @@ def _insert_tp_all_reduce_comm_nodes(
             return _is_backward_activation_subkind(dst.compute_subkind)
         return False
 
+    derived: dict[str, dict[str, Any]] = {}
+
+    def _derived_tensor_idx(node: TrainingDAGNode) -> int | None:
+        """None when the placements leave nothing to reduce on this node's out-edges."""
+        from .placement import derive_boundary_placements
+
+        fwd_uid = node.uid if node.compute_subkind == "FWD" else node.node_meta.get("fwd_uid")
+        if fwd_uid not in derived:
+            m = dag.nodes[fwd_uid].node_meta
+            derived[fwd_uid] = derive_boundary_placements(
+                m["gm"], m["graphargs"], m["input_idxs"], m["param_idxs"], params, len(expected))
+        d = derived[fwd_uid]
+        if node.compute_subkind == "FWD":
+            partial = [k for k, pl in enumerate(d["outputs"]) if pl.is_partial()]
+            other = [pl for pl in d["outputs"] if not (pl.is_partial() or pl.is_replicate())]
+        else:
+            partial = [k for k, pl in d["input_grads"].items() if pl.is_partial()]
+            other = [pl for pl in d["input_grads"].values() if not (pl.is_partial() or pl.is_replicate())]
+        if other or len(partial) > 1:
+            raise ValueError(
+                f"shard_tensor(params={params}) on {node.uid}: boundary placements "
+                f"{d} need more than one all-reduce, or a collective TP_COMM cannot express")
+        return partial[0] if partial else None
+
     for uid in sorted(matched):
         node = dag.nodes[uid]
         # BWD_W produces only weight gradients; there is no activation to reduce.
         if node.compute_subkind == "BWD_W":
+            continue
+        derived_idx = _derived_tensor_idx(node) if params is not None else None
+        if params is not None and derived_idx is None:
             continue
         outgoing = [e for e in list(dag.edges) if _is_boundary_activation_edge(e, node)]
         for e in outgoing:
@@ -1327,6 +1360,29 @@ def _insert_tp_all_reduce_comm_nodes(
                 src_uid=uid, dst_uid=comm_uid, dep_kind="data", tensor_name=e.tensor_name))
             dag.add_edge(TrainingDAGEdge(
                 src_uid=comm_uid, dst_uid=e.dst_uid, dep_kind="data", tensor_name=e.tensor_name))
+
+
+def _keep_gathered_params_for_backward(dag: TrainingDAG, filters: list[dict[str, Any]]) -> int:
+    """Hold each forward's gathered parameters until its backward, with no second gather.
+
+    ZeRO-3 frees full parameters after the forward and gathers them again for the
+    backward. _prune_zero_lifetime_metadata already keeps one gather per chain of
+    directly linked same-bucket compute nodes, which is why the last stage never
+    regathers: its forward feeds its backward directly. A temporal edge from every
+    other forward to its own backward makes them one chain too. The edge adds no
+    ordering, since the backward already depends on the forward; it only changes
+    buffer lifetime (log F68). Returns the number of edges added.
+    """
+    added = 0
+    for fwd in [n for n in dag.nodes.values()
+                if n.node_kind == "COMPUTE" and n.compute_subkind == "FWD"
+                and any(_match_filter(n.tag, flt) for flt in filters)]:
+        for bwd in [n for n in dag.nodes.values()
+                    if n.node_kind == "COMPUTE" and n.node_meta.get("fwd_uid") == fwd.uid]:
+            if not any(e.src_uid == fwd.uid and e.dst_uid == bwd.uid for e in dag.edges):
+                dag.add_edge(TrainingDAGEdge(src_uid=fwd.uid, dst_uid=bwd.uid, dep_kind="temporal"))
+                added += 1
+    return added
 
 
 def _bound_all_gather_issue(
@@ -2196,6 +2252,8 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
                 _insert_all_gather_comm_nodes(training_dag, filters, devices, comm_stream=gather_stream)
                 if raw.get("prefetch_distance") is not None:
                     _bound_all_gather_issue(training_dag, filters, int(raw["prefetch_distance"]))
+                if raw.get("regather") is False:
+                    _keep_gathered_params_for_backward(training_dag, filters)
                 _insert_reduce_scatter_comm_nodes(training_dag, filters, devices, comm_stream=reduce_stream)
             elif shard_grads:
                 _insert_reduce_scatter_comm_nodes(training_dag, filters, devices, comm_stream=reduce_stream)
@@ -2209,7 +2267,8 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
                 hoist=bool(raw.get("hoist", False)), distance=int(raw.get("distance", 1)),
             )
         elif op == "shard_tensor":
-            _insert_tp_all_reduce_comm_nodes(training_dag, filters, devices, comm_stream=stream)
+            _insert_tp_all_reduce_comm_nodes(
+                training_dag, filters, devices, comm_stream=stream, params=raw.get("params"))
         else:
             raise ValueError(f"Unsupported directive op after normalization: {op}")
 
