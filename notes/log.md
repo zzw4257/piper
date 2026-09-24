@@ -4213,3 +4213,29 @@ Derived vs rule: 0. Derived vs TP=1: 1.0e-6. regather=false vs shipped: 0. Peak 
 **Not yet.** Routing does not combine with boundary collectives on the same edge (TP/EP/CP comm before a routed consumer raises `NotImplementedError`); one microbatch only was run; a producer that feeds several consumers on other stages sends each its own subset but was not exercised; no real multimodal model yet.
 
 **Next.** A small real multimodal model (a vision encoder and a text encoder feeding a decoder) with microbatches and 1F1B-style order, and routing combined with TP inside a branch.
+
+---
+
+## 2026-09-24 — F72: routing on a real multimodal model; CLIP ViT-B/32 trains identically under all three schedules, and routing shortens the step 1.79x (B200) / 1.72x (H200)
+
+**Question.** F71 used a synthetic two-branch model. Does routing hold on a real multimodal model with released weights and real data (issue #16)?
+
+**Model and data.** `examples/models/clip.py`: CLIP ViT-B/32 with Hugging Face parameter names, three PP regions (vision tower + projection | text tower + projection | cosine head). `experiments/prepare_clip.py` loads `openai/clip-vit-base-patch32` and 2048 CIFAR-10 test images, each paired with one caption from CLIP's CIFAR prompt templates.
+- Logits vs Hugging Face `CLIPModel`: max |diff| 2.0e-5 (16 pairs), on both hosts.
+- Zero-shot CIFAR-10 with the pretrained weights: 0.893, on both hosts.
+- Training: symmetric contrastive loss, Adam lr 1e-5, batch 512, 5 iterations, fp32. (commit `746418b`)
+
+**Tested** (`experiments/check_clip.py`: one GPU, three GPUs threaded, three GPUs routed; same weights, same data).
+
+| host | microbatches | one GPU | threaded | routed | threaded / routed |
+|---|---|---|---|---|---|
+| B200 | 1 | 498.6 ms | 495.7 ms | 277.3 ms | **1.79x** |
+| H200 | 1 | 558.8 ms | 559.0 ms | 325.1 ms | **1.72x** |
+| H200 | 2 | 1113 ms | 879.5 / 878.5 ms | 993.9 / 644.7 ms | 0.88x / 1.36x, contended |
+
+- Losses are identical within each host across all schedules (difference 0.0). Across hosts they differ in the 5th digit (4.60304 vs 4.603011 at step 1).
+- With one microbatch, threaded is no faster than one GPU: the three stages run strictly one after another. Routing runs the two towers at once.
+- The two-microbatch timings are not clean. The third card (H200 GPU 4) was shared with another user's job; during the second run its utilisation averaged 44% and peaked at 94%, against 9–14% on the other two. The two routed runs differ by 1.5x. Treat these as unmeasured.
+- Threaded with 2 microbatches already overlaps the towers across microbatches (1113 → 879 ms), so routing's gain there should be below the 1-microbatch gain even on idle cards.
+
+**Not yet.** A clean 2-microbatch timing on three idle cards; 1F1B orders; routing combined with TP inside a tower.
