@@ -397,7 +397,12 @@ def piper_setup(
             "No compute_loss node found in per-PP DAGs; falling back to labels on pp_rank=%s",
             loss_pp_ranks[0],
         )
-    ray.get(piper_metadata.actors[0].load_input.remote(example_inputs))
+    # Under consumer routing any stage may read a model input directly (log F71);
+    # otherwise only the first stage does.
+    routed = any(isinstance(d, dict) and d.get("op") == "route" and d.get("mode") == "consumers"
+                 for d in (piper_metadata.schedule_directives or []))
+    input_ranks = list(piper_metadata.actors) if routed else [0]
+    ray.get([piper_metadata.actors[r].load_input.remote(example_inputs) for r in input_ranks])
     ray.get([
         piper_metadata.actors[pp_rank].load_labels.remote(example_outputs)
         for pp_rank in loss_pp_ranks

@@ -82,6 +82,18 @@ class CommunicationExecutor:
                 dist.recv(tensor, src=global_src_rank, group=pp_group)
         return buf
 
+    def recv_meta(self, meta: list, peer_pp_rank: int, stream: torch.cuda.Stream) -> list:
+        """Receive tensors described by (shape, dtype, requires_grad), in order (consumer routing)."""
+        global_src_rank = self.runtime.pipeline_peer_global_rank(peer_pp_rank)
+        buf = [torch.empty(shape, dtype=dtype, requires_grad=rg, device=self.runtime.device)
+               for shape, dtype, rg in meta]
+        with torch.cuda.stream(stream):
+            use_hi_lo = global_src_rank > self.runtime.global_rank
+            pp_group = self.runtime.pp_hi_lo if use_hi_lo else self.runtime.pp_lo_hi
+            for tensor in buf:
+                dist.recv(tensor, src=global_src_rank, group=pp_group)
+        return buf
+
     def recv_bwd(self, shape_meta: list, peer_pp_rank: int, stream: torch.cuda.Stream) -> list:
         global_src_rank = self.runtime.pipeline_peer_global_rank(peer_pp_rank)
 
@@ -776,6 +788,23 @@ class DagExecutor:
             rf = self._rf_enter(task_label)
 
             match task_type:
+                case TaskType.SEND if "route_out_idxs" in self._node_meta(node) or "route_grad_slots" in self._node_meta(node):
+                    # Consumer routing (log F71): send only this edge's tensors.
+                    compute_node = node.data_preds[0]
+                    node_stream.wait_event(comp_events[compute_node.uid])
+                    meta = self._node_meta(node)
+                    cbuf = self.buffers.task[compute_node.uid]
+                    if "route_out_idxs" in meta:
+                        outs = cbuf["send_output"]
+                        outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
+                        send_data = [outs[k] for k in meta["route_out_idxs"]]
+                    else:
+                        send_data = [cbuf["inp_grads"][j] for j in meta["route_grad_slots"]]
+                        assert all(g is not None for g in send_data), (
+                            f"{node.uid}: a routed gradient is missing for slots {meta['route_grad_slots']}")
+                    self.communication.send(send_data, node.peer_pp_rank, stream=node_stream)
+                    self.buffers.release(compute_node.uid)
+
                 case TaskType.SEND:
                     compute_node = node.data_preds[0]
                     node_stream.wait_event(comp_events[compute_node.uid])
@@ -791,7 +820,19 @@ class DagExecutor:
                     comp_evt = last_comp_event_by_stream.get(self.runtime.stream_id(compute_node))
                     if comp_evt is not None:
                         node_stream.wait_event(comp_evt)
-                    if compute_node.task_type == TaskType.FWD:
+                    rmeta = self._node_meta(node)
+                    if compute_node.task_type == TaskType.FWD and "route_slots" in rmeta:
+                        full = self.stages.bucket(self._node_bucket_key(compute_node)).forward_input_meta
+                        recv_tensors = self.communication.recv_meta(
+                            [full[j] for j in rmeta["route_slots"]], node.peer_pp_rank, stream=node_stream)
+                    elif "route_grad_out_idxs" in rmeta:
+                        fwd_uid = compute_node.node_meta.get("fwd_uid")
+                        fwd_key = (compute_node.node_meta.get("bucket_key"), fwd_uid)
+                        shape_all = self.buffers.task[("shape_all",) + fwd_key]
+                        recv_tensors = self.communication.recv_meta(
+                            [(*shape_all[k], False) for k in rmeta["route_grad_out_idxs"]],
+                            node.peer_pp_rank, stream=node_stream)
+                    elif compute_node.task_type == TaskType.FWD:
                         recv_ubid = self._node_bucket_key(compute_node)
                         recv_tensors = self.communication.recv_fwd(
                             recv_ubid, node.peer_pp_rank, stream=node_stream
@@ -1050,6 +1091,51 @@ class DagExecutor:
                     ag_evt.record(node_stream)
                     self.events.all_gather[node.uid] = ag_evt
 
+                case TaskType.FWD if "input_sources" in self._node_meta(node):
+                    # Consumer routing (log F71): each input slot names its supplier.
+                    srcs = self._node_meta(node)["input_sources"]
+                    vals: list = [None] * len(srcs)
+                    for p in node.data_preds:
+                        pm = self._node_meta(p)
+                        if p.task_type == TaskType.RECV:
+                            if p.uid in self.events.recv:
+                                node_stream.wait_event(self.events.recv.pop(p.uid))
+                            for slot, tensor in zip(pm["route_slots"], self.buffers.task[p.uid]):
+                                vals[slot] = tensor
+                            self.buffers.release(p.uid)
+                        elif p.task_type == TaskType.FWD:
+                            outs = self.buffers.task[p.uid]["detached_outs"]
+                            for j, (kind, s_, k) in enumerate(srcs):
+                                if kind == "seg" and s_ == pm.get("segment_id"):
+                                    vals[j] = outs[k]
+                            self.buffers.release(p.uid)
+                        else:
+                            raise NotImplementedError(
+                                f"consumer routing does not yet combine with {p.task_type} before {node.uid}")
+                    for j, (kind, i, _k) in enumerate(srcs):
+                        if kind == "model":
+                            vals[j] = inputs[i]
+                    missing = [j for j, v in enumerate(vals) if v is None]
+                    assert not missing, f"{node.uid}: no supplier delivered input slots {missing} ({srcs})"
+                    self._wait_for_all_gather(node)
+                    _t0 = time.perf_counter()
+                    fwd_out = self.compute.forward(ubid, vals, node_stream)
+                    _inner(node.uid, _t0)
+                    fwd_out["routed"] = True
+                    self.buffers.task[node.uid] = fwd_out
+                    fwd_key = (node.node_meta.get("bucket_key"), node.uid)
+                    self.buffers.task[("shape_ref",) + fwd_key] = [
+                        (x.shape, x.dtype) for x in fwd_out["out_with_grad"]]
+                    self.buffers.task[("shape_all",) + fwd_key] = [
+                        (x.shape, x.dtype) for x in fwd_out["pre_detach_outs"]]
+                    self.buffers.task[fwd_key] = fwd_out
+                    evt = torch.cuda.Event()
+                    evt.record(node_stream)
+                    comp_events[node.uid] = evt
+                    last_comp_event_by_stream[node_stream_id] = evt
+                    if self._node_meta(node).get("zero_free_full_params_after"):
+                        self.params.defer_free_full_params(ubid, evt)
+
                 case TaskType.FWD:
                     recv_pred = next(
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
@@ -1147,7 +1233,34 @@ class DagExecutor:
                     fwd_key = (node.node_meta.get("bucket_key"), fwd_uid)
                     fwd_out = self.buffers.task[fwd_key]
 
-                    if self._node_meta(node).get("compute_loss", False):
+                    routed = bool(fwd_out.get("routed")) and not self._node_meta(node).get("compute_loss", False)
+                    if routed:
+                        # Consumer routing (log F71): sum each output's gradient over every
+                        # consumer that read it, then drive this segment's backward.
+                        acc: dict = {}
+                        my_seg = dag.nodes[fwd_uid].node_meta.get("segment_id")
+                        for p in node.data_preds:
+                            pm = self._node_meta(p)
+                            if p.task_type == TaskType.RECV and "route_grad_out_idxs" in pm:
+                                if p.uid in self.events.recv:
+                                    node_stream.wait_event(self.events.recv.pop(p.uid))
+                                pairs = zip(pm["route_grad_out_idxs"], self.buffers.task[p.uid])
+                            elif p.task_type in (TaskType.BWD, TaskType.BWD_I):
+                                c_sources = dag.nodes[pm["fwd_uid"]].node_meta["input_sources"]
+                                grads = self.buffers.task[p.uid]["inp_grads"]
+                                pairs = [(k, grads[j]) for j, (kind, s_, k) in enumerate(c_sources)
+                                         if kind == "seg" and s_ == my_seg and grads[j] is not None]
+                            else:
+                                continue
+                            for k, g in pairs:
+                                acc[k] = g if k not in acc else acc[k] + g
+                            self.buffers.release(p.uid)
+                        outs = fwd_out["pre_detach_outs"]
+                        outputs_or_loss = [outs[k] for k in sorted(acc)]
+                        upstream_grads = [acc[k] for k in sorted(acc)]
+                        pre_detach_outs = None
+                        detached_outs = None
+                    elif self._node_meta(node).get("compute_loss", False):
                         assert loss_fn is not None
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
@@ -1176,7 +1289,9 @@ class DagExecutor:
                         outputs_or_loss = fwd_out["out_with_grad"]
                         upstream_grads = None
 
-                    if a2a_pred is not None:
+                    if routed:
+                        pass
+                    elif a2a_pred is not None:
                         a2a_buf = self.buffers.task[a2a_pred.uid]
                         pre_detach_outs = fwd_out["pre_detach_outs"]
                         detached_outs = fwd_out["detached_outs"]

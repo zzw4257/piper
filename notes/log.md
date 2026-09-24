@@ -4188,3 +4188,28 @@ Derived vs rule: 0. Derived vs TP=1: 1.0e-6. regather=false vs shipped: 0. Peak 
 **What this says about the abstraction.** Placement decides *which* collective CP needs (gather K/V, derivable). How it is carried out is a second-layer choice: one all-gather, a ring of n-1 hops (needs a combine rule, lets Piper hoist and bound each hop), or DTensor's all-to-all plan. Piper can now take the first from a rule and keep the second explicit.
 
 **Claim boundary.** One ring-attention model; the dependency test is a single perturbation of position 0 in float64, which would miss a dependence that is exactly zero at that point. EP routing untouched.
+
+---
+
+## 2026-09-24 — F71: consumer routing unchains independent branches end to end; on three GPUs the two encoders run at once and the step is 1.86x shorter, with bit-identical losses
+
+**Question.** F66 found that two independent encoders lower as a chain, because the frontend threads every crossing value through each segment in between. Direction B asks whether Piper can run such branches at once (issue #16).
+
+**Where the chain comes from.** Three linear assumptions, not one: (1) `split_gm_by_annotations` makes each segment's outputs exactly the next segment's crossing inputs, and gives runtime inputs only to segment 0; (2) `build_training_dag` adds an edge from each segment to the next; (3) the executor feeds a forward from its first predecessor's whole output (or one recv, or the model inputs), sends a segment's whole output, and returns gradients along the same single path.
+
+**Changed** (all behind `{"op": "route", "mode": "consumers"}`; without it every path is byte-for-byte the old one):
+- Frontend: a value is handed from its producer (or the model input) to the segments that read it, in order; each consumer hands it to the next. Values read by a contiguous run of segments, such as CP's K/V, are threaded exactly as before. Each segment records `input_sources`: for every input slot, `("seg", supplier, output)` or `("model", i)`. (commit `7a21058`)
+- DAG: one edge per supplier instead of one per neighbour.
+- Lowering: each send/recv records the tensors that cross that one edge, forward (producer outputs to consumer slots) and backward (slot gradients back to producer outputs).
+- Executor: a routed forward assembles its inputs slot by slot from same-stage predecessors, recvs and model inputs; a routed backward sums each output's gradient over every consumer and drives autograd on those outputs. Model inputs are loaded on every stage.
+
+**Tested.**
+- CPU (`test/test_routing.py`, suite 96 passed): branches lower as image→decoder and text→decoder with no image→text edge; TP, ZeRO-3 and hoisted CP=4 lowerings are identical with routing on.
+- GPU (`experiments/check_branches.py`, `examples/test_branches.py`, model `examples/models/branches.py`): one GPU threaded, one GPU routed, three GPUs threaded, three GPUs routed, same weights and data. Losses bit-identical in all four, at dim 2048 and at dim 4096.
+- Timing, dim 4096, batch 8192, 8 layers per encoder, 1 decoder layer, fp32, GPUs 1/4/5 idle, three interleaved repeats: threaded 220.6 / 221.1 / 221.0 ms, routed 119.0 / 119.2 / 118.9 ms; **1.86x**. The compute ratio (8+8+1)/(8+1) is 1.89.
+- The first dim-4096 run shared GPU 0 with a tenant at 100% utilisation: 351.4 vs 245.8 ms (1.43x); its one-GPU numbers (489 ms) ran on that card and are not comparable.
+- At dim 2048 the step is about 7 ms and host-bound (F50): routing is no faster there (7.8 vs 6.6 ms).
+
+**Not yet.** Routing does not combine with boundary collectives on the same edge (TP/EP/CP comm before a routed consumer raises `NotImplementedError`); one microbatch only was run; a producer that feeds several consumers on other stages sends each its own subset but was not exercised; no real multimodal model yet.
+
+**Next.** A small real multimodal model (a vision encoder and a text encoder feeding a decoder) with microbatches and 1F1B-style order, and routing combined with TP inside a branch.

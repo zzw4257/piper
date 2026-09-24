@@ -460,11 +460,40 @@ def _insert_send_recv_comm_nodes(dag: TrainingDAG, comm_stream: str | None = Non
                 "bucket_key": dst.node_meta.get("bucket_key"),
             },
         )
+        _annotate_routed_payload(dag, src, dst, send_node, recv_node)
         dag.add_node(send_node)
         dag.add_node(recv_node)
         _remove_edge(dag, edge)
         dag.add_edge(TrainingDAGEdge(src_uid=src.uid, dst_uid=send_uid, dep_kind="data", tensor_name=edge.tensor_name))
         dag.add_edge(TrainingDAGEdge(src_uid=recv_uid, dst_uid=dst.uid, dep_kind="data", tensor_name=edge.tensor_name))
+
+
+def _annotate_routed_payload(dag, src, dst, send_node, recv_node) -> None:
+    """Under consumer routing, record which tensors cross this one edge (log F71).
+
+    Forward: the consumer slots that come from this producer, and the producer
+    output each one is. Backward (consumer.bwd -> producer.bwd): the gradients of
+    those same slots, going back to the same producer outputs.
+    """
+    if src.compute_subkind == "FWD" and dst.compute_subkind == "FWD":
+        consumer, producer = dst, src
+    elif src.compute_subkind in ("BWD", "BWD_I") and dst.compute_subkind in ("BWD", "BWD_I"):
+        consumer = dag.nodes[src.node_meta["fwd_uid"]]
+        producer = dag.nodes[dst.node_meta["fwd_uid"]]
+    else:
+        return
+    sources = consumer.node_meta.get("input_sources")
+    if sources is None:
+        return
+    seg = producer.node_meta.get("segment_id")
+    slots = [j for j, (kind, s_, _k) in enumerate(sources) if kind == "seg" and s_ == seg]
+    out_idxs = [sources[j][2] for j in slots]
+    if src.compute_subkind == "FWD":
+        send_node.node_meta["route_out_idxs"] = out_idxs
+        recv_node.node_meta["route_slots"] = slots
+    else:
+        send_node.node_meta["route_grad_slots"] = slots
+        recv_node.node_meta["route_grad_out_idxs"] = out_idxs
 
 
 def _replicate_update_nodes_by_device(dag: TrainingDAG) -> None:
