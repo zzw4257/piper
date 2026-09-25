@@ -66,6 +66,7 @@ def main(args, pg):
         piper_exec_dag(clip_loss)
     piper_flush_losses()
 
+    ray.get([a.reset_peak_memory.remote() for a in actors.values()])
     iter_times, losses = [], []
     for _ in range(args.iters):
         ray.get([a.drain.remote() for a in actors.values()])
@@ -77,7 +78,9 @@ def main(args, pg):
 
     metrics = {"losses": [float(x) for x in losses], "iter_times": iter_times,
                "dp_rank": int(os.environ.get("PIPER_DP_RANK", 0)),
-               "schedule": os.path.basename(args.schedule_directives_file)}
+               "schedule": os.path.basename(args.schedule_directives_file),
+               "peak_mem_gb": {int(r): m / 2**30 for r, m in ray.get(
+                   [a.get_and_reset_peak_memory_stats.remote() for a in actors.values()])}}
     path = os.path.join(getattr(piper_metadata, "artifact_dir", "out"),
                         f"branches_metrics_dp{metrics['dp_rank']}.json")
     with open(path, "w", encoding="utf-8") as f:

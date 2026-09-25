@@ -43,19 +43,27 @@ def test_consumer_routing_unchains_the_branches() -> None:
     assert dag.nodes["s2.seg2"].node_meta["input_sources"] == [("seg", 0, 0), ("seg", 1, 0)]
 
 
-def test_consumer_routing_leaves_tp_zero3_and_cp_lowerings_unchanged() -> None:
+def test_consumer_routing_leaves_tp_ep_and_cp_lowerings_unchanged() -> None:
     import probe_route
     for name, sched, make in [
         ("tp", [{"op": "place", "filter": {"PP": 0}, "devices": [0, 1]},
                 {"op": "shard_tensor", "filter": {"TP": "*"}, "devices": [0, 1], "stream": "tp_stream"}, p.SPLIT],
+         lambda: (p.TPMlp(32, 128, 2, 1), (torch.empty(8, 32, device="meta"),))),
+        ("tp_derived", [{"op": "place", "filter": {"PP": 0}, "devices": [0, 1]},
+                        {"op": "shard_tensor", "filter": {"TP": "*"}, "devices": [0, 1], "stream": "tp_stream",
+                         "params": {"up": "colwise", "down": "rowwise"}}, p.SPLIT],
+         lambda: (p.TPMlp(32, 128, 1, 1), (torch.empty(8, 32, device="meta"),))),
+        ("ep", [{"op": "place", "filter": {"PP": 0}, "devices": [0, 1]},
+                {"op": "shard", "filter": {"TP": "*"}, "devices": [0, 1], "stream": "ep_stream"}, p.SPLIT],
          lambda: (p.TPMlp(32, 128, 2, 1), (torch.empty(8, 32, device="meta"),))),
         ("cp", [{"op": "place", "filter": {"PP": 0}, "devices": [0, 1, 2, 3]},
                 {"op": "ring_exchange", "filter": {"CP": "*"}, "devices": [0, 1, 2, 3], "tensors": ["k", "v"],
                  "stream": "cp_stream", "hoist": True, "distance": 1}, p.SPLIT],
          lambda: (p.RingAttn(64, 2, 4), tuple(torch.empty(2, 8, 64, device="meta") for _ in range(3)))),
     ]:
-        _, a, _ = probe_route.lower(sched, make)
-        _, b, _ = probe_route.lower([p.ROUTE] + sched, make)
+        _, a, na = probe_route.lower(sched, make)
+        _, b, nb = probe_route.lower([p.ROUTE] + sched, make)
+        assert na == nb == "", (name, na, nb)
         assert probe_route.shape(a) == probe_route.shape(b), name
 
 

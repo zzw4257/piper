@@ -530,13 +530,13 @@ def _routing_mode() -> str:
 
 
 def _collective_region_filters() -> list[dict]:
-    """Filters of ``shard_tensor`` directives: regions whose boundary carries a collective."""
+    """Filters of ``shard_tensor``/``shard`` directives: regions whose boundary carries a collective."""
     from .directives import _normalize_filter_spec
     from .state import piper_metadata
 
     out = []
     for d in getattr(piper_metadata, "schedule_directives", None) or []:
-        if isinstance(d, dict) and d.get("op") == "shard_tensor":
+        if isinstance(d, dict) and d.get("op") in ("shard_tensor", "shard"):
             for f in d.get("filters") or [d.get("filter") or {}]:
                 f = _normalize_filter_spec(f, d)
                 out.append({k: v for k, v in f.items() if k not in ("PASS", "MB")})
@@ -638,8 +638,8 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
         # Values read by a contiguous run of segments -- CP's K and V -- are threaded
         # exactly as before; a value that skips segments no longer passes through them,
         # so independent branches stop depending on each other (log F66, F71).
-        # A shard_tensor region relays nothing it did not produce: its boundary
-        # all-reduces one partial sum, and a relayed value would be reduced with it
+        # A shard_tensor or shard (EP) region relays nothing it did not produce: its
+        # boundary transforms one tensor, and a relayed value would be transformed with it
         # (or its gradient counted twice). The next reader is supplied by whoever
         # supplied the region (log F73).
         from .directives import _match_filter

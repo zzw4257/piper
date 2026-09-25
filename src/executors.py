@@ -1095,6 +1095,7 @@ class DagExecutor:
                     # Consumer routing (log F71): each input slot names its supplier.
                     srcs = self._node_meta(node)["input_sources"]
                     vals: list = [None] * len(srcs)
+                    ring_slots: list = []
                     for p in node.data_preds:
                         pm = self._node_meta(p)
                         if p.task_type == TaskType.RECV:
@@ -1103,23 +1104,39 @@ class DagExecutor:
                             for slot, tensor in zip(pm["route_slots"], self.buffers.task[p.uid]):
                                 vals[slot] = tensor
                             self.buffers.release(p.uid)
-                        elif p.task_type in (TaskType.FWD, TaskType.FWD_TP_ALL_REDUCE):
-                            # A TP all-reduce carries its region's outputs, one reduced (log F73).
-                            producer = p
-                            if p.task_type == TaskType.FWD_TP_ALL_REDUCE:
-                                evt = self.events.a2a.pop(p.uid, None)
+                        elif p.task_type == TaskType.FWD or p.task_type in _FWD_BOUNDARY_COMM_TASKS:
+                            # A boundary collective (TP all-reduce, EP all-to-all, CP ring) carries
+                            # its source region's outputs with some slots replaced (log F73, F75).
+                            seg = pm.get("segment_id")
+                            if p.task_type != TaskType.FWD:
+                                evt = self.events.a2a.get(p.uid)
                                 if evt is not None:
                                     node_stream.wait_event(evt)
-                                producer = next(q for q in p.data_preds if q.task_type == TaskType.FWD)
-                            seg = self._node_meta(producer).get("segment_id")
+                                    # a hoisted ring's event is also awaited by the next ring node
+                                    if len(getattr(p, "data_succs", ())) <= 1:
+                                        self.events.a2a.pop(p.uid, None)
+                                src_uid = pm.get("source_uid") or next(
+                                    q.uid for q in p.data_preds if q.task_type == TaskType.FWD)
+                                seg = dag.nodes[src_uid].node_meta.get("segment_id")
                             outs = self.buffers.task[p.uid]["detached_outs"]
-                            for j, (kind, s_, k) in enumerate(srcs):
-                                if kind == "seg" and s_ == seg:
-                                    vals[j] = outs[k]
+                            if pm.get("hoisted"):
+                                # Only the rotated slots are the ring's; the source region
+                                # supplies the rest. Applied after every other supplier.
+                                ring_slots.append((seg, pm["ring_tensor_idxs"], outs))
+                            else:
+                                for j, (kind, s_, k) in enumerate(srcs):
+                                    if kind == "seg" and s_ == seg:
+                                        vals[j] = outs[k]
                             self.buffers.release(p.uid)
                         else:
                             raise NotImplementedError(
                                 f"consumer routing does not yet combine with {p.task_type} before {node.uid}")
+                    for seg, idxs, outs in ring_slots:
+                        for j, (kind, s_, k) in enumerate(srcs):
+                            if kind == "seg" and s_ == seg and k in idxs:
+                                assert outs[k] is not None, f"hoisted ring for {node.uid} has no tensor at {k}"
+                                outs[k].record_stream(node_stream)
+                                vals[j] = outs[k]
                     for j, (kind, i, _k) in enumerate(srcs):
                         if kind == "model":
                             vals[j] = inputs[i]
@@ -1253,10 +1270,11 @@ class DagExecutor:
                                 if p.uid in self.events.recv:
                                     node_stream.wait_event(self.events.recv.pop(p.uid))
                                 pairs = zip(pm["route_grad_out_idxs"], self.buffers.task[p.uid])
-                            elif p.task_type in (TaskType.BWD, TaskType.BWD_I, TaskType.BWD_TP_ALL_REDUCE):
-                                # A TP all-reduce carries its consumer's input grads, one reduced (log F73).
+                            elif p.task_type in (TaskType.BWD, TaskType.BWD_I) or p.task_type in _BWD_BOUNDARY_COMM_TASKS:
+                                # A boundary collective carries its consumer's input grads with
+                                # some slots replaced (log F73, F75).
                                 consumer = p
-                                if p.task_type == TaskType.BWD_TP_ALL_REDUCE:
+                                if p.task_type in _BWD_BOUNDARY_COMM_TASKS:
                                     evt = self.events.a2a.pop(p.uid, None)
                                     if evt is not None:
                                         node_stream.wait_event(evt)
@@ -1266,9 +1284,6 @@ class DagExecutor:
                                 grads = self.buffers.task[p.uid]["inp_grads"]
                                 pairs = [(k, grads[j]) for j, (kind, s_, k) in enumerate(c_sources)
                                          if kind == "seg" and s_ == my_seg and grads[j] is not None]
-                            elif p.task_type in _BWD_BOUNDARY_COMM_TASKS:
-                                raise NotImplementedError(
-                                    f"consumer routing does not yet combine with {p.task_type} before {node.uid}")
                             else:
                                 continue
                             # The sum must run on this node's stream, which is the one that
@@ -1281,8 +1296,11 @@ class DagExecutor:
                                     acc[k] = g if k not in acc else acc[k] + g
                             self.buffers.release(p.uid)
                         outs = fwd_out["pre_detach_outs"]
-                        outputs_or_loss = [outs[k] for k in sorted(acc)]
-                        upstream_grads = [acc[k] for k in sorted(acc)]
+                        # A forwarded model input (CP K/V in the first ring region) gets a
+                        # gradient downstream but has nothing to backpropagate into here.
+                        keep = [k for k in sorted(acc) if outs[k].requires_grad]
+                        outputs_or_loss = [outs[k] for k in keep]
+                        upstream_grads = [acc[k] for k in keep]
                         pre_detach_outs = None
                         detached_outs = None
                     elif self._node_meta(node).get("compute_loss", False):

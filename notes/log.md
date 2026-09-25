@@ -4299,3 +4299,45 @@ Derived vs rule: 0. Derived vs TP=1: 1.0e-6. regather=false vs shipped: 0. Peak 
 - The routed step grows with m (324 → 411 ms); per-microbatch overhead, not studied.
 
 **Meaning.** With many microbatches, threading already overlaps the branches through the pipeline; routing saves fill and drain. Its larger effects are elsewhere: few microbatches, and TP inside a branch, which threading cannot express (F73).
+
+---
+
+## 2026-09-25 — F75: consumer routing composes with every boundary collective; routed runs equal threaded ones to the last bit, and under 1F1B routing also lowers the first stage's peak memory
+
+**Changed.**
+- Executor: a routed forward takes any boundary collective as a supplier (TP all-reduce, EP all-to-all, CP ring, hoisted CP ring). The collective carries its source region's outputs with some slots replaced; the source is `source_uid`, or the collective's forward predecessor for an incoming all-to-all. A hoisted ring supplies only its rotated slots, applied after the source region's.
+- A routed backward takes any backward collective the same way, by the consumer behind it.
+- A routed backward skips outputs that need no gradient: CP forwards K/V, and in the first ring region they are model inputs.
+- Frontend: EP (`shard`) regions relay nothing they did not produce, like `shard_tensor` regions (F73).
+
+**Tested: routed equals threaded** (`experiments/check_route_equiv.py`). On linear models routing leaves the DAG unchanged, but every forward and backward takes the routed path. Losses and each rank's fp64 parameter checksum compared exactly. H200, idle cards.
+
+| case | GPUs | result |
+|---|---|---|
+| TP=2 MLP | 2 | identical |
+| TP=2, derived placements (`params`) | 2 | identical |
+| EP=2 (`shard` on the MLP) | 2 | identical |
+| TP=2 × PP=2, 4 microbatches, 1F1B | 4 | identical |
+| CP=2 ring | 2 | identical |
+| CP=4 hoisted ring + DP | 4 | identical |
+
+- The first CP runs failed with "element 1 of tensors does not require grad" (the model-input K/V above); fixed.
+- CPU: the routing-invariance test now covers derived TP and EP and asserts that lowering succeeds; suite 97 passed.
+
+**Tested: 1F1B on CLIP** (fixed work, batch 512/m; one GPU, three GPUs threaded, three GPUs routed; losses identical in every run).
+- 1F1B warmup forwards equal the stage's depth: threaded vision 2, text 1, head 0; routed vision 1, text 1, head 0.
+
+| m | order | threaded | routed | ratio | peak GB, vision stage (threaded → routed) |
+|---|---|---|---|---|---|
+| 4 | GPipe | 445.5 ms | 376.1 ms | 1.18x | 19.77 → 19.77 |
+| 4 | 1F1B | 698.0 ms* | 605.0 ms* | — | 15.62 → 11.15 |
+| 8 | GPipe | 448.5 ms | 410.9 ms | 1.09x | 19.66 → 19.66 |
+| 8 | 1F1B | 436.8 ms | 411.3 ms | 1.06x | 8.80 → 6.57 |
+
+\* a third card was shared during the m=4 1F1B pair (49% mean utilisation from another job); times not usable, memory is.
+- Text stage peaks match between threaded and routed (both warm up 1); the head holds under 1 GB.
+- Under 1F1B the vision stage holds (depth + 1) microbatches: 3 threaded, 2 routed. Measured activation part (peak minus ~1 GB of weights and Adam state): 7.75 vs 5.52 GB, ratio 1.40 against 1.5.
+
+**Meaning.** Routing now composes with TP, EP and CP boundaries. Its lasting value under many microbatches is memory: a branch that is no longer deep in a chain keeps fewer microbatches in flight.
+
+**Not yet.** A branch with EP or CP inside under routing on GPU (only linear models tested); a clean timing of the m=4 1F1B pair.

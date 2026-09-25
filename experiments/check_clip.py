@@ -29,7 +29,8 @@ def run(schedule, extra, repo):
         sys.exit(f"{schedule} failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}")
     run_dir = os.path.join(repo, re.findall(r"out/\d{8}_\d{6}", proc.stdout)[-1])
     m = [json.load(open(f)) for f in glob.glob(f"{run_dir}/branches_metrics_dp*.json")]
-    return {"dir": os.path.relpath(run_dir, repo), "losses": m[0]["losses"], "times": m[0]["iter_times"]}
+    return {"dir": os.path.relpath(run_dir, repo), "losses": m[0]["losses"], "times": m[0]["iter_times"],
+            "mem": m[0].get("peak_mem_gb", {})}
 
 
 def main():
@@ -38,7 +39,9 @@ def main():
     extra = [a for a in sys.argv[1:] if not a.startswith('--mb')]
     mb = next((a.split('=')[1] for a in sys.argv[1:] if a.startswith('--mb=')), '1')
     sfx = '' if mb == '1' else f'_mb{mb}'
-    NAMES = [f'clip_single{sfx}', f'clip_threaded{sfx}', f'clip_routed{sfx}']
+    var = next((a.split('=')[1] for a in sys.argv[1:] if a.startswith('--variant=')), '')
+    extra = [a for a in extra if not a.startswith('--variant=')]
+    NAMES = [f'clip_single{sfx}', f'clip_threaded{sfx}{var}', f'clip_routed{sfx}{var}']
     runs = {name: run(name, extra, repo) for name in NAMES}
     ref = runs[NAMES[0]]["losses"]
     ok = True
@@ -46,7 +49,8 @@ def main():
         worst = max(abs(a - b) for a, b in zip(r["losses"], ref))
         ok &= worst <= TOL
         print(f"{name:18s} {r['dir']}  losses {[round(x, 6) for x in r['losses']]}  "
-              f"vs one GPU {worst:.1e}  median step {statistics.median(r['times']) * 1e3:.1f} ms")
+              f"vs one GPU {worst:.1e}  median step {statistics.median(r['times']) * 1e3:.1f} ms  "
+              f"peak GB {[round(v, 2) for _, v in sorted(r['mem'].items())]}")
     t_thr = statistics.median(runs[NAMES[1]]["times"])
     t_rt = statistics.median(runs[NAMES[2]]["times"])
     print(f"three GPUs: threaded {t_thr * 1e3:.1f} ms, routed {t_rt * 1e3:.1f} ms, ratio {t_thr / t_rt:.2f}x")
