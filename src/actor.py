@@ -812,8 +812,9 @@ class PiperActor:
         """
         total = sq = 0.0
         n = 0
+        per_param = []  # (bucket, slot, sum, sumsq): which parameter moved, not just whether
 
-        def _accumulate(t):
+        def _accumulate(t, where=None):
             nonlocal total, sq, n
             if t is None:
                 return False
@@ -829,18 +830,20 @@ class PiperActor:
             total += float(d.sum())
             sq += float((d * d).sum())
             n += d.numel()
+            if where is not None:
+                per_param.append((*where, float(d.sum()), float((d * d).sum())))
             return True
 
-        for bucket in self.stages.buckets.values():
+        for key, bucket in self.stages.buckets.items():
             # Under ZeRO-3 the shard is what persists between steps and is what
             # the optimizer updates; the full parameter is transient.
             if _accumulate(getattr(bucket, "shard_param", None)):
                 continue
             args = getattr(bucket, "forward_args", None) or []
             for idx in getattr(bucket, "trainable_param_idxs", None) or []:
-                _accumulate(args[idx] if idx < len(args) else None)
+                _accumulate(args[idx] if idx < len(args) else None, (str(key), idx))
         return {"rank": int(self.runtime.global_rank), "n_params": n,
-                "sum": total, "sumsq": sq}
+                "sum": total, "sumsq": sq, "per_param": per_param}
 
     def flush_losses(self) -> list:
         """Losses PIPER_SYNC_MODE=defer is still holding after the last step."""

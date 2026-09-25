@@ -4239,3 +4239,37 @@ Derived vs rule: 0. Derived vs TP=1: 1.0e-6. regather=false vs shipped: 0. Peak 
 - Threaded with 2 microbatches already overlaps the towers across microbatches (1113 → 879 ms), so routing's gain there should be below the 1-microbatch gain even on idle cards.
 
 **Not yet.** A clean 2-microbatch timing on three idle cards; 1F1B orders; routing combined with TP inside a tower.
+
+---
+
+## 2026-09-25 — F73: TP inside a branch needs routing; with it, TP=2 inside each encoder trains bit-identically on four GPUs. Also a stream bug in F71's gradient sum
+
+**Question.** Can a branch be tensor-parallel while the branches run at once?
+
+**Found.**
+- Threaded, TP inside an encoder cannot be lowered. The image TP region would relay `x_txt` and its own input `a` (the residual), and `shard_tensor` refuses a boundary that carries 3 tensors: one boundary, one all-reduce.
+- F71's consumer routing still relayed `a` through the TP region, since a value read by consecutive segments is handed reader to reader (the rule that keeps CP's K/V threaded). 2 tensors, still refused.
+
+**Changed.**
+- Frontend (consumer mode only): a region matched by `shard_tensor` relays nothing it did not produce. The next reader is supplied by whoever supplied the region.
+- Executor: a routed forward accepts a forward TP all-reduce as a supplier; a routed backward accepts a backward TP all-reduce. Other boundary collectives raise `NotImplementedError`; the backward used to skip them silently.
+- Stream bug: a routed backward summed the gradients from several readers on the thread's current stream, while only `node_stream` had waited for the recv/all-reduce events. The sum now runs on `node_stream`, with `record_stream` on gradients made on another stream. F71's runs had one reader per value, so no sum kernel ran and they are unaffected.
+- `param_checksum` also reports per-parameter sums.
+
+**How the bug was found.**
+- First loss matched, later losses drifted (8e-3 by step 5).
+- Per-parameter checksums after one step: TP shards summed over ranks match the unsharded weights; post layers and decoder match; replicated weights agree across TP ranks; only the pre layers differ.
+- fp64 CPU replay of one Adam step, scaling the residual path and the TP path gradients separately: the GPU result equals "TP path gradient = 0" in all 8 pre-layer sums to 6 digits.
+- A debug print showed the two TP ranks reading different "reduced" gradients: the read happened before the all-reduce, into fresh memory.
+
+**Tested.**
+- CPU: `test/test_routing.py` (4 tests, one new: lowering refused threaded, accepted routed, edges and TP comms as expected); suite 97 passed.
+- GPU, H200 cards 2/4/5/6 idle: dim 4096, batch 4096, per encoder 4 layers + TP MLP (hidden 16384) + post, 1 decoder layer, Adam lr 1e-5, no warmup, 5 steps.
+
+| run | GPUs | losses vs one GPU | median step |
+|---|---|---|---|
+| one GPU, routed | 1 | reference | 221.4 ms |
+| routed | 2 | bit-identical | 123.0 ms |
+| routed, TP=2 per encoder | 4 | bit-identical | 89.9 ms |
+
+**Not yet.** EP or CP under routing; derived (`params`) shard_tensor under routing; several microbatches with TP.

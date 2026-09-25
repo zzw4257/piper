@@ -529,6 +529,20 @@ def _routing_mode() -> str:
     return "thread"
 
 
+def _collective_region_filters() -> list[dict]:
+    """Filters of ``shard_tensor`` directives: regions whose boundary carries a collective."""
+    from .directives import _normalize_filter_spec
+    from .state import piper_metadata
+
+    out = []
+    for d in getattr(piper_metadata, "schedule_directives", None) or []:
+        if isinstance(d, dict) and d.get("op") == "shard_tensor":
+            for f in d.get("filters") or [d.get("filter") or {}]:
+                f = _normalize_filter_spec(f, d)
+                out.append({k: v for k, v in f.items() if k not in ("PASS", "MB")})
+    return out
+
+
 def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[AnnotationSegment]]:
     """Split a GraphModule into contiguous subgraphs by Piper annotation stack.
 
@@ -624,6 +638,16 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
         # Values read by a contiguous run of segments -- CP's K and V -- are threaded
         # exactly as before; a value that skips segments no longer passes through them,
         # so independent branches stop depending on each other (log F66, F71).
+        # A shard_tensor region relays nothing it did not produce: its boundary
+        # all-reduces one partial sum, and a relayed value would be reduced with it
+        # (or its gradient counted twice). The next reader is supplied by whoever
+        # supplied the region (log F73).
+        from .directives import _match_filter
+        no_relay = {
+            s for s in range(n_segs)
+            if any(_match_filter(_tag_from_stack(segment_stacks[s]), f)
+                   for f in _collective_region_filters())
+        }
         for node in nodes:
             if node not in value_seg:
                 continue
@@ -636,9 +660,10 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
             for c in consumers:
                 seg_cross_in[c].append(node)
                 supplier[(c, node)] = prev
-                if prev >= 0:
+                if prev >= 0 and node not in seg_outputs[prev]:
                     seg_outputs[prev].append(node)
-                prev = c
+                if c not in no_relay:
+                    prev = c
 
     segments: list[AnnotationSegment] = []
     output_node = next((node for node in nodes if node.op == "output"), None)

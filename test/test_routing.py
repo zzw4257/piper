@@ -57,3 +57,39 @@ def test_consumer_routing_leaves_tp_zero3_and_cp_lowerings_unchanged() -> None:
         _, a, _ = probe_route.lower(sched, make)
         _, b, _ = probe_route.lower([p.ROUTE] + sched, make)
         assert probe_route.shape(a) == probe_route.shape(b), name
+
+
+def _tp_branches_schedule(route):
+    s = [{"op": "place", "filter": {"PP": 0}, "devices": [0, 1]},
+         {"op": "place", "filter": {"PP": 1}, "devices": [2, 3]},
+         {"op": "place", "filter": {"PP": 2}, "devices": [2, 3]},
+         {"op": "shard_tensor", "filter": {"PP": 0, "TP": "*"}, "devices": [0, 1], "stream": "tp_stream"},
+         {"op": "shard_tensor", "filter": {"PP": 1, "TP": "*"}, "devices": [2, 3], "stream": "tp_stream"},
+         p.SPLIT,
+         {"op": "order", "filters": [[{"PP": 0, "PASS": "F"}], [{"PP": 0, "PASS": "B"}]]},
+         {"op": "order", "filters": [[{"PP": 1, "PASS": "F"}], [{"PP": 2, "PASS": "F"}],
+                                     [{"PP": 2, "PASS": "B"}], [{"PP": 1, "PASS": "B"}]]}]
+    return ([p.ROUTE] if route else []) + s
+
+
+def _tp_branches():
+    from models.branches import Branches
+    return Branches(64, 2, 2, 1, hidden=256, tp_degree=2), (torch.empty(8, 64, device="meta"),
+                                                            torch.empty(8, 64, device="meta"))
+
+
+def test_tp_inside_a_branch_needs_routing() -> None:
+    # Threaded, the image TP region would relay x_txt and its own input: one all-reduce cannot serve three tensors.
+    _, _, note = p.lower(_tp_branches_schedule(False), _tp_branches)
+    assert note, "threaded lowering must refuse a TP region that relays other values"
+    dag, _, note = p.lower(_tp_branches_schedule(True), _tp_branches)
+    assert note == ""
+    # The TP region reads the residual and emits only its partial sum; the residual goes straight to post.
+    assert dag.nodes["s0.seg1"].node_meta["input_sources"] == [("seg", 0, 0)]
+    assert dag.nodes["s0.seg2"].node_meta["input_sources"] == [("seg", 0, 0), ("seg", 1, 0)]
+    data = {(e.src_uid, e.dst_uid) for e in dag.edges if e.dep_kind == "data"}
+    assert {("s0.seg1", "tp_all_reduce.0"), ("tp_all_reduce.0", "s0.seg2"), ("s0.seg0", "s0.seg2")} <= data
+    # Backward: the residual's gradient reaches seg0 twice, once all-reduced through the TP region.
+    assert {("s0.seg2.bwd", "s0.seg0.bwd"), ("s0.seg1.bwd", "tp_all_reduce.1"),
+            ("tp_all_reduce.1", "s0.seg0.bwd")} <= data
+    assert sum(n.node_kind == "TP_COMM" for n in dag.nodes.values()) == 4

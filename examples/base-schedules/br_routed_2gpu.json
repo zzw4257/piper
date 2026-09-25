@@ -1,0 +1,85 @@
+[
+ {
+  "op": "route",
+  "mode": "consumers"
+ },
+ {
+  "op": "place",
+  "filter": {
+   "PP": 0
+  },
+  "devices": [
+   0
+  ]
+ },
+ {
+  "op": "place",
+  "filter": {
+   "PP": 1
+  },
+  "devices": [
+   1
+  ]
+ },
+ {
+  "op": "place",
+  "filter": {
+   "PP": 2
+  },
+  "devices": [
+   1
+  ]
+ },
+ {
+  "op": "split",
+  "filter": {},
+  "dim_name": "MB",
+  "num_microbatches": 1
+ },
+ {
+  "op": "order",
+  "filters": [
+   [
+    {
+     "PP": 0,
+     "PASS": "F"
+    }
+   ],
+   [
+    {
+     "PP": 0,
+     "PASS": "B"
+    }
+   ]
+  ]
+ },
+ {
+  "op": "order",
+  "filters": [
+   [
+    {
+     "PP": 1,
+     "PASS": "F"
+    }
+   ],
+   [
+    {
+     "PP": 2,
+     "PASS": "F"
+    }
+   ],
+   [
+    {
+     "PP": 2,
+     "PASS": "B"
+    }
+   ],
+   [
+    {
+     "PP": 1,
+     "PASS": "B"
+    }
+   ]
+  ]
+ }
+]

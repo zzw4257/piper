@@ -16,7 +16,7 @@ import statistics
 import subprocess
 import sys
 
-TOL = 1e-4
+TOL = 1e-4  # relative (absolute below 1)
 
 
 def run(schedule, extra, repo):
@@ -32,18 +32,21 @@ def run(schedule, extra, repo):
 
 def main():
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    extra = sys.argv[1:]
-    runs = {name: run(name, extra, repo) for name in ("br_single", "br_single_routed", "br_threaded", "br_routed")}
-    ref = runs["br_single"]["losses"]
+    extra = [a for a in sys.argv[1:] if not a.startswith("--runs=")]
+    names = next((a.split("=", 1)[1].split(",") for a in sys.argv[1:] if a.startswith("--runs=")),
+                 ["br_single", "br_single_routed", "br_threaded", "br_routed"])
+    runs = {name: run(name, extra, repo) for name in names}
+    ref = runs[names[0]]["losses"]
     ok = True
     for name, r in runs.items():
-        worst = max(abs(a - b) for a, b in zip(r["losses"], ref))
+        worst = max(abs(a - b) / max(abs(b), 1.0) for a, b in zip(r["losses"], ref))
         ok &= worst <= TOL
         print(f"{name:18s} {r['dir']}  losses {[round(x, 6) for x in r['losses']]}  "
               f"vs one GPU {worst:.1e}  median step {statistics.median(r['times']) * 1e3:.1f} ms")
-    t_thr = statistics.median(runs["br_threaded"]["times"])
-    t_rt = statistics.median(runs["br_routed"]["times"])
-    print(f"three GPUs: threaded {t_thr * 1e3:.1f} ms, routed {t_rt * 1e3:.1f} ms, ratio {t_thr / t_rt:.2f}x")
+    if "br_threaded" in runs and "br_routed" in runs:
+        t_thr = statistics.median(runs["br_threaded"]["times"])
+        t_rt = statistics.median(runs["br_routed"]["times"])
+        print(f"three GPUs: threaded {t_thr * 1e3:.1f} ms, routed {t_rt * 1e3:.1f} ms, ratio {t_thr / t_rt:.2f}x")
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

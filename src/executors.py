@@ -1103,10 +1103,18 @@ class DagExecutor:
                             for slot, tensor in zip(pm["route_slots"], self.buffers.task[p.uid]):
                                 vals[slot] = tensor
                             self.buffers.release(p.uid)
-                        elif p.task_type == TaskType.FWD:
+                        elif p.task_type in (TaskType.FWD, TaskType.FWD_TP_ALL_REDUCE):
+                            # A TP all-reduce carries its region's outputs, one reduced (log F73).
+                            producer = p
+                            if p.task_type == TaskType.FWD_TP_ALL_REDUCE:
+                                evt = self.events.a2a.pop(p.uid, None)
+                                if evt is not None:
+                                    node_stream.wait_event(evt)
+                                producer = next(q for q in p.data_preds if q.task_type == TaskType.FWD)
+                            seg = self._node_meta(producer).get("segment_id")
                             outs = self.buffers.task[p.uid]["detached_outs"]
                             for j, (kind, s_, k) in enumerate(srcs):
-                                if kind == "seg" and s_ == pm.get("segment_id"):
+                                if kind == "seg" and s_ == seg:
                                     vals[j] = outs[k]
                             self.buffers.release(p.uid)
                         else:
@@ -1245,15 +1253,32 @@ class DagExecutor:
                                 if p.uid in self.events.recv:
                                     node_stream.wait_event(self.events.recv.pop(p.uid))
                                 pairs = zip(pm["route_grad_out_idxs"], self.buffers.task[p.uid])
-                            elif p.task_type in (TaskType.BWD, TaskType.BWD_I):
-                                c_sources = dag.nodes[pm["fwd_uid"]].node_meta["input_sources"]
+                            elif p.task_type in (TaskType.BWD, TaskType.BWD_I, TaskType.BWD_TP_ALL_REDUCE):
+                                # A TP all-reduce carries its consumer's input grads, one reduced (log F73).
+                                consumer = p
+                                if p.task_type == TaskType.BWD_TP_ALL_REDUCE:
+                                    evt = self.events.a2a.pop(p.uid, None)
+                                    if evt is not None:
+                                        node_stream.wait_event(evt)
+                                    consumer = next(q for q in p.data_preds
+                                                    if q.task_type in (TaskType.BWD, TaskType.BWD_I))
+                                c_sources = dag.nodes[self._node_meta(consumer)["fwd_uid"]].node_meta["input_sources"]
                                 grads = self.buffers.task[p.uid]["inp_grads"]
                                 pairs = [(k, grads[j]) for j, (kind, s_, k) in enumerate(c_sources)
                                          if kind == "seg" and s_ == my_seg and grads[j] is not None]
+                            elif p.task_type in _BWD_BOUNDARY_COMM_TASKS:
+                                raise NotImplementedError(
+                                    f"consumer routing does not yet combine with {p.task_type} before {node.uid}")
                             else:
                                 continue
-                            for k, g in pairs:
-                                acc[k] = g if k not in acc else acc[k] + g
+                            # The sum must run on this node's stream, which is the one that
+                            # waited for the recv/all-reduce events; a gradient made on another
+                            # stream is also marked as read here before its buffer is released.
+                            with torch.cuda.stream(node_stream):
+                                for k, g in pairs:
+                                    if p.task_type != TaskType.BWD:
+                                        g.record_stream(node_stream)
+                                    acc[k] = g if k not in acc else acc[k] + g
                             self.buffers.release(p.uid)
                         outs = fwd_out["pre_detach_outs"]
                         outputs_or_loss = [outs[k] for k in sorted(acc)]
