@@ -4273,3 +4273,29 @@ Derived vs rule: 0. Derived vs TP=1: 1.0e-6. regather=false vs shipped: 0. Peak 
 | routed, TP=2 per encoder | 4 | bit-identical | 89.9 ms |
 
 **Not yet.** EP or CP under routing; derived (`params`) shard_tensor under routing; several microbatches with TP.
+
+---
+
+## 2026-09-25 — F74: routing's gain over threading is a pipeline-depth saving, 1 + (T/V)/m; on CLIP the prediction holds to 0.01
+
+**Correction to F72.** Piper's `split` does not split data: every microbatch reads the whole loaded input. F72's two-microbatch runs were two full batches (twice the work). The fixed-work runs below pass batch 512/m.
+
+**Model.** Vision tower time V, text tower T, head about 0.
+- Threaded, 3 stages, GPipe: text of microbatch i overlaps vision of i+1, so a step is about V + T/m.
+- Routed: the towers run at once, so about V.
+- Ratio 1 + (T/V)/m. The one-microbatch run gives T/V = 0.72.
+
+**Tested** (H200 cards 2/4/5/6, idle during the runs; CLIP ViT-B/32, 512 pairs per step).
+
+| m | batch per mb | one GPU | threaded | routed | measured | predicted |
+|---|---|---|---|---|---|---|
+| 1 | 512 | 558.8 ms | 558.7 ms | 323.9 ms | 1.72x | (fit) |
+| 2 | 256 | 600.7 ms | 475.9 ms | 349.5 ms | 1.36x | 1.36x |
+| 4 | 128 | 651.7 ms | 444.6 ms | 374.5 ms | 1.19x | 1.18x |
+| 8 | 64 | 706.7 ms | 443.0 ms | 410.9 ms | 1.08x | 1.09x |
+
+- Losses identical across one GPU, threaded and routed at every m.
+- Full-batch microbatches (F72's m=2, rerun clean): 879.0 vs 643.3 ms, 1.37x; the ratio does not depend on batch size.
+- The routed step grows with m (324 → 411 ms); per-microbatch overhead, not studied.
+
+**Meaning.** With many microbatches, threading already overlaps the branches through the pipeline; routing saves fill and drain. Its larger effects are elsewhere: few microbatches, and TP inside a branch, which threading cannot express (F73).
