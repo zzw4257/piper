@@ -1026,6 +1026,20 @@ def _boundary_info_for_edge(
             f"{kind} missing tensor_idx for edge {src_node.uid}->{dst_node.uid}; "
             f"producer={producer.uid} boundary_info={binfo!r}"
         )
+    if producer is not src_node:
+        # A backward collective acts on the consumer's input gradients. Threaded, the
+        # consumer's input slots are the producer's outputs in order; under consumer
+        # routing they are not, so name the consumer slot that holds this output (log F76).
+        consumer = dag.nodes.get(src_node.node_meta.get("fwd_uid"))
+        sources = consumer.node_meta.get("input_sources") if consumer is not None else None
+        if sources is not None:
+            want = ("seg", producer.node_meta.get("segment_id"), binfo["tensor_idx"])
+            slots = [j for j, src in enumerate(sources) if tuple(src) == want]
+            if len(slots) != 1:
+                raise ValueError(
+                    f"{kind}: consumer {consumer.uid} reads output {binfo['tensor_idx']} of "
+                    f"{producer.uid} in {len(slots)} slots ({sources})")
+            binfo = {**binfo, "tensor_idx": slots[0]}
     return binfo
 
 
@@ -1229,6 +1243,7 @@ def _insert_tp_all_reduce_comm_nodes(
     devices: list[int],
     comm_stream: str | None = None,
     params: dict[str, str] | None = None,
+    inputs: dict[str, str] | None = None,
 ) -> None:
     """Insert TP activation all-reduces at the boundary of a tensor-parallel region.
 
@@ -1338,14 +1353,18 @@ def _insert_tp_all_reduce_comm_nodes(
         if fwd_uid not in derived:
             m = dag.nodes[fwd_uid].node_meta
             derived[fwd_uid] = derive_boundary_placements(
-                m["gm"], m["graphargs"], m["input_idxs"], m["param_idxs"], params, len(expected))
+                m["gm"], m["graphargs"], m["input_idxs"], m["param_idxs"], params, len(expected),
+                inputs=inputs)
         d = derived[fwd_uid]
         if node.compute_subkind == "FWD":
             partial = [k for k, pl in enumerate(d["outputs"]) if pl.is_partial()]
             other = [pl for pl in d["outputs"] if not (pl.is_partial() or pl.is_replicate())]
         else:
             partial = [k for k, pl in d["input_grads"].items() if pl.is_partial()]
-            other = [pl for pl in d["input_grads"].values() if not (pl.is_partial() or pl.is_replicate())]
+            # A gradient placed like its input (a sequence-split input's gradient stays
+            # split) needs nothing on the boundary.
+            other = [pl for k, pl in d["input_grads"].items()
+                     if not (pl.is_partial() or pl.is_replicate() or pl == d["input_placements"].get(k))]
         if other or len(partial) > 1:
             raise ValueError(
                 f"shard_tensor(params={params}) on {node.uid}: boundary placements "
@@ -2320,7 +2339,8 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
             )
         elif op == "shard_tensor":
             _insert_tp_all_reduce_comm_nodes(
-                training_dag, filters, devices, comm_stream=stream, params=raw.get("params"))
+                training_dag, filters, devices, comm_stream=stream, params=raw.get("params"),
+                inputs=raw.get("inputs"))
         else:
             raise ValueError(f"Unsupported directive op after normalization: {op}")
 

@@ -19,8 +19,11 @@ import sys
 TOL = 1e-4  # relative (absolute below 1)
 
 
+TEST = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--test=")), "examples/test_branches.py")
+
+
 def run(schedule, extra, repo):
-    cmd = [sys.executable, "examples/test_harness.py", "--test-file", "examples/test_branches.py",
+    cmd = [sys.executable, "examples/test_harness.py", "--test-file", TEST,
            "--base-schedule", f"examples/base-schedules/{schedule}.json", "--schedule", "custom", *extra]
     proc = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=1800)
     if proc.returncode != 0:
@@ -32,7 +35,7 @@ def run(schedule, extra, repo):
 
 def main():
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    extra = [a for a in sys.argv[1:] if not a.startswith("--runs=")]
+    extra = [a for a in sys.argv[1:] if not a.startswith(("--runs=", "--test="))]
     names = next((a.split("=", 1)[1].split(",") for a in sys.argv[1:] if a.startswith("--runs=")),
                  ["br_single", "br_single_routed", "br_threaded", "br_routed"])
     runs = {name: run(name, extra, repo) for name in names}

@@ -27,8 +27,11 @@ def _placement(spec: str):
 
     # nn.Linear weights are [out, in]: column-parallel splits outputs, row-parallel splits inputs.
     table = {"colwise": Shard(0), "rowwise": Shard(1), "replicate": Replicate()}
+    m = re.fullmatch(r"shard\((\d+)\)", spec)
+    if m:
+        return Shard(int(m.group(1)))
     if spec not in table:
-        raise ValueError(f"unknown parameter placement {spec!r}; expected one of {sorted(table)}")
+        raise ValueError(f"unknown placement {spec!r}; expected one of {sorted(table)} or 'shard(d)'")
     return table[spec]
 
 
@@ -55,12 +58,17 @@ def derive_boundary_placements(
     param_idxs: list[int],
     params: dict[str, str],
     world_size: int,
+    inputs: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Placements of a segment's outputs and runtime-input gradients.
 
     ``params`` maps a module name (``"up"``) to ``"colwise"``, ``"rowwise"`` or
-    ``"replicate"``; unnamed parameters and all runtime inputs are replicated.
-    Returns ``{"outputs": [...], "input_grads": {graphargs_idx: placement}}``.
+    ``"replicate"``; unnamed parameters are replicated. ``inputs`` maps the position
+    of a runtime input (``"0"`` is the first) to ``"replicate"`` or ``"shard(d)"``;
+    unnamed inputs are replicated. A sharded input is built from a local tensor of
+    the traced shape, since the region was traced on one rank's chunk (log F76).
+    Returns ``{"outputs": [...], "input_grads": {graphargs_idx: placement},
+    "input_placements": {graphargs_idx: placement}}``.
     """
     from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
     from torch.utils._debug_mode import DebugMode
@@ -69,15 +77,21 @@ def derive_boundary_placements(
     names = [n.name for n in gm.graph.nodes if n.op == "placeholder"]
     patterns = {k: re.compile(rf"(^|_)modules_{re.escape(k)}_parameters_") for k in params}
     input_grads: dict[int, Any] = {}
+    input_placements: dict[int, Any] = {}
     with _fake_mesh(world_size) as mesh:
         args = []
         for i, (g, name) in enumerate(zip(graphargs, names)):
             if not isinstance(g, torch.Tensor):
                 args.append(g)
                 continue
-            spec = next((params[k] for k, p in patterns.items() if p.search(name)), "replicate") \
-                if i in param_idxs else "replicate"
-            t = distribute_tensor(torch.randn(tuple(g.shape)), mesh, [_placement(spec)])
+            if i in param_idxs:
+                spec = next((params[k] for k, p in patterns.items() if p.search(name)), "replicate")
+                t = distribute_tensor(torch.randn(tuple(g.shape)), mesh, [_placement(spec)])
+            else:
+                pos = input_idxs.index(i) if i in input_idxs else -1
+                pl = _placement((inputs or {}).get(str(pos), "replicate"))
+                input_placements[i] = pl
+                t = DTensor.from_local(torch.randn(tuple(g.shape)), mesh, [pl], run_check=False)
             args.append(t.requires_grad_(i in param_idxs or i in input_idxs))
             if i in input_idxs:
                 # Record the input gradient as computed. Accumulating a Partial gradient into
@@ -105,6 +119,7 @@ def derive_boundary_placements(
         return {
             "outputs": [o.placements[0] for o in outs],
             "input_grads": input_grads,
+            "input_placements": input_placements,
         }
 
 

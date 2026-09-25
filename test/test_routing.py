@@ -101,3 +101,33 @@ def test_tp_inside_a_branch_needs_routing() -> None:
     assert {("s0.seg2.bwd", "s0.seg0.bwd"), ("s0.seg1.bwd", "tp_all_reduce.1"),
             ("tp_all_reduce.1", "s0.seg0.bwd")} <= data
     assert sum(n.node_kind == "TP_COMM" for n in dag.nodes.values()) == 4
+
+
+def test_cp_inside_a_branch_derives_one_forward_all_reduce() -> None:
+    import json
+    from models.branches_cp import BranchesCP
+    sched = json.load(open("examples/base-schedules/brcp_routed_cp2.json"))
+    make = lambda: (BranchesCP(64, 4, 2, 64), (torch.empty(4, 64, device="meta"),) + tuple(  # noqa: E731
+        torch.empty(4, 32, 64, device="meta") for _ in range(3)))
+    dag, _, note = p.lower(sched, make)
+    assert note == ""
+    kinds = sorted((n.node_kind, n.tag["PASS"]) for n in dag.nodes.values() if n.node_kind in ("TP_COMM", "RING_COMM"))
+    # the pool's sequence-split input keeps a split gradient: no backward all-reduce
+    assert kinds == [("RING_COMM", "B"), ("RING_COMM", "F"), ("TP_COMM", "F")]
+    assert dag.nodes["s2.seg6"].node_meta["input_sources"] == [("seg", 0, 0), ("seg", 5, 0)]
+
+
+def test_backward_collective_indexes_the_consumer_slot_under_routing() -> None:
+    # EP inside a branch: the post segment reads (a, e), so e's gradient is its slot 1,
+    # although e is output 0 of the EP region.
+    import json
+    from models.branches_cp import BranchesCP
+    sched = json.load(open("examples/base-schedules/brcp_routed_cp2_ep2.json"))
+    make = lambda: (BranchesCP(64, 4, 2, 64, 2, 1, True), (torch.empty(4, 64, device="meta"),) + tuple(  # noqa: E731
+        torch.empty(4, 32, 64, device="meta") for _ in range(3)))
+    dag, _, note = p.lower(sched, make)
+    assert note == ""
+    assert dag.nodes["s0.seg2"].node_meta["input_sources"] == [("seg", 0, 0), ("seg", 1, 0)]
+    idx = {(n.tag["PASS"], n.node_meta["direction"]): n.node_meta["a2a_tensor_idx"]
+           for n in dag.nodes.values() if n.node_kind == "A2A_COMM"}
+    assert idx == {("F", "incoming"): 0, ("F", "outgoing"): 0, ("B", "incoming"): 1, ("B", "outgoing"): 0}

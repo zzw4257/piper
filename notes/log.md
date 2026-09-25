@@ -4341,3 +4341,26 @@ Derived vs rule: 0. Derived vs TP=1: 1.0e-6. regather=false vs shipped: 0. Peak 
 **Meaning.** Routing now composes with TP, EP and CP boundaries. Its lasting value under many microbatches is memory: a branch that is no longer deep in a chain keeps fewer microbatches in flight.
 
 **Not yet.** A branch with EP or CP inside under routing on GPU (only linear models tested); a clean timing of the m=4 1F1B pair.
+
+---
+
+## 2026-09-25 — F76: CP and EP inside a branch lower correctly under routing; input placements let `shard_tensor` derive a CP-to-merge boundary; a backward-index bug fixed. GPU check pending (H200 GPU 4 fault)
+
+**Question.** Can a branch hold CP or EP while the branches run at once?
+
+**Model** (`examples/models/branches_cp.py`).
+- Image branch: MLP layers, optionally an expert layer in an EP region with a residual, `a = post(a + gelu(expert(a)))`.
+- Text branch: ring attention on one rank's sequence chunk (CP regions as in `ring_attn.py`), then a pool region, `t.sum(dim=1) / seq_total`, whose output is a partial sum across the CP group.
+- Decoder merges the two.
+
+**Changed.**
+- `shard_tensor` derived mode takes `inputs` (runtime-input position to `"replicate"` or `"shard(d)"`). A sharded input is built from a local tensor of the traced shape. Rule: a partial output or a partial input gradient gets an all-reduce; an input gradient placed like its input needs nothing. The pool gets `inputs: {"0": "shard(1)"}` and derives one forward all-reduce and no backward one. The plain TP rule would have all-reduced the sequence-split gradient too.
+- Bug: under routing, a backward boundary collective indexed the consumer's input gradients with the producer's output index. They coincide threaded and in F73/F75's cases. With EP inside a branch the post segment reads (a, e), so `e` is its slot 1 while it is output 0 of the EP region: the backward all-to-all would have exchanged the residual's gradient. `_boundary_info_for_edge` now names the consumer slot.
+- Frontend: `shard` (EP) regions relay nothing they did not produce (F75).
+
+**Tested (CPU).**
+- CP branch lowers to: ring on K/V between the two CP steps (forward and backward), one forward TP all-reduce after the pool, none backward; decoder reads the image branch directly.
+- EP branch: backward incoming all-to-all indexes slot 1, the others 0.
+- Suite 99 passed.
+
+**Not tested (GPU).** H200 GPU 4 dropped off the bus ("Unable to determine the device handle ... Unknown Error"). Since then every multi-GPU NCCL init on the host fails in NVML (`nvmlDeviceGetHandleByIndex(4) failed`), also a bare 2-card all-reduce on healthy cards, with or without NCCL_NVLS_ENABLE=0 / NCCL_P2P_DISABLE=1 / NCCL_SHM_DISABLE=1. Prepared: `check_branches.py --test=examples/test_branches_cp.py --runs=brcp_single,brcp_routed_cp2` (and `--ep` with `brcp_routed_cp2_ep2`, compare first loss and non-expert parameters after one step).

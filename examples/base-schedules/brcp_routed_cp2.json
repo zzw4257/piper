@@ -1,0 +1,120 @@
+[
+ {
+  "op": "route",
+  "mode": "consumers"
+ },
+ {
+  "op": "place",
+  "filter": {
+   "PP": 0
+  },
+  "devices": [
+   0,
+   2
+  ]
+ },
+ {
+  "op": "place",
+  "filter": {
+   "PP": 1
+  },
+  "devices": [
+   1,
+   3
+  ]
+ },
+ {
+  "op": "place",
+  "filter": {
+   "PP": 2
+  },
+  "devices": [
+   1,
+   3
+  ]
+ },
+ {
+  "op": "ring_exchange",
+  "filter": {
+   "PP": 1,
+   "CP": "*"
+  },
+  "devices": [
+   1,
+   3
+  ],
+  "tensors": [
+   "k",
+   "v"
+  ],
+  "stream": "cp_stream"
+ },
+ {
+  "op": "shard_tensor",
+  "filter": {
+   "PP": 1,
+   "TP": "*"
+  },
+  "devices": [
+   1,
+   3
+  ],
+  "stream": "tp_stream",
+  "params": {},
+  "inputs": {
+   "0": "shard(1)"
+  }
+ },
+ {
+  "op": "split",
+  "filter": {},
+  "dim_name": "MB",
+  "num_microbatches": 1
+ },
+ {
+  "op": "order",
+  "filters": [
+   [
+    {
+     "PP": 0,
+     "PASS": "F"
+    }
+   ],
+   [
+    {
+     "PP": 0,
+     "PASS": "B"
+    }
+   ]
+  ]
+ },
+ {
+  "op": "order",
+  "filters": [
+   [
+    {
+     "PP": 1,
+     "PASS": "F"
+    }
+   ],
+   [
+    {
+     "PP": 2,
+     "PASS": "F"
+    }
+   ],
+   [
+    {
+     "PP": 2,
+     "PASS": "B"
+    }
+   ],
+   [
+    {
+     "PP": 1,
+     "PASS": "B"
+    }
+   ]
+  ]
+ }
+]
