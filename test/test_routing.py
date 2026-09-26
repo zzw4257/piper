@@ -131,3 +131,19 @@ def test_backward_collective_indexes_the_consumer_slot_under_routing() -> None:
     idx = {(n.tag["PASS"], n.node_meta["direction"]): n.node_meta["a2a_tensor_idx"]
            for n in dag.nodes.values() if n.node_kind == "A2A_COMM"}
     assert idx == {("F", "incoming"): 0, ("F", "outgoing"): 0, ("B", "incoming"): 1, ("B", "outgoing"): 0}
+
+
+def test_vlm_text_stops_passing_through_the_vision_stages() -> None:
+    # SmolVLM, vision in three stages, embedding + decoder on the fourth: threaded, the
+    # prompt's token ids ride through every vision stage; routed, only the image does.
+    import json
+    from models.smolvlm import SmolVLM
+    make = lambda: (SmolVLM(5, 1, 3), (torch.empty(2, 3, 512, 512, device="meta"),  # noqa: E731
+                                       torch.zeros(2, 112, dtype=torch.long, device="meta")))
+    for kind, crossing in (("threaded", {"input_ids"}), ("routed", set())):
+        dag, _, note = p.lower(json.load(open(f"examples/base-schedules/vlm_4st_{kind}_mb1.json")), make)
+        assert note == "", note
+        for vis in ("s0.seg0", "s1.seg1", "s2.seg2"):
+            names = set(dag.nodes[vis].node_meta["output_names"])
+            assert {n for n in names if "input_ids" in n} == {n for n in names if any(c in n for c in crossing)}, (kind, vis, names)
+            assert len(names) == 1 + len(crossing), (kind, vis, names)

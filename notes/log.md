@@ -4364,3 +4364,41 @@ Derived vs rule: 0. Derived vs TP=1: 1.0e-6. regather=false vs shipped: 0. Peak 
 - Suite 99 passed.
 
 **Not tested (GPU).** H200 GPU 4 dropped off the bus ("Unable to determine the device handle ... Unknown Error"). Since then every multi-GPU NCCL init on the host fails in NVML (`nvmlDeviceGetHandleByIndex(4) failed`), also a bare 2-card all-reduce on healthy cards, with or without NCCL_NVLS_ENABLE=0 / NCCL_P2P_DISABLE=1 / NCCL_SHM_DISABLE=1. Prepared: `check_branches.py --test=examples/test_branches_cp.py --runs=brcp_single,brcp_routed_cp2` (and `--ep` with `brcp_routed_cp2_ep2`, compare first loss and non-expert parameters after one step).
+
+---
+
+## 2026-09-26 — F77: a real vision-language model in Piper: SmolVLM-256M on COCO captions. The encoder is 3.9x the decoder, so its lever is stage balance, not branch overlap. Multi-GPU runs pending (H200 GPU 4 fault)
+
+**Why this model.** CLIP (F72) has two towers of similar size and no decoder. The shape Piper §4.2 points at is an encoder feeding a language model. SmolVLM-256M-Instruct is the smallest released one: SigLIP vision tower (768 wide, 12 layers, 1024 patches of a 512x512 image), a pixel-shuffle connector to 64 tokens, and a Llama decoder (576 wide, 30 layers, GQA 9/3). The decoder's `lm_head` is not tied, so no parameter spans two stages.
+
+**Model** (`examples/models/smolvlm.py`, Hugging Face parameter names).
+- Regions, in order: vision (split into `vis_stages`), text embedding, decoder (split into `dec_stages`).
+- The first decoder region concatenates the 64 image tokens at the prompt's fixed offset.
+- Splitting the vision or decoder into regions leaves the output bit-identical.
+
+**Data** (`experiments/prepare_smolvlm.py`).
+- 512 COCO val2017 images, first caption each, in SmolVLM's chat template: user turn with the image and "Describe this image in one sentence.", assistant turn with the caption.
+- Right-padded to 112 tokens; next-token labels on the caption only.
+- Weights and data came from ModelScope, since hf-mirror and huggingface.co time out from the H200 host. torchvision was added to the H200 run venv for the HF image processor (data prep only).
+
+**Checks.**
+- Logits vs `Idefics3ForConditionalGeneration` on CPU: identical (max |diff| 0, loss 2.89549 both).
+- On GPU the two differ by up to 0.16 (scale 28.8). They choose different attention kernels, and the decoder's residual stream reaches about 600, which amplifies fp32 rounding.
+- The reference captions real images sensibly, e.g. "In this image we can see some zebras standing on the ground. In the background there is a wall." for COCO's "Three zebras standing in front of a wall."
+- Piper, one GPU, batch 16: first loss 3.8334508 equals the eager model's 3.833451. Losses 3.833 / 2.466 / 1.576 / 0.996 / 0.671 over 5 steps on one batch. Step 312.4 ms, peak 16.9 GB.
+
+**Cost profile** (one H200, fp32, batch 16, forward+backward, eager).
+
+| part | ms |
+|---|---|
+| vision tower + connector | 247.8 |
+| text embedding | 0.72 |
+| decoder + lm_head | 64.1 |
+
+- Vision is 3.9x the decoder; the text branch is negligible. Running the branches at once buys nothing here.
+- The lever is balance. Vision | decoder on two GPUs is bound by the vision stage (at most about 1.26x). Vision split three ways plus the decoder gives four stages of about 83/83/83/64 ms per 16 images.
+- Routing still matters for traffic. Threaded, the prompt's token ids ride through every vision stage; routed, only the image does, and the embedding runs on the decoder's GPU. Asserted in `test/test_routing.py`.
+
+**One GPU, fixed work (batch 32 over m microbatches).** m=1 592.6 ms, m=4 789.3 ms, m=8 1053.7 ms; peak 29.8 / 28.3 / 25.2 GB. The per-microbatch overhead is large at 4 images per microbatch.
+
+**Prepared, not run.** 20 multi-GPU schedules, all lowered on CPU: `vlm_{2st,4st}_{threaded,routed}_mb{1,4,8}[_1f1b]` (2 or 4 GPUs). They wait for the H200 host's NCCL (F76).
