@@ -802,4 +802,22 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
             )
         )
 
+    # A trainable parameter read by two regions is lifted into each, and every region
+    # realizes and optimizes its own copy (actor._load_stage, one optimizer per bucket):
+    # the copies would silently drift apart, each seeing only its own region's gradient.
+    # Tied embeddings are the common case; Piper's Qwen3 configs untie them for this
+    # reason. Refuse until shared parameters have one owner (log F79).
+    users: dict[str, list[int]] = {}
+    for node in grapharg_placeholders:
+        if not bool(getattr(_example_value(node), "requires_grad", False)):
+            continue
+        segs = sorted({c for u in node.users for c in [node_seg.get(u)] if c is not None})
+        if len(segs) > 1:
+            users[node.name] = segs
+    if users:
+        raise ValueError(
+            "trainable parameters are used by more than one annotated region, and each region "
+            f"would train its own copy: {dict(list(users.items())[:4])}. Keep every use of a "
+            "parameter inside one region, or untie it (e.g. a separate output projection "
+            "instead of tied embeddings).")
     return gm, segments

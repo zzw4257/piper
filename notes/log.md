@@ -4453,3 +4453,39 @@ All within 1%. Piper's own overhead on these steps is below the model's resoluti
 **Design point this raises.** The two modalities want different microbatch sizes: the vision tower is compute-bound and pipelines well in small pieces, while the decoder is launch-bound and wants few large ones. Piper's `split` applies one m to the whole DAG. Per-region microbatching (merge microbatches at the vision→decoder boundary) would be a schedule transform in the Layer 2 sense; not built.
 
 **Next.** Run `check_vlm.py` for m = 1/4/8 when the H200 host's NCCL is back, and compare against the table above.
+
+---
+
+## 2026-09-27 — F79: the two modalities want different microbatch sizes (predicted 1.30x over the best single m); what stands in the way; and a silent bug refused: a parameter shared by two regions trains as two copies
+
+**Per-region microbatching, simulated** (F78's model, extended: decoder microbatch j waits for vision microbatches jk..jk+k-1; profiles at b = 32/16/8/4/2, `notes/profile_smolvlm.json`; SmolVLM, 4 stages, 32 pairs; one GPU 587.4 ms).
+
+| vision m | decoder m | step ms | vs one GPU |
+|---|---|---|---|
+| 1 | 1 | 587.4 | 1.00 |
+| 2 | 2 | 398.9 | 1.47 |
+| 4 | 4 | 393.3 | 1.49 |
+| 8 | 8 | 610.6 | 0.96 |
+| 4 | 1 | 365.0 | 1.61 |
+| 4 | 2 | 331.7 | 1.77 |
+| 8 | 1 | 336.9 | 1.74 |
+| **8** | **2** | **303.6** | **1.93** |
+| 16 | 2 | 312.6 | 1.88 |
+
+- The decoder costs about 65 ms per microbatch at any b ≤ 16 (launch-bound), so it wants few microbatches. The vision stages want many.
+- Vision 8 / decoder 2 beats the best single m (m=4, 393.3) by 1.30x.
+
+**What Piper would need.**
+- (a) `split` to slice the loaded inputs per microbatch; today every microbatch reads the whole input (F74).
+- (b) A merge at the boundary: concatenate k producer microbatches along the batch dim forward, chunk the gradient backward. The DAG side is expressible as a nested split of the vision sub-DAG; the executor's routed forward would concatenate same-segment suppliers in microbatch order.
+- (c) Regions run at a batch size other than the traced one. Dynamo bakes the batch into `view`/`reshape`, so the vision regions would need a dynamic batch dim or a second trace.
+- Writing the chunking in the model instead (vision applied to k slices, each its own region) hits (d).
+
+**(d) Found: a trainable parameter read by two regions is lifted into both, and each region trains its own copy.**
+- Each region realizes its parameters separately (`actor._load_stage`) and each bucket has its own optimizer. The copies would drift apart, each seeing only its own region's gradient, with no error.
+- CPU probe: a Linear used in regions 0 and 2 appears as a parameter of both segments.
+- Tied input/output embeddings are the common case. Piper's Qwen3 configs set `enable_weight_tying=False` everywhere; torchtitan's own Qwen3 configs set it True.
+- Changed: `split_gm_by_annotations` now refuses a trainable parameter used by more than one region, naming it and suggesting untying. Buffers read by every region (RoPE tables) are unaffected.
+- Checked on CPU: Llama3 debug (2 stages), Qwen3 9M (2 stages), CLIP (3), SmolVLM, CP=2 ring attention all still lower. New `test/test_shared_params.py` (refused when shared, fine for a shared buffer). Suite 102 passed.
+
+**Next.** Per-region microbatching needs (a)–(c); sharing needs one owner per parameter (one realized tensor per actor, one optimizer entry, and a gradient reduction when the regions sit on different stages). Both are design proposals for now; the multi-GPU check of F78's predictions comes first.

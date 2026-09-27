@@ -69,7 +69,7 @@ def smolvlm_stages(data_dir):
         return {"vision": (vis(0, 12, True, True), [px]), "vision_1": (vis(0, 4, True, False), [px]),
                 "vision_2": (vis(4, 8, False, False), [h1]), "vision_3": (vis(8, 12, False, True), [h2]),
                 "decoder": (dec, [ids, img_all])}
-    return make, (32, 8, 4)
+    return make, (32, 16, 8, 4, 2)
 
 
 def clip_stages(data_dir):
