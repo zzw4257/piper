@@ -4402,3 +4402,54 @@ Derived vs rule: 0. Derived vs TP=1: 1.0e-6. regather=false vs shipped: 0. Peak 
 **One GPU, fixed work (batch 32 over m microbatches).** m=1 592.6 ms, m=4 789.3 ms, m=8 1053.7 ms; peak 29.8 / 28.3 / 25.2 GB. The per-microbatch overhead is large at 4 images per microbatch.
 
 **Prepared, not run.** 20 multi-GPU schedules, all lowered on CPU: `vlm_{2st,4st}_{threaded,routed}_mb{1,4,8}[_1f1b]` (2 or 4 GPUs). They wait for the H200 host's NCCL (F76).
+
+---
+
+## 2026-09-27 — F78: a four-line pipeline model predicts every measured CLIP step to ±1%; its SmolVLM predictions, written down before the multi-GPU runs
+
+**Why.** The H200 host cannot run multi-GPU jobs (F76), and the question for SmolVLM is which placement to use. If single-GPU stage profiles predict multi-GPU steps, placements can be chosen before any GPU is booked.
+
+**Model** (`experiments/pipeline_sim.py`).
+- A stage runs its tasks one at a time in schedule order (GPipe, or 1F1B with depth warm-up forwards).
+- A forward waits for the same microbatch on every upstream stage; a backward waits for every downstream stage.
+- Durations are profiled forward/backward times at the microbatch size (`experiments/profile_stages.py`: one GPU, eager, fp32, stage input detached as at a Piper boundary; median of 5).
+- No communication and no host cost are modelled.
+
+**Validation on CLIP** (profiles `notes/profile_clip.json`; measurements from F74/F75, H200, 512 pairs).
+
+| m | order | threaded pred / meas | routed pred / meas | ratio pred / meas |
+|---|---|---|---|---|
+| 1 | GPipe | 561.3 / 558.7 | 325.6 / 323.9 | 1.72 / 1.72 |
+| 2 | GPipe | 476.7 / 475.9 | 350.5 / 349.5 | 1.36 / 1.36 |
+| 4 | GPipe | 444.6 / 444.6 | 374.6 / 374.5 | 1.19 / 1.19 |
+| 8 | GPipe | 446.6 / 443.0 | 408.7 / 410.9 | 1.09 / 1.08 |
+| 8 | 1F1B | 432.3 / 436.8 | 407.5 / 411.3 | 1.06 / 1.06 |
+
+All within 1%. Piper's own overhead on these steps is below the model's resolution.
+
+**SmolVLM profile** (`notes/profile_smolvlm.json`, fwd+bwd ms per microbatch).
+
+| stage | b=32 | b=8 | b=4 |
+|---|---|---|---|
+| vision (12 layers + connector) | 488.4 | 132.1 | 70.4 |
+| vision third | about 163 | about 44 | about 24 |
+| decoder (embedding + 30 layers + head) | 98.6 | 63.3 | 64.4 |
+
+- The decoder stops getting cheaper below 8 samples: at 112 tokens and 576 wide it is launch-bound (30 layers of small kernels, eager).
+- The vision tower scales with the batch.
+
+**Predictions** (fixed work, 32 pairs; one GPU = sum of stages; single-GPU measured F77: 592.6 / 789.3 / 1053.7 ms for m = 1/4/8, predicted 587.0 / 781.4 / 1078.2).
+
+| m | 2 stages GPipe | 2 stages 1F1B | 4 stages GPipe | 4 stages 1F1B |
+|---|---|---|---|---|
+| 1 | 587.0 | — | 587.1 | — |
+| 4 | 591.6 | 548.5 | **385.5** | 385.5 |
+| 8 | 627.6 | 621.5 | 585.8 | 585.8 |
+
+- Best: 4 stages at m=4, 1.52x the best single-GPU step (m=1, 587 ms).
+- At m=8 the decoder, run 8 times at launch-bound cost, becomes the bottleneck (8 x 64 = 512 ms) and the gain is gone.
+- Routing does not change these numbers (the text embedding costs 0.7 ms); it only removes the token ids from the vision stages' sends.
+
+**Design point this raises.** The two modalities want different microbatch sizes: the vision tower is compute-bound and pipelines well in small pieces, while the decoder is launch-bound and wants few large ones. Piper's `split` applies one m to the whole DAG. Per-region microbatching (merge microbatches at the vision→decoder boundary) would be a schedule transform in the Layer 2 sense; not built.
+
+**Next.** Run `check_vlm.py` for m = 1/4/8 when the H200 host's NCCL is back, and compare against the table above.
