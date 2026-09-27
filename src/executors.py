@@ -1605,6 +1605,10 @@ class DagExecutor:
 
         for ar_evt in self.events.all_reduce.values():
             stream.wait_event(ar_evt)
+        if getattr(self.stages, "shared_params", False):
+            # An owner's step must see the gradient every borrowing region added (log F80).
+            for evt in self.events.backward.values():
+                stream.wait_event(evt)
 
         for ubid, bucket in self.stages.buckets.items():
             if bucket.optimizer is None:

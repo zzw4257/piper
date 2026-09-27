@@ -4489,3 +4489,30 @@ All within 1%. Piper's own overhead on these steps is below the model's resoluti
 - Checked on CPU: Llama3 debug (2 stages), Qwen3 9M (2 stages), CLIP (3), SmolVLM, CP=2 ring attention all still lower. New `test/test_shared_params.py` (refused when shared, fine for a shared buffer). Suite 102 passed.
 
 **Next.** Per-region microbatching needs (a)–(c); sharing needs one owner per parameter (one realized tensor per actor, one optimizer entry, and a gradient reduction when the regions sit on different stages). Both are design proposals for now; the multi-GPU check of F78's predictions comes first.
+
+---
+
+## 2026-09-28 — F80: regions on one device group can share a parameter; with it, the vision tower runs in smaller pieces than the decoder, written in the model. Correct on one GPU; the multi-GPU timing is queued
+
+**Changed.**
+- Actor: a trainable parameter read by several regions on one actor is realized once (keyed by its placeholder name). Their gradients accumulate on that leaf; the first region that realized it owns it in its optimizer, the others leave it out.
+- With shared parameters, the update waits for every region's backward before any step.
+- Refused at lowering (after placement): sharing across device groups, or with DP/ZeRO on a sharing region. Each would need a gradient reduction that is not built. F79's blanket refusal is narrowed to this.
+- ZeRO-managed buckets with a borrowed parameter raise.
+- SmolVLM `vis_chunks=k`: the vision tower runs on k slices of the batch, each slice its own regions, sharing the vision weights; the decoder concatenates the slices. Stacked with `split` into m microbatches, the vision tower pipelines in k·m pieces and the decoder in m: F79's per-region microbatching, expressed in the model, with no change to `split` and one trace.
+- Routing hands `pixel_values` chunk to chunk (the relay rule CP's ring needs), so each device's backward order runs the chunks last-first. `experiments/mk_vlm_chunk_schedules.py` writes them.
+
+**Tested.**
+- CPU: sharing on one device group lowers; across three device groups it is refused; a buffer shared across groups is fine (`test/test_shared_params.py`). Suite 103 passed.
+- Eager: vision in 4 chunks vs 1, max |diff| 2e-6 (tiling).
+- One GPU through Piper, batch 32, Adam lr 1e-5, 5 steps.
+
+| run | losses |
+|---|---|
+| unchunked | 3.93015, 2.54587, 1.65385, 1.16447, 0.82310 |
+| vision in 4 chunks | 3.93015, 2.54587, 1.65385, 1.16447, 0.82311 |
+
+  If the chunks held separate copies, each would see a quarter of the gradient and the losses would part after step 1.
+- The single-GPU step times of this session are not usable: another job on the shared account started on GPUs 0/2/5/6 during the runs.
+
+**Queued** (`check_vlm.py`, H200, once NCCL is back): `vlm_4st_routed_c{4,2,8,4}_mb{2,4,1,1}` next to the uniform schedules. F79's model predicts vision 8 / decoder 2 (k=4, m=2) at 303.6 ms against 393.3 ms for the best uniform m.

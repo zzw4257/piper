@@ -153,6 +153,8 @@ class StageStore:
         self.graph_modules.clear()
         self.buckets.clear()
 
+    shared_params: bool = False  # some bucket borrows a parameter another bucket owns (log F80)
+
     def ensure_bucket(self, ubid: Any) -> BucketState:
         return self.buckets.setdefault(ubid, BucketState())
 

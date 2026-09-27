@@ -2249,6 +2249,40 @@ def _reject_overlapping_boundary_comm_directives(
             claimed[uid] = (idx, op)
 
 
+def _check_shared_parameters(dag: TrainingDAG) -> None:
+    """A trainable parameter read by several regions is one tensor per actor (log F80).
+
+    That holds only when every region reading it runs on the same device group and no
+    DP/ZeRO collective touches those regions; otherwise each group, or each gradient
+    reduction, would see a separate copy. Refuse those cases."""
+    users: dict[str, set[tuple]] = {}
+    synced: set[str] = set()
+    sync_kinds = {"REDUCE_COMM", "ALL_GATHER_COMM", "REDUCE_SCATTER_COMM"}
+    for uid, n in dag.nodes.items():
+        m = n.node_meta
+        if n.compute_subkind != "FWD" or "gm" not in m:
+            continue
+        names = [x.name for x in m["gm"].graph.nodes if x.op == "placeholder"]
+        trainable = [names[i] for i in m.get("param_idxs", [])
+                     if i < len(names) and getattr(m["graphargs"][i], "requires_grad", False)]
+        near_sync = any(dag.nodes[v].node_kind in sync_kinds
+                        for v in list(dag.succs.get(uid, ())) + list(dag.preds.get(uid, ())))
+        for name in trainable:
+            users.setdefault(name, set()).add((uid, tuple(sorted(n.device or ()))))
+            if near_sync:
+                synced.add(name)
+    for name, us in users.items():
+        segs = {u.split(".split")[0] for u, _ in us}
+        if len(segs) < 2:
+            continue
+        devs = {d for _, d in us}
+        if len(devs) > 1 or name in synced:
+            raise ValueError(
+                f"parameter {name} is read by regions {sorted(segs)[:4]} on device groups {sorted(devs)}"
+                f"{' with a DP/ZeRO collective' if name in synced else ''}: each would train its own copy. "
+                "Keep regions that share a parameter on one device group without replicate/shard, or untie it.")
+
+
 def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] | None) -> None:
     if not directives:
         return
@@ -2360,3 +2394,5 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
         n = _fuse_tp_collectives(training_dag, [flt])
         logger.debug("Applying directive[%d]: fuse_collectives(filter=%s) -> %d group(s)",
                      i, flt, n)
+
+    _check_shared_parameters(training_dag)

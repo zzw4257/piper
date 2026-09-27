@@ -459,14 +459,24 @@ class PiperActor:
 
             # Realize parameter tensors.
             realized = [None] * len(forward_args)
+            borrowed: set[int] = set()
+            owned = self.__dict__.setdefault("_realized_params_by_name", {})
             for i, arg in enumerate(forward_args):
                 if arg is None:
                     continue
-                t = torch.empty(arg.shape, dtype=arg.dtype, device=self.runtime.device)
                 ph_name_t = (
                     shared_placeholder_names[i]
                     if i < len(shared_placeholder_names) else ""
                 )
+                # A parameter several regions on this actor read (log F80): one tensor,
+                # so their gradients accumulate on one leaf; the first region that
+                # realized it owns it in its optimizer.
+                if arg.requires_grad and ph_name_t and ph_name_t in owned:
+                    realized[i] = owned[ph_name_t]
+                    borrowed.add(i)
+                    self.stages.shared_params = True
+                    continue
+                t = torch.empty(arg.shape, dtype=arg.dtype, device=self.runtime.device)
                 override = self.model_param_overrides.get(ph_name_t)
                 if override is not None:
                     if tuple(override.shape) != tuple(arg.shape):
@@ -497,6 +507,8 @@ class PiperActor:
                     else:
                         t.zero_()
                 realized[i] = t
+                if arg.requires_grad and ph_name_t:
+                    owned[ph_name_t] = t
 
             shared_name_to_idx = {
                 name: i for i, name in enumerate(shared_placeholder_names)
@@ -577,6 +589,8 @@ class PiperActor:
                 and bool(trainable_idxs)
                 and ubid in self.stages.zero_managed_ubids
             )
+            if borrowed and zero_managed:
+                raise ValueError(f"bucket {ubid}: a parameter shared between regions cannot be ZeRO-managed")
             params_sharded = ubid in self.stages.param_sharded_ubids
             grads_sharded = ubid in self.stages.grad_sharded_ubids
 
@@ -647,7 +661,7 @@ class PiperActor:
                 bucket.reduce_scatter_grads = None
                 bucket.param_shard_info = None
                 bucket.full_params_fresh = False
-                trainable_for_optim = [realized[i] for i in trainable_idxs]
+                trainable_for_optim = [realized[i] for i in trainable_idxs if i not in borrowed]
                 optim = self.optim_class(trainable_for_optim, fused=True) if trainable_for_optim else None
             bucket.optimizer = optim
 

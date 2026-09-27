@@ -36,7 +36,7 @@ def main(args, pg):
 
     piper_setup(
         SmolVLM,
-        model_args=(data["image_offset"], args.dec_stages, args.vis_stages),
+        model_args=(data["image_offset"], args.dec_stages, args.vis_stages, None, args.vis_chunks),
         optim_fn=functools.partial(torch.optim.Adam, lr=args.lr),
         example_inputs=[pixel_values, input_ids],
         example_outputs=labels,
@@ -83,6 +83,7 @@ def parse_args(argv=None):
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--dec-stages", type=int, default=1)
     ap.add_argument("--vis-stages", type=int, default=1)
+    ap.add_argument("--vis-chunks", type=int, default=1)
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--warmup", type=int, default=0)
     ap.add_argument("--iters", type=int, default=5)

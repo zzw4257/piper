@@ -200,12 +200,17 @@ class Idefics3Model(nn.Module):
 class SmolVLM(nn.Module):
     """``image_offset``: index of the first image token in every prompt.
     ``dec_stages`` / ``vis_stages``: how many PP regions the decoder layers and the
-    vision layers are split into. Regions in order: vision, text embedding, decoder."""
+    vision layers are split into. ``vis_chunks``: the vision tower runs on that many
+    slices of the batch, each its own set of regions, so it pipelines in smaller
+    pieces than the decoder (log F80); the slices share the vision parameters.
+    Regions in order: vision (chunk-major), text embedding, decoder."""
 
-    def __init__(self, image_offset: int, dec_stages: int = 1, vis_stages: int = 1, config: dict | None = None):
+    def __init__(self, image_offset: int, dec_stages: int = 1, vis_stages: int = 1, config: dict | None = None,
+                 vis_chunks: int = 1):
         super().__init__()
         self.c = c = dict(CFG, **(config or {}))
         self.image_offset, self.dec_stages, self.vis_stages = image_offset, dec_stages, vis_stages
+        self.vis_chunks = vis_chunks
         self.n_img = (c["image"] // c["patch"]) ** 2 // c["scale"] ** 2
         self.model = Idefics3Model(c)
         self.lm_head = nn.Linear(c["t_width"], c["vocab"], bias=False)
@@ -220,13 +225,17 @@ class SmolVLM(nn.Module):
     def forward(self, pixel_values, input_ids):
         vm = self.model.vision_model
         vper = -(-len(vm.encoder.layers) // self.vis_stages)
-        for s in range(self.vis_stages):
-            with annotate("PP"):
-                img = vm.embeddings(pixel_values) if s == 0 else img
-                for layer in vm.encoder.layers[s * vper:(s + 1) * vper]:
-                    img = layer(img)
-                if s == self.vis_stages - 1:
-                    img = self.model.connector(vm.post_layernorm(img))
+        b = pixel_values.shape[0] // self.vis_chunks
+        imgs = []
+        for c in range(self.vis_chunks):
+            for s in range(self.vis_stages):
+                with annotate("PP"):
+                    img = vm.embeddings(pixel_values[c * b:(c + 1) * b]) if s == 0 else img
+                    for layer in vm.encoder.layers[s * vper:(s + 1) * vper]:
+                        img = layer(img)
+                    if s == self.vis_stages - 1:
+                        img = self.model.connector(vm.post_layernorm(img))
+            imgs.append(img)
         with annotate("PP"):
             txt = self.model.text_model.embed_tokens(input_ids)
         layers = self.model.text_model.layers
@@ -234,6 +243,7 @@ class SmolVLM(nn.Module):
         for s in range(self.dec_stages):
             with annotate("PP"):
                 if s == 0:
+                    img = imgs[0] if len(imgs) == 1 else torch.cat(imgs, dim=0)
                     o = self.image_offset
                     h = torch.cat([txt[:, :o], img, txt[:, o + self.n_img:]], dim=1)
                 cos, sin = self._rope(h.shape[1], h.device, h.dtype)

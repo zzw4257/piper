@@ -3,8 +3,9 @@
     CUDA_VISIBLE_DEVICES=a,b,c,d python experiments/check_vlm.py --mb=4 --data DIR
 
 For one m: one GPU, then 2 stages (vision | embedding+decoder) and 4 stages (vision in
-three | embedding+decoder), threaded and routed, GPipe and (m > 1) 1F1B. Losses must
-match the one-GPU run; prints median step and per-rank peak memory.
+three | embedding+decoder), threaded and routed, GPipe and (m > 1) 1F1B, and 4 stages
+with the vision tower in k chunks. Losses must match the one-GPU run (chunking changes
+GEMM tiling, hence TOL); prints median step and per-rank peak memory.
 """
 import glob
 import json
@@ -34,15 +35,20 @@ def main():
     m = int(next((a.split("=")[1] for a in sys.argv[1:] if a.startswith("--mb=")), "1"))
     extra = [a for a in sys.argv[1:] if not a.startswith("--mb=")] + ["--batch-size", str(32 // m)]
     ngpu = len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))
-    names = [(f"vlm_single_v3_mb{m}", 3)]
+    names = [(f"vlm_single_v3_mb{m}", 3, 1)]
     for lay, v, need in (("2st", 1, 2), ("4st", 3, 4)):
         if need > ngpu:
             continue
         for kind in ("threaded", "routed"):
-            names += [(f"vlm_{lay}_{kind}_mb{m}", v)] + ([(f"vlm_{lay}_{kind}_mb{m}_1f1b", v)] if m > 1 else [])
+            names += [(f"vlm_{lay}_{kind}_mb{m}", v, 1)] + ([(f"vlm_{lay}_{kind}_mb{m}_1f1b", v, 1)] if m > 1 else [])
+    # the vision tower in k chunks per microbatch (log F80): vision pipelines in k*m pieces, the decoder in m
+    for k in (2, 4, 8):
+        name = f"vlm_4st_routed_c{k}_mb{m}"
+        if ngpu >= 4 and os.path.exists(os.path.join(repo, f"examples/base-schedules/{name}.json")):
+            names.append((name, 3, k))
     ref, ok = None, True
-    for name, v in names:
-        r, err = run(name, extra + ["--vis-stages", str(v)], repo)
+    for name, v, k in names:
+        r, err = run(name, extra + ["--vis-stages", str(v), "--vis-chunks", str(k)], repo)
         if r is None:
             ok = False
             print(f"{name:28s} FAILED\n{err}")
