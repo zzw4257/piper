@@ -4999,3 +4999,37 @@ GPU 1 also idles at 162–173 W against 137–144 W on the others.
 - Step 5 of the design, plan choice, works for multimodal placement, where plans differ by up to 3×.
 - For CP the plans tie (F86, F89), so there is nothing to choose there yet.
 - The model's inputs are single-GPU stage profiles and the DAG. Its failure on B200 (F81) was a hot card, not the model.
+
+---
+
+## 2026-09-28 — F96: Ulysses (head-parallel CP) in Piper is EP's all-to-all plus a layout; no new runtime code, exact on CP=2 and CP=4
+
+**Why.** F92 found DeepSpeed-Ulysses to be the only CP plan that beat gather-and-hold. It turns the sequence split into a head split and back, one all-to-all each way.
+
+**Built.**
+- `examples/models/ulysses_attn.py`: the ring model's math (q = x W_q, full non-causal attention, o W_o) with attention as one `SP` region inside `PP`.
+- Around that region q, k, v are packed as one tensor `[n, 3, b, h/n, s/n, d]`:
+  - Before the exchange, dim 0 is the head group.
+  - After it, dim 0 is the sequence chunk. The shape is unchanged.
+- So the exchange is an all_to_all_single along dim 0 with equal splits. That is exactly what Piper's EP directive `shard` inserts, and its backward runs the reverse exchange.
+- The output takes the return trip the same way.
+- Schedules `cp{2,4}_ulysses_dp.json`: `place` + `replicate` (the projections' gradient sums) + `shard` on `{"SP": "*"}`. `test_ring_attn.py --model ulysses [--no-model-fused]`.
+- Lowering: exactly 4 A2A nodes (forward in/out, backward in/out) and 2 gradient all-reduces.
+
+**Tested** (healthy B200s, `check_cp_equivalence.py`, 3 optimizer steps, dense CP=1 is the same model with n=1):
+- CP=2: 1.7e-6. Without `shard` the loss is off by 7.1e-4.
+- CP=4: 2.6e-6. Without `shard`: 1.6e-3.
+
+**Timing, first look** (CP=4, 8192 tokens, dim 1024, 8 heads, batch 2):
+
+| plan | ms | peak MiB |
+|---|---|---|
+| ring | 12.1 | 3079 |
+| hoisted ring | 11.7 | 3079 |
+| Ulysses, softmax written out | 8.3 | 4485 |
+| Ulysses, fused SDPA | 9.3 | 453 |
+
+- A second user's unregistered sglang server took GPUs 2–5 (161 GB each) mid-sweep. The 32768-token arms ran out of memory, and the gather arm (27.5 ms against F86's 12.0) is suspect. To be re-run on free cards.
+- The fused path is the case where the ring cannot follow. The ring's online-softmax steps need the running max and sum per chunk, while Ulysses runs whole attention per head group and can use a fused kernel. Its memory is 7× smaller here for that reason, not because of the exchange.
+
+**Meaning.** A new CP plan cost a model layout and one existing directive. EP's exchange and Ulysses' exchange are the same collective on the same axis: a resharding S(heads) ↔ S(seq), written as the one Piper already had.

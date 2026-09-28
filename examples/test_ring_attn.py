@@ -28,6 +28,7 @@ from src.piper import piper_exec_dag, piper_flush_losses, piper_param_checksums
 from src.state import LOG_LEVEL, create_logger, piper_metadata
 
 from models.ring_attn import RingAttn, global_weights
+from models.ulysses_attn import UlyssesAttn
 
 logger = create_logger("test_ring_attn", LOG_LEVEL)
 _DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
@@ -81,8 +82,8 @@ def main(args, pg):
     x, k, v, y = (t[:, sl].contiguous() for t in full)
 
     piper_setup(
-        RingAttn,
-        model_args=(args.dim, args.heads, args.steps),
+        UlyssesAttn if args.model == "ulysses" else RingAttn,
+        model_args=(args.dim, args.heads, args.steps) + ((args.model_fused,) if args.model == "ulysses" else ()),
         optim_fn=torch.optim.Adam,
         example_inputs=[x, k, v],
         example_outputs=y,
@@ -159,4 +160,8 @@ def parse_args(argv=None):
         "--schedule-directives-file", type=str,
         default="examples/base-schedules/cp2_ring_dp.json",
     )
+    parser.add_argument("--model", choices=("ring", "ulysses"), default="ring",
+                        help="ulysses: head-parallel attention, one all-to-all each way (log F96)")
+    parser.add_argument("--model-fused", action=__import__("argparse").BooleanOptionalAction, default=True,
+                        help="ulysses only: fused SDPA (default) or softmax written out, as in the ring model")
     return parser.parse_args(argv)

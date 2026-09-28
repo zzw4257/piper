@@ -12,12 +12,14 @@ import re
 import subprocess
 import sys
 
-ARMS = ["cp4_ring_dp", "cp4_ring_dp_hoist", "cp4_gather_dp"]
+ARMS = ["cp4_ring_dp", "cp4_ring_dp_hoist", "cp4_gather_dp", "cp4_ulysses_dp:explicit", "cp4_ulysses_dp:fused"]
+MODEL_ARGS = {"explicit": ["--model", "ulysses", "--no-model-fused"], "fused": ["--model", "ulysses"]}
 
 
 def run(repo, sched, seq, a, extra):
     cmd = [sys.executable, "examples/test_harness.py", "--test-file", "examples/test_ring_attn.py",
-           "--base-schedule", f"examples/base-schedules/{sched}.json", "--schedule", "custom",
+           "--base-schedule", f"examples/base-schedules/{sched.split(':')[0]}.json", "--schedule", "custom",
+           *MODEL_ARGS.get(sched.split(":")[1] if ":" in sched else "", []),
            "--steps", "4", "--seq", str(seq), "--dim", str(a.dim), "--heads", str(a.heads),
            "--batch-size", str(a.batch), "--warmup", "2", "--iters", str(a.iters), *extra]
     p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=600)
@@ -50,7 +52,7 @@ def main():
                     best[s] = r
         for s in ARMS:
             t, m = best.get(s, (float("nan"), float("nan")))
-            print(f"seq={seq} {s:20s} min_iter={t:8.2f} ms peak={m:8.0f} MiB", flush=True)
+            print(f"seq={seq} {s:24s} min_iter={t:8.2f} ms peak={m:8.0f} MiB", flush=True)
     print("PASS")
 
 
