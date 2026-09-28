@@ -31,8 +31,6 @@ def main(args, pg):
     data = torch.load(os.path.join(args.data, "data.pt"))
     weights = torch.load(os.path.join(args.data, "weights.pt"))
     b = args.batch_size
-    pixel_values = (data["images"][:b].permute(0, 3, 1, 2).float() / 255.0 - 0.5) / 0.5
-    input_ids, labels = data["input_ids"][:b], data["labels"][:b]
     from src.schedule import derive_schedule_info, load_schedule_directives, mesh_coords
     sched = derive_schedule_info(load_schedule_directives(args.schedule_directives_file),
                                  args.schedule_directives_file)
@@ -41,10 +39,20 @@ def main(args, pg):
     if args.tp > 1:
         # every rank of the group is a TP rank, or its tp coordinate on a mesh (log F82)
         weights = shard_weights(weights, coords.get("tp", place), args.tp)
-    if args.dp_split > 1:
-        # replica d trains on rows d, d+n, ...: its dp coordinate, or its place without a mesh
-        d = coords.get("dp", place)
-        pixel_values, input_ids, labels = (t[d::args.dp_split].contiguous() for t in (pixel_values, input_ids, labels))
+
+    def batch(i):
+        # batch i of the stream; with --stream, step i trains on rows i*b.. of the data (log F88)
+        n = len(data["input_ids"])
+        rows = torch.arange(i * b, (i + 1) * b) % n
+        px = (data["images"][rows].permute(0, 3, 1, 2).float() / 255.0 - 0.5) / 0.5
+        ids, lab = data["input_ids"][rows], data["labels"][rows]
+        if args.dp_split > 1:
+            # replica d trains on rows d, d+n, ...: its dp coordinate, or its place without a mesh
+            d = coords.get("dp", place)
+            px, ids, lab = (t[d::args.dp_split].contiguous() for t in (px, ids, lab))
+        return px, ids, lab
+
+    pixel_values, input_ids, labels = batch(0)
 
     piper_setup(
         SmolVLM,
@@ -68,7 +76,12 @@ def main(args, pg):
 
     ray.get([a.reset_peak_memory.remote() for a in actors.values()])
     iter_times, losses = [], []
-    for _ in range(args.iters):
+    for i in range(args.iters):
+        if args.stream and i > 0:
+            px, ids, lab = batch(i)
+            refs = ray.put([px, ids]), ray.put(lab)
+            ray.get([a.load_input.remote(refs[0]) for a in actors.values()]
+                    + [a.load_labels.remote(refs[1]) for a in actors.values()])
         ray.get([a.drain.remote() for a in actors.values()])
         start = time.perf_counter()
         losses.extend(piper_exec_dag(lm_loss) or [])
@@ -98,6 +111,7 @@ def parse_args(argv=None):
     ap.add_argument("--vis-chunks", type=int, default=1)
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--dp-split", type=int, default=1)
+    ap.add_argument("--stream", action="store_true", help="a new batch every step instead of one fixed batch")
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--warmup", type=int, default=0)
     ap.add_argument("--iters", type=int, default=5)

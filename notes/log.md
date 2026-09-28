@@ -4743,3 +4743,24 @@ All within 1%. Piper's own overhead on these steps is below the model's resoluti
 - Only 1.17x on three GPUs: 168 small all-reduces per step, since every region is a boundary (F33's per-collective cost). Fusing adjacent collectives, or TP on the decoder alone, are the levers; neither is tried here.
 
 **Pending.** Mesh dp=2 × tp=3 against dp=2 alone (`experiments/check_vlm_dp_tp.py`, schedules `vlm_dp2`, `vlm_dp2_tp3`) needs six idle cards; queued.
+
+---
+
+## 2026-09-28 — F88: 200 fine-tuning steps of SmolVLM. Heterogeneous and TP=3 placements follow the one-GPU curve as closely as one GPU follows itself with a different floating-point order
+
+**Why.** F84 and F87 compare 5 steps on one fixed batch. Training uses a new batch every step for many steps, and small differences can grow.
+
+**Changed.** `test_smolvlm.py --stream`: step i trains on rows 48i … 48i+47 of the 512 COCO pairs (the data cycles, about 19 epochs in 200 steps). Before each step the batch is pushed to every actor (`load_input`, `load_labels`). `experiments/check_vlm_converge.py --run NAME` runs one placement per time-boxed job and prints its curve.
+
+**Measured** (B200, registered; Adam, lr 1e-5, from the released weights; reference: one GPU, vision in 3 chunks):
+
+| run | GPUs | first step > 1e-4 away | worst diff | first 20 steps | mean of last 20 | median step |
+|---|---|---|---|---|---|---|
+| one GPU, vision in 3 chunks (reference) | 1 | — | 0 | 0 | 0.00605 | 776.0 ms |
+| **control**: one GPU, vision unchunked | 1 | 32 | 3.3e-2 | 2.8e-5 | 0.00593 | 738.8 ms |
+| vision DP=3 + decoder (F84) | 4 | 31 | 3.4e-2 | 3.0e-5 | 0.00620 | 353.2 ms |
+| TP=3 on every layer (F87) | 3 | 41 | 2.7e-2 | 2.7e-5 | 0.00615 | 927.2 ms |
+
+- All four fall from 3.99 to about 0.006. That is memorization of 512 pairs, not generalization; the run tests equivalence, not model quality.
+- The control computes the same math with different GEMM shapes. It leaves the reference at the same step and by the same amount as the two multi-GPU placements. So the drift is floating-point order amplified by training, and the placements cannot be told apart from a legitimate one-GPU reordering.
+- TP=3 at batch 48 is slower than one GPU (927 vs 776 ms), while at batch 16 it was faster (231 vs 270, F87). Not explained; this run pushes a new batch to every actor each step, and nothing was profiled.
