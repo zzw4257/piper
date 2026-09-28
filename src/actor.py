@@ -119,6 +119,13 @@ class PiperActor:
         # Suppress the spurious stream-mismatch warning.
         set_warn_on_accumulate_grad_stream_mismatch(False)
 
+        if os.environ.get("PIPER_DETERMINISTIC") in ("1", "warn"):
+            # Bit-reproducible runs (log F93): one GPU is otherwise not reproducible run to run.
+            # "1" refuses a nondeterministic kernel with an error naming it; "warn" only warns.
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            torch.use_deterministic_algorithms(True, warn_only=os.environ["PIPER_DETERMINISTIC"] == "warn")
+            self.logger.warning("deterministic algorithms on (PIPER_DETERMINISTIC=%s)", os.environ["PIPER_DETERMINISTIC"])
+
         self.optim_class = optim_class
         self.use_inductor = bool(use_inductor)
         if self.use_inductor:

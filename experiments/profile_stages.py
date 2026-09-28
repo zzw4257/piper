@@ -16,24 +16,25 @@ import torch
 sys.path[:0] = ["examples", "."]
 
 
-def timed(fn, n=5):
-    for _ in range(2):
+def timed(fn, n=5, warm=2, stat="median"):
+    for _ in range(warm):
         fn()
     torch.cuda.synchronize()
     ts = []
     for _ in range(n):
         s = time.perf_counter(); fn(); torch.cuda.synchronize(); ts.append(time.perf_counter() - s)
-    return sorted(ts)[n // 2] * 1e3
+    return (min(ts) if stat == "min" else sorted(ts)[n // 2]) * 1e3
 
 
-def fwd_bwd(stage, inputs):
+def fwd_bwd(stage, inputs, robust=False):
     """(fwd_ms, bwd_ms) of stage(*inputs) -> tensor, with a unit upstream gradient."""
     ins = [x.detach().requires_grad_(x.is_floating_point()) for x in inputs]
-    t_f = timed(lambda: stage(*ins))
+    kw = dict(n=10, warm=5, stat="min") if robust else {}
+    t_f = timed(lambda: stage(*ins), **kw)
     def fb():
         out = stage(*ins)
         out.backward(torch.ones_like(out))
-    return t_f, max(timed(fb) - t_f, 0.0)
+    return t_f, max(timed(fb, **kw) - t_f, 0.0)
 
 
 def smolvlm_stages(data_dir):
@@ -100,13 +101,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", choices=("clip", "smolvlm"), required=True)
     ap.add_argument("--data", required=True)
-    args = ap.parse_args()
+    ap.add_argument("--sizes", default=None, help="comma-separated batch sizes (default: the model's)")
+    ap.add_argument("--rounds", type=int, default=1)
+    args, _ = ap.parse_known_args()
     make, sizes = (clip_stages if args.model == "clip" else smolvlm_stages)(args.data)
+    if args.sizes:
+        sizes = [int(x) for x in args.sizes.split(",")]
     out = {}
-    for b in sizes:
-        for name, (fn, ins) in make(b).items():
-            out.setdefault(name, {})[b] = [round(v, 2) for v in fwd_bwd(fn, ins)]
-        torch.cuda.empty_cache()
+    # --rounds > 1: every size measured once per round, rounds interleaved, minimum kept. On a
+    # shared host a single pass depends on what ran before it (log F94: batch 16 took 218, 316
+    # or 437 ms depending on the order of sizes).
+    for _ in range(args.rounds):
+        for b in sizes:
+            for name, (fn, ins) in make(b).items():
+                v = [round(x, 2) for x in fwd_bwd(fn, ins, robust=args.rounds > 1)]
+                old = out.setdefault(name, {}).get(b)
+                out[name][b] = v if old is None or sum(v) < sum(old) else old
+            torch.cuda.empty_cache()
     print(json.dumps(out))
 
 

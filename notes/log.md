@@ -4899,3 +4899,103 @@ These are per module, as eager hooks or compiler passes. Piper holds the same ch
 - A per-operator planner with a fixed cost table gives plans that change with sizes, with the launcher's GPU visibility, and with the backward left out of each choice.
 - Piper's side of the design keeps the plan a written, per-region choice (`decompose`, `lifetime`).
 - The Ulysses result says the candidate set should include head-parallel attention: a third `decompose` option worth adding, and the only one here that beat gather-and-hold.
+
+---
+
+## 2026-09-28 — F93: one GPU does not reproduce itself, and that sets the bar for every placement. The cause is SDPA's memory-efficient backward; strict determinism makes Piper bit-reproducible, chunked and shared weights included
+
+**Why.** F88 showed that every placement drifts from one GPU over 200 steps no more than a GEMM-order control does. Is that drift the placement, or something any run has?
+
+**Measured** (SmolVLM, a new batch of 48 COCO pairs each step, Adam lr 1e-5 unless noted, one healthy B200). Reference: one GPU with vision in 3 chunks.
+
+| perturbation | first step off | first >1e-6 | first >1e-3 | worst |
+|---|---|---|---|---|
+| the same run again | 1 | 12 | 48 | 4.5e-2 |
+| one float32 ulp on `lm_head.weight[0,0]` (`--perturb-ulp`) | 1 | 11 | 48 | 6.0e-2 |
+| vision unchunked (GEMM order, F88) | 2 | 2 | 48 | 3.3e-2 |
+| heterogeneous, 4 GPUs (F84) | 1 | 9 | 48 | 3.4e-2 |
+| TP=3 (F87) | 0 | 1 | 58 | 2.7e-2 |
+| lr 3e-6: one ulp | 1 | 4 | 121 | 2.0e-2 |
+
+- Five perturbations of very different kinds cross 1e-3 at step 48 (TP at 58). The source does not matter; training amplifies at its own rate, and more slowly at lower lr (step 121 at lr 3e-6).
+- The same program, rerun, is already off at step 1. So one GPU is not a fixed reference: every placement stays within the spread of one GPU against itself.
+
+**Cause.**
+- `PIPER_DETERMINISTIC=1` (new, `src/actor.py`) calls `torch.use_deterministic_algorithms(True)` in each actor. `warn` is the same with `warn_only`.
+- Unchunked, strict mode: two runs bit-identical over 30 steps, at no cost (737.5 vs 739.0 ms). Default mode: off from step 2.
+- Chunked (three regions sharing the vision weights, F80), strict mode: bit-identical across runs, across cards (GPU 3 vs GPU 0), and with or without host sync (`PIPER_SYNC_MODE=device`). Piper's scheduling and its shared-parameter gradient sums are deterministic.
+- `warn` mode is not deterministic: two runs differ from each other and from strict.
+- `experiments/sdpa_determinism.py`: fp32 SDPA on B200 runs the memory-efficient kernel (`fmha_cutlassB_f32`).
+  - Default: its backward is not reproducible run to run.
+  - `warn`: PyTorch warns "Memory Efficient attention defaults to a non-deterministic algorithm" and keeps it.
+  - Strict: a deterministic variant of the same kernel, reproducible, 6.0 vs 4.6 ms per attention fwd + bwd. On the whole chunked model, 820 vs 776 ms.
+- Retracted in-session: a first pass blamed Piper's stream timing, from `warn`-mode runs. Strict-mode runs disproved it.
+
+**Consequence for tests.** Equivalence over many steps should run under `PIPER_DETERMINISTIC=1`. Then one GPU is a fixed reference and any placement difference beyond reduction order shows.
+
+---
+
+## 2026-09-28 — F94: physical GPU 1 on the B200 host throttles for heat. It had inflated F84's one-GPU baselines by 21%; corrected headline 2.95×, not 3.56×
+
+**Symptom.** Stage profiles were unstable. Vision at batch 16 took 218, 316 or 437 ms depending on the order of sizes measured, and the pipeline model over-predicted the one-GPU step by 70% (F81 had called the B200 profiles "too noisy").
+
+**Ruled out** (`experiments/interference_probe.py`, card A timed while card B works): the other card running bf16 matmuls 615.9 vs 615.9 ms idle; 16 busy host processes 615.9 ms; SM clock 1965 MHz throughout. TF32 is off in both paths.
+
+**Cause** (`experiments/card_check.py`, the same vision step on each card in turn):
+
+| card | step | SM clock | power | temp | throttle reasons |
+|---|---|---|---|---|---|
+| GPU 0, 2, 3, 4 | 615.9–617.5 ms | 1965/1965 MHz | 696–707 W | 43–44 °C | none |
+| **GPU 1** | **886.0 ms** (728–1027) | **1338** | 454 W | **88 °C** | **0x20, SW thermal slowdown** |
+
+GPU 1 also idles at 162–173 W against 137–144 W on the others.
+
+**Affected.** Timings from any job whose cards included GPU 1. Correctness is untouched.
+- F84: all heterogeneous runs, and the one-GPU baseline, which ran whole on GPU 1.
+- F86 (CP ring vs gather), F88 (TP's 927 ms spread; the "shared card" guess there is replaced by this), F92 (GPU timings).
+
+**Re-measured F84 on four healthy cards** (`no_gpu1.sh` drops GPU 1 from a 5-card claim; 48 pairs per step; losses equal one GPU within 5.8e-6):
+
+| m | one GPU | vision in 3 pipeline stages (1F1B if m>1) | hetero GPipe | hetero 1F1B |
+|---|---|---|---|---|
+| 1 | 776.4 (was 936.6) | 742.1 | 347.0 | — |
+| 2 | 814.7 (was 970.6) | 455.0 | 301.5 | **263.0** |
+| 4 | 900.4 (was 1060.0) | 352.1 | 291.5 | 274.5 |
+
+- Only the one-GPU numbers moved. GPU 1 held one light vision chunk or stage in the multi-GPU runs, and stayed cool enough there.
+- Corrected headline: 263.0 ms is **2.95×** one GPU at m=1 (was 3.56×) and 1.34× the best pipeline split (352.1), unchanged.
+- One hetero m=1 run gave 472.7 ms on cards 0, 3, 4, 5; the rerun gave 347.0, matching the original 346.9. The outlier is recorded, not explained.
+
+**Practice.** Card check before timing runs. `job.sh` now takes a lock: its cleanup removed every new run dir, so two concurrent jobs clobbered each other (lost run `ch_ref_lr3`, rerun).
+
+---
+
+## 2026-09-28 — F95: with a clean profile, the pipeline model picks SmolVLM's placement correctly and prices unseen placements within 1.6% (design step 5)
+
+**Method.** `experiments/select_vlm.py`:
+- Every candidate on four GPUs: one GPU, 2 stages, 4 stages, hetero; m = 1, 2, 4; GPipe and 1F1B. 18 plans.
+- Priced with the F78 model from single-GPU stage profiles measured alone on healthy GPU 0: `profile_stages.py --rounds 2`, the minimum of interleaved rounds; `notes/profile_smolvlm_b200.json`.
+- No communication or host cost.
+
+**Against the 11 measured plans.**
+- Every prediction within 1–3% (always a little low).
+- 55 of 55 pairs ordered correctly.
+- The model's pick is the fastest measured: hetero, m=2, 1F1B.
+- With the GPU-1 profile, 46/55 pairs and the pick was third (F94).
+
+**Blind test.** Seven plans never run before, priced first and measured after (`experiments/check_vlm_blind.py`, cards 0, 2, 4, 5):
+
+| plan | predicted | measured | error |
+|---|---|---|---|
+| 2 stages, m=1 | 734.2 | 740.8 | −0.9% |
+| 2 stages, m=2 | 688.8 | 694.1 | −0.8% |
+| 2 stages, m=2, 1F1B | 622.9 | 626.3 | −0.5% |
+| 2 stages, m=4 | 671.8 | 678.0 | −0.9% |
+| 2 stages, m=4, 1F1B | 630.4 | 636.3 | −0.9% |
+| 4 stages, m=2 | 482.7 | 489.2 | −1.3% |
+| 4 stages, m=4 | 358.6 | 364.3 | −1.6% |
+
+**Meaning.**
+- Step 5 of the design, plan choice, works for multimodal placement, where plans differ by up to 3×.
+- For CP the plans tie (F86, F89), so there is nothing to choose there yet.
+- The model's inputs are single-GPU stage profiles and the DAG. Its failure on B200 (F81) was a hot card, not the model.

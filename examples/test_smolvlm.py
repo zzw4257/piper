@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 def main(args, pg):
     data = torch.load(os.path.join(args.data, "data.pt"))
     weights = torch.load(os.path.join(args.data, "weights.pt"))
+    if args.perturb_ulp:
+        # one float32 ulp on one weight: the smallest perturbation there is (log F93)
+        w = weights["lm_head.weight"]
+        w[0, 0] = torch.nextafter(w[0, 0], torch.tensor(float("inf")))
     b = args.batch_size
     from src.schedule import derive_schedule_info, load_schedule_directives, mesh_coords
     sched = derive_schedule_info(load_schedule_directives(args.schedule_directives_file),
@@ -112,6 +116,7 @@ def parse_args(argv=None):
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--dp-split", type=int, default=1)
     ap.add_argument("--stream", action="store_true", help="a new batch every step instead of one fixed batch")
+    ap.add_argument("--perturb-ulp", action="store_true", help="move lm_head.weight[0, 0] by one float32 ulp")
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--warmup", type=int, default=0)
     ap.add_argument("--iters", type=int, default=5)
