@@ -1237,6 +1237,22 @@ def _is_boundary_activation_edge_static(
     return False
 
 
+def _schedule_mesh() -> dict[str, int]:
+    """Named mesh axes of the schedule being lowered, {} when it has none (log F82)."""
+    from .state import piper_metadata
+    return {a: int(n) for a, n in ((getattr(piper_metadata, "schedule_info", None) or {}).get("mesh") or [])}
+
+
+def _axis_size(axis: str, default: int) -> int:
+    return _schedule_mesh().get(axis, default)
+
+
+def _mesh_separates(a: str, b: str) -> bool:
+    """True when the mesh names both axes: collectives on one never mix ranks of the other."""
+    m = _schedule_mesh()
+    return a != b and a in m and b in m
+
+
 def _insert_tp_all_reduce_comm_nodes(
     dag: TrainingDAG,
     filters: list[dict[str, Any]],
@@ -1244,6 +1260,7 @@ def _insert_tp_all_reduce_comm_nodes(
     comm_stream: str | None = None,
     params: dict[str, str] | None = None,
     inputs: dict[str, str] | None = None,
+    axis: str = "tp",
 ) -> None:
     """Insert TP activation all-reduces at the boundary of a tensor-parallel region.
 
@@ -1300,7 +1317,7 @@ def _insert_tp_all_reduce_comm_nodes(
             other_uid = e.dst_uid if e.src_uid == uid else (e.src_uid if e.dst_uid == uid else None)
             if other_uid is None or e.dep_kind != "data":
                 continue
-            if dag.nodes[other_uid].node_kind in _SYNC_KINDS:
+            if dag.nodes[other_uid].node_kind in _SYNC_KINDS and not _mesh_separates(axis, "dp"):
                 raise ValueError(
                     f"shard_tensor cannot compose with replicate on the same region: node "
                     f"{uid} already has {dag.nodes[other_uid].node_kind} node {other_uid} "
@@ -1353,7 +1370,7 @@ def _insert_tp_all_reduce_comm_nodes(
         if fwd_uid not in derived:
             m = dag.nodes[fwd_uid].node_meta
             derived[fwd_uid] = derive_boundary_placements(
-                m["gm"], m["graphargs"], m["input_idxs"], m["param_idxs"], params, len(expected),
+                m["gm"], m["graphargs"], m["input_idxs"], m["param_idxs"], params, _axis_size(axis, len(expected)),
                 inputs=inputs)
         d = derived[fwd_uid]
         if node.compute_subkind == "FWD":
@@ -1397,6 +1414,7 @@ def _insert_tp_all_reduce_comm_nodes(
                         "direction": "outgoing",
                         "source_uid": uid,
                         "tp_tensor_idx": binfo["tensor_idx"],
+                        "axis": axis,
                         "bucket_key": node.node_meta.get(
                             "bucket_key", dst_node.node_meta.get("bucket_key")
                         ),
@@ -2334,7 +2352,7 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
 
     for i, raw in enumerate(directives):
         if isinstance(raw, dict) and raw.get("op") in (
-            "place", "split", "order", "fuse_collectives", "route"
+            "place", "split", "order", "fuse_collectives", "route", "mesh"
         ):
             continue
         op, filters, devices, stream, gather_stream, reduce_stream, shard_params, shard_grads, bucket_size = _normalize_filter_devices_directive(raw)
@@ -2374,7 +2392,7 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
         elif op == "shard_tensor":
             _insert_tp_all_reduce_comm_nodes(
                 training_dag, filters, devices, comm_stream=stream, params=raw.get("params"),
-                inputs=raw.get("inputs"))
+                inputs=raw.get("inputs"), axis=raw.get("axis", "tp"))
         else:
             raise ValueError(f"Unsupported directive op after normalization: {op}")
 

@@ -111,13 +111,14 @@ class CommunicationExecutor:
     def all_to_all(self, input_tensor: torch.Tensor, stream: torch.cuda.Stream) -> torch.Tensor:
         output_buf = torch.empty_like(input_tensor, device=self.runtime.device)
         with torch.cuda.stream(stream):
-            dist.all_to_all_single(output_buf, input_tensor, group=self.runtime.ep_group)
+            dist.all_to_all_single(output_buf, input_tensor, group=self.runtime.group_for("ep", self.runtime.ep_group))
         return output_buf
 
     def all_reduce_activation(
         self,
         input_tensor: torch.Tensor,
         stream: torch.cuda.Stream,
+        axis: str | None = "tp",
     ) -> torch.Tensor:
         """Sum a boundary activation (or its gradient) across the TP group.
 
@@ -134,7 +135,7 @@ class CommunicationExecutor:
         """
         with torch.cuda.stream(stream):
             out = input_tensor.detach().clone(memory_format=torch.contiguous_format)
-            dist.all_reduce(out, group=self.runtime.ep_group)
+            dist.all_reduce(out, group=self.runtime.group_for(axis, self.runtime.ep_group))
         return out
 
     def ring_exchange(
@@ -150,7 +151,7 @@ class CommunicationExecutor:
         peer is the same rank both ways) cannot deadlock. Rides on ep_group; see
         the ponytail note on all_reduce_activation for the limit that implies.
         """
-        group = self.runtime.ep_group
+        group = self.runtime.group_for("cp", self.runtime.ep_group)
         n = dist.get_world_size(group=group)
         me = dist.get_rank(group=group)
         dst = dist.get_global_rank(group, (me + shift) % n)
@@ -171,6 +172,7 @@ class CommunicationExecutor:
         self,
         tensors: list[torch.Tensor],
         stream: torch.cuda.Stream,
+        axis: str | None = "tp",
     ) -> list[torch.Tensor]:
         """One all-reduce covering several boundary activations.
 
@@ -182,7 +184,7 @@ class CommunicationExecutor:
         shapes = [t.shape for t in tensors]
         with torch.cuda.stream(stream):
             flat = torch.cat([t.detach().reshape(-1) for t in tensors])
-            dist.all_reduce(flat, group=self.runtime.ep_group)
+            dist.all_reduce(flat, group=self.runtime.group_for(axis, self.runtime.ep_group))
             out, offset = [], 0
             for t, shape in zip(tensors, shapes):
                 n = t.numel()
@@ -910,7 +912,7 @@ class DagExecutor:
                             for src_uid, idx in meta["fusion_sources"]
                         ]
                         fusion_results[gid] = self.communication.all_reduce_fused(
-                            parts, node_stream
+                            parts, node_stream, axis=meta.get("axis", "tp")
                         )
                     fwd_buf = dict(self.buffers.task[fwd_pred.uid])
                     self.buffers.release(fwd_pred.uid)
@@ -919,7 +921,7 @@ class DagExecutor:
                         fusion_results[gid][meta["fusion_index"]]
                         if gid is not None
                         else self.communication.all_reduce_activation(
-                            detached_outs[tensor_idx], node_stream)
+                            detached_outs[tensor_idx], node_stream, axis=meta.get("axis", "tp"))
                     )
                     detached_outs[tensor_idx] = reduced.requires_grad_(True)
                     fwd_buf["detached_outs"] = detached_outs
@@ -952,7 +954,7 @@ class DagExecutor:
                             f"BWD_TP_ALL_REDUCE fused group {gid}: a member's grad is None"
                         )
                         fusion_results[gid] = self.communication.all_reduce_fused(
-                            parts, node_stream
+                            parts, node_stream, axis=meta.get("axis", "tp")
                         )
                     bwd_buf = dict(self.buffers.task[bwd_pred.uid])
                     self.buffers.release(bwd_pred.uid)
@@ -965,7 +967,7 @@ class DagExecutor:
                     inp_grads[tensor_idx] = (
                         fusion_results[gid][meta["fusion_index"]]
                         if gid is not None
-                        else self.communication.all_reduce_activation(grad_tp, node_stream)
+                        else self.communication.all_reduce_activation(grad_tp, node_stream, axis=meta.get("axis", "tp"))
                     )
                     bwd_buf["inp_grads"] = inp_grads
                     self.buffers.task[node.uid] = bwd_buf

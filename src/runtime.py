@@ -181,6 +181,10 @@ class RuntimeState:
     device: str = "cuda"
     dp_group: Any = None
     ep_group: Any = None
+    # Named mesh axes over the stage's device group (log F82): group, coordinate, size.
+    axis_groups: dict = field(default_factory=dict)
+    axis_coord: dict = field(default_factory=dict)
+    axis_size: dict = field(default_factory=dict)
     pp_lo_hi: Any = None
     pp_hi_lo: Any = None
     streams: dict[str, torch.cuda.Stream] = field(default_factory=dict)
@@ -190,6 +194,18 @@ class RuntimeState:
     @property
     def global_rank(self) -> int:
         return self.pp_rank + self.dp_rank * self.pp_degree
+
+    @property
+    def zero_rank(self) -> int:
+        """This rank's ZeRO shard index: its dp coordinate, or its place in the group."""
+        return self.axis_coord.get("dp", self.dp_rank)
+
+    @property
+    def zero_size(self) -> int:
+        return self.axis_size.get("dp", self.dp_degree)
+
+    def group_for(self, axis: str | None, fallback: Any) -> Any:
+        return self.axis_groups.get(axis, fallback) if axis else fallback
 
     def pipeline_peer_global_rank(self, pp_rank: int) -> int:
         return pp_rank + self.dp_rank * self.pp_degree
@@ -307,7 +323,7 @@ class ParamStorage:
         ubid: Any | None,
         stream: torch.cuda.Stream,
     ) -> None:
-        if ubid is None or ubid not in self.stages.zero_managed_ubids or self.runtime.dp_degree <= 1:
+        if ubid is None or ubid not in self.stages.zero_managed_ubids or self.runtime.zero_size <= 1:
             return
         if ubid in self.stages.grad_sharded_ubids:
             self.wait_pending_free(self.pending_grad_frees, ubid)
@@ -323,7 +339,7 @@ class ParamStorage:
                     return
                 _shard_start, shard_size, _orig_numel = shard_info
                 flat_grads = torch.zeros(
-                    shard_size * self.runtime.dp_degree,
+                    shard_size * self.runtime.zero_size,
                     dtype=self.grad_buffer_dtype,
                     device=self.runtime.device,
                 )
@@ -482,7 +498,7 @@ class ParamStorage:
         shard_size = shard_info[1]
         with torch.cuda.stream(stream):
             if bucket.flat_grads is None:
-                numel = shard_size * self.runtime.dp_degree
+                numel = shard_size * self.runtime.zero_size
                 pool = self._pool
                 pooled = pool.take(("grad", numel, self.grad_buffer_dtype), stream) if pool is not None else None
                 if pooled is not None:

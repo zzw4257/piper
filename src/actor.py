@@ -1,5 +1,6 @@
 import ray
 import torch
+import json
 import os
 import re
 import time
@@ -70,6 +71,7 @@ def _create_actors(
                 # "NCCL_P2P_DISABLE": "1",
                 # "NCCL_DEBUG": "INFO",
                 **({"TMPDIR": temp_dir} if (profile and temp_dir) else {}),
+                "PIPER_MESH": json.dumps((piper_metadata.schedule_info or {}).get("mesh")),
             }
         }
         # When pp_outer=True, one bundle corresponds to one pipeline stage and
@@ -314,6 +316,47 @@ class PiperActor:
             if self.runtime.global_rank % num_dp_groups == dp_group_id:
                 self.runtime.dp_group = process_group
                 self.runtime.ep_group = ep_process_group
+        self._join_mesh_axis_groups(num_dp_groups)
+
+    def _join_mesh_axis_groups(self, num_dp_groups: int) -> None:
+        """One communicator per named mesh axis inside each stage's device group (log F82).
+
+        A member's place in its group, ``dp_rank``, is read row-major over the axes, the
+        first outermost. Every rank creates every group in the same order, as
+        ``dist.new_group`` requires. ``dp`` then carries gradient sync and ZeRO, ``tp``
+        TP's all-reduces, ``cp`` the ring, ``ep`` the all-to-all; without a mesh they all
+        use the whole group, as before.
+        """
+        import itertools
+        import math
+
+        mesh = json.loads(os.environ.get("PIPER_MESH") or "null")
+        if not mesh:
+            return
+        names = [a for a, _ in mesh]
+        sizes = [int(n) for _, n in mesh]
+        assert math.prod(sizes) == self.runtime.dp_degree, (mesh, self.runtime.dp_degree)
+        strides = [math.prod(sizes[k + 1:]) for k in range(len(sizes))]
+        mine = [(self.runtime.dp_rank // strides[k]) % sizes[k] for k in range(len(sizes))]
+        self.runtime.axis_coord = dict(zip(names, mine))
+        self.runtime.axis_size = dict(zip(names, sizes))
+        for g in range(num_dp_groups):
+            members = [g + num_dp_groups * i for i in range(self.runtime.dp_degree)]
+            for k, axis in enumerate(names):
+                others = [range(sizes[j]) for j in range(len(sizes)) if j != k]
+                for rest in itertools.product(*others):
+                    coords = list(rest)
+                    idxs = []
+                    for v in range(sizes[k]):
+                        c = coords[:k] + [v] + coords[k:]
+                        idxs.append(sum(c[j] * strides[j] for j in range(len(sizes))))
+                    pg = dist.new_group(ranks=[members[i] for i in idxs], backend="nccl")
+                    if self.runtime.global_rank % num_dp_groups == g and self.runtime.dp_rank in idxs:
+                        self.runtime.axis_groups[axis] = pg
+        if "dp" in self.runtime.axis_groups:
+            self.runtime.dp_group = self.runtime.axis_groups["dp"]
+        if "ep" in self.runtime.axis_groups:
+            self.runtime.ep_group = self.runtime.axis_groups["ep"]
 
     def _join_pp_process_group(self):
         num_pp_groups = self.runtime.world_size // self.runtime.pp_degree
@@ -584,7 +627,7 @@ class PiperActor:
             bucket.trainable_param_idxs = trainable_idxs
 
             zero_managed = (
-                self.runtime.dp_degree > 1
+                self.runtime.zero_size > 1
                 and apply_zero
                 and bool(trainable_idxs)
                 and ubid in self.stages.zero_managed_ubids
@@ -599,7 +642,7 @@ class PiperActor:
                 flat_params = torch.cat([p.detach().view(-1) for p in trainable]).contiguous()
                 flat_params.requires_grad_(False)
                 orig_numel = flat_params.numel()
-                dp = self.runtime.dp_degree
+                dp = self.runtime.zero_size
                 shard_size = (orig_numel + dp - 1) // dp
                 padded_numel = shard_size * dp
                 if padded_numel > orig_numel:
@@ -618,7 +661,7 @@ class PiperActor:
                     view_specs.append((realized[idx], offset, numel, tuple(p.shape)))
                     offset += numel
 
-                shard_start = self.runtime.dp_rank * shard_size
+                shard_start = self.runtime.zero_rank * shard_size
                 if params_sharded:
                     shard_param = flat_params[shard_start:shard_start + shard_size].detach().clone()
                 else:
@@ -814,6 +857,25 @@ class PiperActor:
         clock stops while the GPU is still working (log F61).
         """
         torch.cuda.synchronize()
+
+    def sync_dp_params(self) -> int:
+        """Startup weight sync as open PR #24 does it: broadcast every parameter from the
+        first rank of ``dp_group``. Reproduced here to measure it against TP (log F82).
+        Without a mesh ``dp_group`` is the whole stage group, so TP shards get overwritten;
+        with one it is the dp axis, and each TP rank keeps its shard."""
+        group = self.runtime.dp_group
+        if group is None:
+            return 0
+        src = dist.get_global_rank(group, 0)
+        n = 0
+        for bucket in self.stages.buckets.values():
+            for idx in bucket.trainable_param_idxs:
+                p = bucket.forward_args[idx]
+                if p is not None:
+                    dist.broadcast(p.data, src=src, group=group)
+                    n += 1
+        torch.cuda.synchronize()
+        return n
 
     def param_checksum(self) -> dict:
         """A fingerprint of this rank's trainable parameters, in fp64.

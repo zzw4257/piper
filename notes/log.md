@@ -4561,3 +4561,36 @@ All within 1%. Piper's own overhead on these steps is below the model's resoluti
 - The model stands as validated on the quiet H200 (F78, CLIP within 1%).
 
 **Also.** F76's GPU checks passed on B200. CP inside a branch: CP=2 routed vs one GPU 2.5e-6 over 5 steps, 56.3 → 35.2 ms. EP inside a branch: first loss 1.1e-7, timing not meaningful for one step.
+
+---
+
+## 2026-09-28 — F82: named mesh axes (design step 1). TP and DP compose; TP stops borrowing EP's communicator; PR #24's weight sync no longer overwrites TP shards
+
+**Why.** The runtime had one axis per stage group, and every in-group collective (TP, CP ring, EP all-to-all, DP sync, ZeRO) rode on it. TP × DP was refused, and PR #24's startup sync broadcast over the TP group. Step 1 of the design (Part V, `tab:steps`) is named axes.
+
+**Changed.**
+- `{"op": "mesh", "axes": [["dp", 2], ["tp", 2]]}`: named axes over each stage's device group, outermost first; their product must equal the group size.
+- A member's place in its group is read row-major over the axes (`schedule.mesh_coords`).
+- Each actor builds one communicator per axis. Every rank creates every group in one order, as `dist.new_group` requires. Then:
+  - `dp` carries gradient sync and ZeRO; ZeRO shards by the dp coordinate (`RuntimeState.zero_rank/zero_size`).
+  - `tp` carries TP's all-reduces, fused too; `shard_tensor.axis`, default `tp`, is recorded on each `TP_COMM`.
+  - `cp` carries the ring; `ep` the all-to-all.
+- Without a mesh, every axis falls back to the whole group, as before.
+- `shard_tensor` on a `replicate`d region is allowed when the mesh names both `dp` and `tp`; still refused without one.
+- Derived placements use the tp axis's size for DTensor's fake mesh.
+- `examples/test_tp_mlp.py`: TP shard by tp coordinate, data slice by dp coordinate (`--dp-split`); `--pr24-sync` applies PR #24's startup broadcast (reproduced as `PiperActor.sync_dp_params`).
+
+**Tested.**
+- CPU: `test/test_mesh.py`: mesh validation, coordinates, TP × DP lowering (2 `TP_COMM` on tp, 3 `REDUCE_COMM`), refused without a mesh. Suite 112 passed; every earlier lowering unchanged.
+- GPU (`experiments/check_mesh.py`, 4 B200, registered, released after): TP MLP, fixed global weights, batch 32, Adam, 5 steps.
+
+| run | GPUs | result |
+|---|---|---|
+| TP=2 × DP=2 vs DP=2, replica 0 | 4 vs 2 | max diff 1.9e-6 over 5 steps |
+| TP=2 × DP=2 vs DP=2, replica 1 | 4 vs 2 | max diff 1.9e-6 |
+| mean of the two replicas vs one GPU, step 1 | | 11.631214 vs 11.631216 |
+| the two TP ranks of one replica | | identical |
+| PR #24 sync, TP=2 without a mesh | 2 | step 1 23.046 vs 11.631: shard overwritten |
+| PR #24 sync, TP × DP on the mesh | 4 | identical to unsynced |
+
+**Meaning.** The runtime change the design called riskiest is in, and backward compatible. It fixes the two concrete problems raised on #15: TP borrowing `ep_group`, and PR #24 overwriting TP shards. Heterogeneous parallelism for multimodal models (different group sizes per stage) is the next runtime step; this one keeps one group size per stage.

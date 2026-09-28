@@ -28,6 +28,7 @@ def load_schedule_info(path: str) -> dict[str, Any]:
 def derive_schedule_info(directives: list[dict], schedule_path: str) -> dict[str, Any]:
     pp_to_devices: dict[int, list[int]] = {}
     num_microbatches = None
+    mesh = None
 
     for directive in directives:
         if not isinstance(directive, dict):
@@ -39,6 +40,8 @@ def derive_schedule_info(directives: list[dict], schedule_path: str) -> dict[str
             if pp_idx is None or not isinstance(devices, list) or not devices:
                 raise ValueError(f"place directive must include PP filter and non-empty devices: {directive}")
             pp_to_devices[int(pp_idx)] = [int(d) for d in devices]
+        elif op == "mesh":
+            mesh = [[str(a), int(n)] for a, n in directive["axes"]]
         elif op == "split":
             n = int(directive.get("num_microbatches", 0))
             if n <= 0:
@@ -62,6 +65,12 @@ def derive_schedule_info(directives: list[dict], schedule_path: str) -> dict[str
     device_keys = sorted({tuple(devices) for devices in pp_to_devices.values()})
     if num_microbatches is None:
         raise ValueError("schedule JSON must include a split directive with num_microbatches")
+    group = next(iter(device_counts))
+    if mesh is not None:
+        import math
+        if math.prod(n for _, n in mesh) != group:
+            raise ValueError(f"mesh axes {mesh} multiply to {math.prod(n for _, n in mesh)}, "
+                             f"but each stage's device group has {group} devices")
 
     return {
         "name": os.path.splitext(os.path.basename(schedule_path))[0],
@@ -70,6 +79,9 @@ def derive_schedule_info(directives: list[dict], schedule_path: str) -> dict[str
         "pp_degree": len(device_keys),
         "dp_degree": next(iter(device_counts)),
         "num_microbatches": num_microbatches,
+        # Named axes over each stage's device group, outermost first (log F82); absent: one
+        # unnamed axis, the group itself, as before.
+        **({"mesh": mesh} if mesh is not None else {}),
     }
 
 
@@ -80,6 +92,12 @@ def _validate_directive_shape(directive: dict, idx: int) -> None:
             raise ValueError(f"{op} directive[{idx}] requires object field 'filter': {directive}")
         if "filters" in directive:
             raise ValueError(f"{op} directive[{idx}] does not accept field 'filters': {directive}")
+    elif op == "mesh":
+        axes = directive.get("axes")
+        if (not isinstance(axes, list) or not axes
+                or not all(isinstance(a, list) and len(a) == 2 and isinstance(a[0], str) and int(a[1]) > 0 for a in axes)
+                or len({a[0] for a in axes}) != len(axes)):
+            raise ValueError(f"mesh directive[{idx}] needs axes: [[name, size], ...] with distinct names: {directive}")
     elif op == "route":
         if directive.get("mode", "thread") not in ("thread", "consumers"):
             raise ValueError(f"route directive[{idx}] mode must be 'thread' or 'consumers': {directive}")
@@ -106,3 +124,15 @@ def _filter_value(filter_spec, key: str):
     if isinstance(filter_spec, dict):
         return filter_spec.get(key)
     return None
+
+
+def mesh_coords(info: dict, index: int) -> dict[str, int]:
+    """Coordinates of a rank's place in its stage group on the schedule's mesh (log F82).
+
+    ``index`` is that place (``PIPER_DP_RANK``); axes are read row-major, the first
+    outermost, as the runtime builds its axis groups. {} when the schedule has no mesh.
+    """
+    import math
+    mesh = info.get("mesh") or []
+    sizes = [int(n) for _, n in mesh]
+    return {a: (index // math.prod(sizes[k + 1:])) % sizes[k] for k, (a, _) in enumerate(mesh)}

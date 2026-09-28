@@ -74,9 +74,15 @@ def main(args, pg):
     # comparable to the TP=1 baseline; Piper's default per-rank seeding
     # (manual_seed(1000 * global_rank + stage_id)) makes any such comparison
     # meaningless (notes/log.md F3).
+    # With a mesh (log F82) a rank's TP shard is its tp coordinate and its data slice its
+    # dp coordinate; without one, every rank in the group is a TP rank, as before.
+    from src.schedule import derive_schedule_info, load_schedule_directives, mesh_coords
+    sched = derive_schedule_info(load_schedule_directives(args.schedule_directives_file), args.schedule_directives_file)
+    place = int(os.environ["PIPER_DP_RANK"])
+    coords = mesh_coords(sched, place)
     param_overrides = None
     if args.init == "fixed":
-        tp_rank = int(os.environ["PIPER_DP_RANK"])
+        tp_rank = coords.get("tp", 0) if coords else (place if args.tp > 1 else 0)
         param_overrides = shard_weights(
             global_weights(args.dim, args.hidden, args.seed, dtype, args.stages),
             tp_rank,
@@ -91,6 +97,11 @@ def main(args, pg):
     torch.manual_seed(args.seed)
     x = torch.randn(args.batch_size, args.dim, dtype=dtype)
     y = torch.randn(args.batch_size, args.dim, dtype=dtype)
+    if args.dp_split > 1:
+        # Data parallel: replica d trains on rows d, d+n, ... of the global batch. The
+        # replica index is the dp coordinate, or the place in the group without a mesh.
+        d = coords.get("dp", 0) if coords else place
+        x, y = x[d::args.dp_split].contiguous(), y[d::args.dp_split].contiguous()
 
     piper_setup(
         TPMlp,
@@ -109,6 +120,8 @@ def main(args, pg):
     )
 
     actors = piper_metadata.actors
+    if args.pr24_sync:
+        ray.get([a.sync_dp_params.remote() for a in actors.values()])
     logger.info(f"Running {args.warmup} warmup iterations")
     for _ in range(args.warmup):
         piper_exec_dag(loss_fn, log_stats=True)
@@ -189,6 +202,10 @@ def parse_args(argv=None):
         help="TP degree the model is authored for; must equal the place-group size.",
     )
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--pr24-sync", action="store_true",
+                        help="Apply open PR #24's startup weight sync over dp_group (log F82).")
+    parser.add_argument("--dp-split", type=int, default=1,
+                        help="Split the global batch across this many data-parallel replicas.")
     parser.add_argument("--dtype", choices=sorted(_DTYPES), default="fp32")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--stages", type=int, default=1,
