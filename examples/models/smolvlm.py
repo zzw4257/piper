@@ -26,6 +26,10 @@ from src.piper import annotate
 CFG = dict(v_width=768, v_layers=12, v_heads=12, v_mlp=3072, patch=16, image=512, scale=4,
            t_width=576, t_layers=30, t_heads=9, t_kv_heads=3, t_mlp=1536, vocab=49280,
            rope_theta=100000.0, rms_eps=1e-5, ln_eps=1e-6, tp=1)
+# SmolVLM2-2.2B-Instruct (2025): SigLIP-so400m tower, 384-pixel tiles of 81 tokens, SmolLM2-1.7B decoder
+CFG_SMOLVLM2 = dict(v_width=1152, v_layers=27, v_heads=16, v_mlp=4304, patch=14, image=384, scale=3,
+                    t_width=2048, t_layers=24, t_heads=32, t_kv_heads=32, t_mlp=8192, vocab=49280,
+                    rope_theta=130000.0, rms_eps=1e-5, ln_eps=1e-6)
 
 # Megatron TP (log F87), weights in TP-local shapes as in tp_mlp.py: column-parallel
 # projections keep 1/tp of their output features (whole heads), row-parallel ones 1/tp
@@ -263,7 +267,11 @@ class SmolVLM(nn.Module):
         emb = torch.cat((f, f), dim=-1)
         return emb.cos().to(dtype)[None, None], emb.sin().to(dtype)[None, None]
 
-    def forward(self, pixel_values, input_ids):
+    def forward(self, pixel_values, input_ids, img_index=None):
+        """Tiled mode (``image_offset=None``, log F97): ``pixel_values`` holds every tile of every
+        sample, ``[B*T, 3, H, W]``, and ``img_index`` ``[B, T*n_img]`` the positions of the image
+        tokens in ``input_ids``, where the tiles' features are scattered, as SmolVLM2's image
+        splitting interleaves them with row/column tokens."""
         vm = self.model.vision_model
         vper = -(-len(vm.encoder.layers) // self.vis_stages)
         b = pixel_values.shape[0] // self.vis_chunks
@@ -285,8 +293,12 @@ class SmolVLM(nn.Module):
             with annotate("PP"):
                 if s == 0:
                     img = imgs[0] if len(imgs) == 1 else torch.cat(imgs, dim=0)
-                    o = self.image_offset
-                    h = torch.cat([txt[:, :o], img, txt[:, o + self.n_img:]], dim=1)
+                    if self.image_offset is None:
+                        img = img.reshape(input_ids.shape[0], -1, img.shape[-1])
+                        h = txt.scatter(1, img_index.unsqueeze(-1).expand(-1, -1, img.shape[-1]), img)
+                    else:
+                        o = self.image_offset
+                        h = torch.cat([txt[:, :o], img, txt[:, o + self.n_img:]], dim=1)
                 cos, sin = self._rope(h.shape[1], h.device, h.dtype)
                 for layer in layers[s * per:(s + 1) * per]:
                     h = layer(h, cos, sin)

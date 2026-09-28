@@ -48,21 +48,24 @@ def main(args, pg):
         # batch i of the stream; with --stream, step i trains on rows i*b.. of the data (log F88)
         n = len(data["input_ids"])
         rows = torch.arange(i * b, (i + 1) * b) % n
-        px = (data["images"][rows].permute(0, 3, 1, 2).float() / 255.0 - 0.5) / 0.5
-        ids, lab = data["input_ids"][rows], data["labels"][rows]
         if args.dp_split > 1:
             # replica d trains on rows d, d+n, ...: its dp coordinate, or its place without a mesh
-            d = coords.get("dp", place)
-            px, ids, lab = (t[d::args.dp_split].contiguous() for t in (px, ids, lab))
-        return px, ids, lab
+            rows = rows[coords.get("dp", place)::args.dp_split]
+        T = data.get("tiles", 1)
+        tile_rows = (rows[:, None] * T + torch.arange(T)).reshape(-1)
+        px = (data["images"][tile_rows].permute(0, 3, 1, 2).float() / 255.0 - 0.5) / 0.5
+        ids, lab = data["input_ids"][rows], data["labels"][rows]
+        extra = [data["img_index"][rows]] if "img_index" in data else []
+        return px, ids, lab, extra
 
-    pixel_values, input_ids, labels = batch(0)
+    pixel_values, input_ids, labels, extra_inputs = batch(0)
+    config = dict(data.get("config") or {}, tp=args.tp)
 
     piper_setup(
         SmolVLM,
-        model_args=(data["image_offset"], args.dec_stages, args.vis_stages, {"tp": args.tp}, args.vis_chunks),
+        model_args=(data["image_offset"], args.dec_stages, args.vis_stages, config, args.vis_chunks),
         optim_fn=functools.partial(torch.optim.Adam, lr=args.lr),
-        example_inputs=[pixel_values, input_ids],
+        example_inputs=[pixel_values, input_ids, *extra_inputs],
         example_outputs=labels,
         model_dtype=torch.float32,
         pg=pg,
@@ -82,8 +85,8 @@ def main(args, pg):
     iter_times, losses = [], []
     for i in range(args.iters):
         if args.stream and i > 0:
-            px, ids, lab = batch(i)
-            refs = ray.put([px, ids]), ray.put(lab)
+            px, ids, lab, ext = batch(i)
+            refs = ray.put([px, ids, *ext]), ray.put(lab)
             ray.get([a.load_input.remote(refs[0]) for a in actors.values()]
                     + [a.load_labels.remote(refs[1]) for a in actors.values()])
         ray.get([a.drain.remote() for a in actors.values()])

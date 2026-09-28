@@ -5033,3 +5033,95 @@ GPU 1 also idles at 162–173 W against 137–144 W on the others.
 - The fused path is the case where the ring cannot follow. The ring's online-softmax steps need the running max and sum per chunk, while Ulysses runs whole attention per head group and can use a fused kernel. Its memory is 7× smaller here for that reason, not because of the exchange.
 
 **Meaning.** A new CP plan cost a model layout and one existing directive. EP's exchange and Ulysses' exchange are the same collective on the same axis: a resharding S(heads) ↔ S(seq), written as the one Piper already had.
+
+**F96 addendum: clean timing** (4 healthy B200s, no other process on the cards; CP=4, dim 1024, 8 heads, batch 2):
+
+| tokens | ring | hoisted ring | gather | Ulysses, softmax written out | Ulysses, fused SDPA |
+|---|---|---|---|---|---|
+| 8192 | 14.4 ms / 3.1 GB | 13.4 / 3.1 | 13.1 / 3.1 | **7.9** / 4.5 | 9.1 / **0.45** |
+| 32768 | 224.9 / 43.6 | 223.0 / 43.6 | 221.4 / 43.7 | **148.4** / 66.9 | 171.1 / **1.6** |
+
+- With the same math, Ulysses is 1.5–1.7× faster than the ring or the gather. Each rank runs one full-sequence GEMM per head group, where the ring runs four chunk GEMMs plus the online-softmax combine.
+- Its memory is higher (the whole score matrix for its heads) unless the kernel is fused; fused, it is 27× lower than the ring's at 32k.
+- The earlier gather figure (27.5 ms) was contention.
+- CP now has plans that differ by up to 1.7× in time and 27× in memory, so step 5 has something to choose there too.
+
+---
+
+## 2026-09-28 — F97: SmolVLM2-2.2B on DocVQA and ChartQA. Tiles vary with the image, and Piper's traced shapes turn that into buckets; logits bit-identical to Hugging Face
+
+**Why.** Beyond SmolVLM-256M on COCO. The target is a 2025 model on document and chart QA, where high-resolution images are split into tiles, so the image part of every example has a different size.
+
+**Changed.**
+- `models/smolvlm.py`:
+  - `CFG_SMOLVLM2`: SigLIP-so400m tower, 1152 wide, 27 layers, 16 heads; 384-pixel tiles of 729 patches become 81 tokens; SmolLM2-1.7B decoder, 2048 wide, 24 layers, 32/32 heads, rope 130000.
+  - Tiled mode (`image_offset=None`): `pixel_values` holds every tile `[B*T, 3, 384, 384]`, and a model input `img_index` `[B, T*81]` gives the image-token positions. The features are scattered there (`txt.scatter`), because SmolVLM2 interleaves the tile tokens with row/column tokens.
+- `experiments/prepare_smolvlm2.py`:
+  - Runs the_cauldron's DocVQA and ChartQA (the Idefics training mix, 2024) through the released processor with image splitting on (longest edge 1536).
+  - Buckets examples by tile count and keeps labels on the answer only.
+  - Writes `T<tiles>/data.pt` with the tiles as uint8 (round trip exact).
+- `test_smolvlm.py` feeds tiles and `img_index`. `test/test_smolvlm_tiles.py`: scatter at contiguous positions equals the old merge bit for bit, and the positions reach the decoder region as a model input. Suite 125 passed.
+
+**Measured.**
+- 600 examples: 9 tiles 6%, 13 tiles 25%, 17 tiles 69% (DocVQA mostly 17; ChartQA mixed). 776–1476 tokens per example, of which 729–1377 are image tokens.
+- Our model against `SmolVLMForConditionalGeneration`, CPU, fp32, a 9-tile example of 785 tokens: logits max |diff| **0.0**, loss 0.06578 both.
+- Stage costs on one healthy B200, fp32, fwd+bwd per example (`experiments/profile_smolvlm2.py`):
+
+| tiles | vision tower | decoder | vision / decoder |
+|---|---|---|---|
+| 9 | 417 ms | 179 ms | 2.33 |
+| 13 | 591 ms | 231 ms | 2.56 |
+| 17 | 725 ms | 336 ms | 2.16 |
+
+- Vision cost per tile falls from 64.9 ms (1 tile) to 43.9 ms (18 tiles).
+- Through Piper on one GPU (9 tiles, batch 2): 1.137 s per step, 3% from the stage sum; peak 66 GB.
+
+**What the IR had to give.** The tile count is data. Piper traces fixed shapes, so a mixed dataset becomes one program per bucket.
+
+---
+
+## 2026-09-28 — F98: the best placement moves with the model and with the data. For SmolVLM2 the decoder needs two GPUs; for 9-tile inputs it needs one. The pipeline model called both, within 2%
+
+**Setup.**
+- 6 examples per step, four healthy B200s.
+- `experiments/select_vlm2.py` prices every placement from the single-GPU profile:
+  - heterogeneous k+s: vision in k chunks side by side, decoder in s pipeline stages;
+  - pipeline v+s;
+  - m = 1, 2, 3, 6; GPipe or 1F1B.
+  - Vision cost is linear in tiles, decoder cost linear in examples.
+- It writes the schedules. `experiments/check_vlm2.py` measures them.
+- One-GPU baselines run one microbatch's forward then its backward: all-forwards-first does not fit in 178 GB.
+- Losses match one GPU at the same m within 1.3e-8 to 9.2e-7.
+
+**17 tiles (DocVQA).**
+
+| placement | predicted | measured | error |
+|---|---|---|---|
+| **vision 2 chunks + decoder 2 stages, m=3, 1F1B** (the model's pick) | 2366.0 | **2368.7 / 2367.4** | −0.1% |
+| vision 3 + decoder 1, m=2, 1F1B (SmolVLM's best shape, F84) | 2534.4 | 2489.0 / 2486.8 | +1.8% |
+| vision 3 + decoder 1, m=2 | 2534.4 | 2557.9 | −0.9% |
+| pipeline 2+2, m=6, 1F1B | 2691.3 | 2683.6 | +0.3% |
+| pipeline 3+1, m=6 | 2780.6 | 2771.7 | +0.3% |
+| vision 2 + decoder 2, m=3 | 2835.4 | 2819.5 | +0.6% |
+| vision 3 + decoder 1, m=1 | 3162.5 | 3145.4 | +0.5% |
+| one GPU, m=2 / 3 / 6 | — | 6002.1 / 6155.0 / 6384.8 | |
+
+- Best is 2.54× one GPU.
+- SmolVLM's best shape loses by 5%. With the vision/decoder ratio at 2.2 instead of 3.9, a single decoder GPU becomes the bottleneck.
+
+**9 tiles (ChartQA-heavy bucket).**
+
+| placement | predicted | measured | error |
+|---|---|---|---|
+| **vision 3 + decoder 1, m=6** (the model's pick) | 1262.0 | **1259.6** | +0.2% |
+| vision 2 + decoder 2, m=3, 1F1B | 1307.2 | 1335.5 | −2.1% |
+| vision 3 + decoder 1, m=2, 1F1B | 1372.8 | 1431.5 | −4.1% |
+| one GPU, m=3 | 3381 | 3384.4 | −0.1% |
+
+- The best shape flips back: tile counts change both the ratio and which chunkings divide evenly.
+- A first 9-tile run was 14–42% slower on every multi-GPU plan and matched nothing. The rerun matches the model. Something else was on the cards that time and left no trace, so `job.sh` now samples every GPU process every 30 s into `<tag>.gpuapps`.
+
+**Meaning.**
+- Placement is not a property of the model alone: it moves with the model's balance and with the data's shape.
+- A single-GPU profile and the DAG are enough to call it (12 of 12 clean measurements within 4.1%, 9 of them within 2%).
+- For mixed-resolution data the right unit is one placement per bucket. Piper compiles one program per schedule, so this is a program per bucket sharing weights, which Piper does not do yet.
