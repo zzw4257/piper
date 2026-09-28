@@ -4764,3 +4764,25 @@ All within 1%. Piper's own overhead on these steps is below the model's resoluti
 - All four fall from 3.99 to about 0.006. That is memorization of 512 pairs, not generalization; the run tests equivalence, not model quality.
 - The control computes the same math with different GEMM shapes. It leaves the reference at the same step and by the same amount as the two multi-GPU placements. So the drift is floating-point order amplified by training, and the placements cannot be told apart from a legitimate one-GPU reordering.
 - TP=3 at batch 48 is slower than one GPU (927 vs 776 ms), while at batch 16 it was faster (231 vs 270, F87). Not explained; this run pushes a new batch to every actor each step, and nothing was profiled.
+
+---
+
+## 2026-09-28 — F89: `lifetime: refetch` makes the CP ring hold 1/n of K/V (design step 4). Losses bit-identical to the plain ring; 256 MB less at the start of the backward; this model's peak is set elsewhere
+
+**Why.** F86 found that Piper's ring keeps every K/V chunk until the backward, because each step saves the chunk it received. Ring-attention libraries avoid that by fetching K/V again during the backward. That is a lifetime choice, step 4 of the design.
+
+**Changed.** `ring_exchange` / `layout` take `lifetime: "keep" | "refetch"` (spliced ring only; refused with `hoist` or `decompose: gather`).
+- Forward: ring node k+1 sends step k's chunk and then frees its storage (`untyped_storage().resize_(0)`, the FSDP pattern). The payload is forwarded, so it is the same storage step k saved for its backward.
+  - The send needs no copy: that buffer was allocated on the ring's stream, so any reuse is ordered after the send.
+  - Kept: the rank's own chunk (step 0) and the last step's chunk.
+- Backward: the ring node before step k's backward restores the storage and receives the chunk straight into it from its owner, k ranks back (`ring_exchange` with shift k, sending the own chunk without a copy). No autograd write happens, so the saved tensor's version is unchanged.
+- The first try received into a fresh buffer and copied, with cloned sends. Its peak was 134 MB *above* the plain ring's, so it was changed to receive in place.
+- Test: step numbers and the refusal (`test_ring_directive.py`). Suite 123 passed.
+
+**Measured** (CP=4 on 4 B200; dim 4096, one head, 4096 tokens, batch 4, so one K+V chunk is 128 MB; 3 steps):
+- Losses: refetch equals keep bit for bit on every rank at every step. Both differ from dense CP=1 by 2.4e-4 at step 3, outside `check_cp_equivalence`'s 2e-4. That is the plain ring too, at this size: fp32 attention over dim 4096.
+- Memory allocated at the first backward ring node (after step 3's backward; temporary probe, not committed): keep 1921 MB, refetch 1665 MB. The difference is 256 MB, two chunks: the ones for steps 1 and 2.
+- Peak per step: 2618 MB for both. The peak comes later in the backward, after the chunks are released under either plan.
+- So in this model the win is real but does not move the peak. Each eager online-softmax step saves output-sized intermediates (o·α, p·v) as large as its K/V chunk. With a fused attention kernel, which saves only the log-sum-exp, the chunks would dominate.
+
+**Meaning.** Steps 1–4 of the design are built: axes, placements, decomposition, lifetime. Each lowering is exact against the one it refines. Step 5, choosing among them, has nothing to separate on this hardware and model yet: plans tie in time (F86) and in peak memory (here).

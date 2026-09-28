@@ -243,3 +243,16 @@ def test_gather_needs_one_step_per_other_rank() -> None:
         _lower([_PLACE, _SPLIT, {**_ring(["k", "v"]), "decompose": "gather"}], steps=4)
     with pytest.raises(BackendCompilerFailed, match="hoist does not apply"):
         _lower([_PLACE, _SPLIT, {**_ring(["k", "v"]), "decompose": "gather", "hoist": True}], steps=2)
+
+
+def test_refetch_lifetime_numbers_the_steps_and_refuses_hoist() -> None:
+    """lifetime=refetch (log F89): the ring nodes carry their step, so the forward can free
+    step k-1's chunk and the backward fetch it again."""
+    place4 = {**_PLACE, "devices": [0, 1, 2, 3]}
+    dag = _lower([place4, _SPLIT, {**_ring(["k", "v"], devices=(0, 1, 2, 3)), "lifetime": "refetch"}], steps=4)
+    ring = [n for n in dag.nodes.values() if n.node_kind == "RING_COMM"]
+    assert sorted((n.tag["PASS"], n.node_meta["ring_step"]) for n in ring) == [
+        ("B", 1), ("B", 2), ("B", 3), ("F", 1), ("F", 2), ("F", 3)]
+    assert all(n.node_meta["lifetime"] == "refetch" for n in ring)
+    with pytest.raises(BackendCompilerFailed, match="spliced ring only"):
+        _lower([_PLACE, _SPLIT, {**_ring(["k", "v"]), "lifetime": "refetch", "hoist": True}], steps=2)

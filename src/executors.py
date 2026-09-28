@@ -143,6 +143,8 @@ class CommunicationExecutor:
         tensors: list[torch.Tensor],
         shift: int,
         stream: torch.cuda.Stream,
+        clone: bool = True,
+        recv_into: list[torch.Tensor] | None = None,
     ) -> list[torch.Tensor]:
         """Rotate tensors one hop around the group: send to rank+shift, receive from rank-shift.
 
@@ -150,6 +152,10 @@ class CommunicationExecutor:
         Sends and receives are issued as one batch so a two-rank ring (where the
         peer is the same rank both ways) cannot deadlock. Rides on ep_group; see
         the ponytail note on all_reduce_activation for the limit that implies.
+
+        ``clone=False`` sends the tensors themselves: only for buffers this stream
+        allocated, whose reuse is ordered after the send. ``recv_into`` receives into
+        given buffers instead of fresh ones (log F89).
         """
         group = self.runtime.group_for("cp", self.runtime.ep_group)
         n = dist.get_world_size(group=group)
@@ -160,8 +166,9 @@ class CommunicationExecutor:
             # clone, not contiguous(): a contiguous() that aliases the producer's
             # buffer would let the default stream free that block under an
             # in-flight isend on this stream. The clone lives in this stream's pool.
-            sends = [t.detach().clone(memory_format=torch.contiguous_format) for t in tensors]
-            recvs = [torch.empty_like(s) for s in sends]
+            sends = ([t.detach().clone(memory_format=torch.contiguous_format) for t in tensors] if clone
+                     else [t.detach() for t in tensors])
+            recvs = recv_into if recv_into is not None else [torch.empty_like(s) for s in sends]
             ops = [dist.P2POp(dist.isend, s, dst, group=group) for s in sends]
             ops += [dist.P2POp(dist.irecv, r, src, group=group) for r in recvs]
             for work in dist.batch_isend_irecv(ops):
@@ -1040,9 +1047,26 @@ class DagExecutor:
                         if meta["ring_step"] == n - 1:
                             del self.buffers.task[key]
                     else:
+                        payload = [detached_outs[i] for i in idxs]
+                        refetch = meta.get("lifetime") == "refetch"
+                        # From step 2 on the payload is an earlier ring node's receive buffer,
+                        # allocated on this stream and freed just below: no clone needed.
                         rotated = self.communication.ring_exchange(
-                            [detached_outs[i] for i in idxs], meta["ring_shift"], node_stream
-                        )
+                            payload, meta["ring_shift"], node_stream,
+                            clone=not (refetch and meta["ring_step"] > 1))
+                        if refetch:
+                            # The payload is the chunk step k-1 consumed (forwarded, so the
+                            # same storage its backward saved). Its send is a clone already
+                            # queued on this stream, and this stream waited for step k-1's
+                            # forward: free it now, refill it in the backward (log F89).
+                            k, chain = meta["ring_step"], meta["ring_chain"]
+                            if k == 1:
+                                self.buffers.task[("own", chain)] = payload
+                            else:
+                                self.buffers.task[("freed", chain, k - 1)] = [
+                                    (t, t.untyped_storage().nbytes()) for t in payload]
+                                for t in payload:
+                                    t.untyped_storage().resize_(0)
                     for i, t in zip(idxs, rotated):
                         detached_outs[i] = t.requires_grad_(True)
                     if meta.get("hoisted"):
@@ -1097,6 +1121,25 @@ class DagExecutor:
                                 rotated = [torch.zeros_like(g) for g in parts]
                     else:
                         rotated = self.communication.ring_exchange(parts, meta["ring_shift"], node_stream)
+                    if meta.get("lifetime") == "refetch":
+                        # Step k-1's backward runs next and needs the chunk freed in the
+                        # forward: it belongs to the rank k-1 back, which sends its own.
+                        k, chain = meta["ring_step"], meta["ring_chain"]
+                        freed = self.buffers.task.pop(("freed", chain, k - 1), None)
+                        if freed:
+                            # Receive straight into the saved tensors' storage; no autograd
+                            # write, so their version stays put. The own chunk is kept alive
+                            # by the stash, so it is sent without a copy.
+                            with torch.cuda.stream(node_stream):
+                                for t, nbytes in freed:
+                                    t.untyped_storage().resize_(nbytes)
+                            self.communication.ring_exchange(
+                                self.buffers.task[("own", chain)], k - 1, node_stream,
+                                clone=False, recv_into=[t.detach() for t, _ in freed])
+                            for t, _ in freed:
+                                t.record_stream(self.runtime.default_stream())
+                        if k == 1:
+                            self.buffers.task.pop(("own", chain), None)
                     for i, g in zip(idxs, rotated):
                         inp_grads[i] = g
                     bwd_buf["inp_grads"] = inp_grads

@@ -1553,6 +1553,7 @@ def _insert_ring_exchange_comm_nodes(
     distance: int = 1,
     derive_seq_dim: int | None = None,
     decompose: str = "ring",
+    lifetime: str = "keep",
 ) -> None:
     """Rotate forwarded tensors one hop around the group between consecutive matched regions.
 
@@ -1600,7 +1601,19 @@ def _insert_ring_exchange_comm_nodes(
     gradient into a per-chunk buffer that the last backward node reduce-scatters. Same
     nodes and edges, different collective: all n chunks stay resident through the
     forward, in exchange for one collective per direction.
+
+    ``lifetime="refetch"`` holds 1/n of K/V instead of all of it (log F89). Each ring
+    step keeps the chunk it received for its own backward, so by default every chunk is
+    resident at the end of the forward (F86). With refetch, step k+1 frees step k's chunk
+    once step k's forward is done, and the backward ring node in front of step k's
+    backward fetches it again from its owner, k ranks back. The first step's chunk is the
+    rank's own and the last step's is used right away, so neither is freed.
     """
+    if lifetime not in ("keep", "refetch"):
+        raise ValueError(f"ring_exchange: lifetime must be 'keep' or 'refetch', got {lifetime!r}")
+    if lifetime == "refetch" and (hoist or decompose != "ring"):
+        raise ValueError("ring_exchange: lifetime='refetch' applies to the spliced ring only (no hoist, decompose='ring')")
+    stepped = decompose == "gather" or lifetime == "refetch"
     if decompose not in ("ring", "gather"):
         raise ValueError(f"ring_exchange: decompose must be 'ring' or 'gather', got {decompose!r}")
     if decompose == "gather" and hoist:
@@ -1696,8 +1709,8 @@ def _insert_ring_exchange_comm_nodes(
             # The step this node serves: the consumer's CP index going forward, the
             # source's going backward (the chunk that region consumed).
             step_tag = (dst_node if is_fwd else node).tag
-            if decompose == "gather" and "CP" not in step_tag:
-                raise ValueError(f"ring_exchange(decompose='gather'): region {uid} has no CP index")
+            if stepped and "CP" not in step_tag:
+                raise ValueError(f"ring_exchange(decompose={decompose!r}, lifetime={lifetime!r}): region {uid} has no CP index")
             comm_uid = f"ring_exchange.{ring_idx}"
             ring_idx += 1
             dag.add_node(
@@ -1713,10 +1726,10 @@ def _insert_ring_exchange_comm_nodes(
                         "source_uid": uid,
                         "ring_tensor_idxs": sorted(set(idxs)),
                         "ring_shift": 1 if is_fwd else -1,
-                        **({"decompose": "gather", "ring_step": int(step_tag["CP"]),
+                        **({"decompose": decompose, "lifetime": lifetime, "ring_step": int(step_tag["CP"]),
                             "ring_chain": repr(sorted((k, v) for k, v in node.tag.items()
                                                       if k not in ("CP", "PASS")))}
-                           if decompose == "gather" else {}),
+                           if stepped else {}),
                         "bucket_key": node.node_meta.get(
                             "bucket_key", dst_node.node_meta.get("bucket_key")
                         ),
@@ -1730,17 +1743,17 @@ def _insert_ring_exchange_comm_nodes(
                 dag.add_edge(TrainingDAGEdge(
                     src_uid=comm_uid, dst_uid=dst_uid, dep_kind="data", tensor_name=e.tensor_name))
 
-    if decompose == "gather":
+    if stepped:
         steps: dict[tuple, set] = {}
         for n in dag.nodes.values():
             m = n.node_meta
-            if n.node_kind == "RING_COMM" and m.get("decompose") == "gather" and m["source_uid"] in matched:
+            if n.node_kind == "RING_COMM" and "ring_step" in m and m["source_uid"] in matched:
                 steps.setdefault((m["ring_chain"], n.tag.get("PASS")), set()).add(m["ring_step"])
         want = set(range(1, len(expected)))
         bad = {k: v for k, v in steps.items() if v != want}
         if bad:
             raise ValueError(
-                f"ring_exchange(decompose='gather'): each chain needs ring steps {sorted(want)} "
+                f"ring_exchange(decompose={decompose!r}, lifetime={lifetime!r}): each chain needs ring steps {sorted(want)} "
                 f"(one per other rank), got {bad}")
     if not hoist:
         return
@@ -2443,7 +2456,8 @@ def _apply_layout(dag: TrainingDAG, filters: list[dict[str, Any]], devices: list
         _insert_ring_exchange_comm_nodes(
             dag, ring_filters, devices, tensors=None, comm_stream=raw.get("ring_stream", raw.get("stream")),
             hoist=bool(raw.get("hoist", False)), distance=int(raw.get("distance", 1)),
-            derive_seq_dim=ring_dims.pop(), decompose=raw.get("decompose", "ring"))
+            derive_seq_dim=ring_dims.pop(), decompose=raw.get("decompose", "ring"),
+            lifetime=raw.get("lifetime", "keep"))
     dag.__dict__.setdefault("layout_report", {})[axis] = report
     return report
 
@@ -2567,6 +2581,7 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
                 hoist=bool(raw.get("hoist", False)), distance=int(raw.get("distance", 1)),
                 derive_seq_dim=(raw.get("derive") or {}).get("seq_dim"),
                 decompose=raw.get("decompose", "ring"),
+                lifetime=raw.get("lifetime", "keep"),
             )
         elif op == "layout":
             _apply_layout(training_dag, filters, devices, raw)
