@@ -39,6 +39,14 @@ CASES = {
                     {"op": "layout", "filter": {"PP": 0}, "devices": [0, 1], "axis": "cp", "inputs": {"*": "shard(1)"},
                      "reduce_stream": "dp_stream", "ring_stream": "cp_stream"}, SPLIT],
                    ring),
+    "cp_gather": ([{"op": "place", "filter": {"PP": 0}, "devices": [0, 1], "stream": "default_stream"},
+                   {"op": "replicate", "filter": {"PP": 0}, "devices": [0, 1], "reduce_stream": "dp_stream"},
+                   {"op": "ring_exchange", "filter": {"CP": "*"}, "devices": [0, 1], "stream": "cp_stream",
+                    "derive": {"seq_dim": 2}, "decompose": "gather"}, SPLIT],
+                  [{"op": "place", "filter": {"PP": 0}, "devices": [0, 1], "stream": "default_stream"},
+                   {"op": "layout", "filter": {"PP": 0}, "devices": [0, 1], "axis": "cp", "inputs": {"*": "shard(1)"},
+                    "reduce_stream": "dp_stream", "ring_stream": "cp_stream", "decompose": "gather"}, SPLIT],
+                  ring),
 }
 
 

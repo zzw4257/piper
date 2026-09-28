@@ -4681,3 +4681,34 @@ All within 1%. Piper's own overhead on these steps is below the model's resoluti
 - For CP the user states only that the model's inputs are split along the sequence. Which regions are row-local (the projections), where the split moves to dim 2 (after the head split), which regions gather K/V (the ring steps), and which weights need a gradient sync (q/o projections) are all derived.
 
 **Not yet.** One layout per axis must agree on gradient sync across its regions (mixed cases raise); EP (data-dependent routing) is not a placement; decomposition other than the ring (one all-gather) needs an activation all-gather node.
+
+---
+
+## 2026-09-28 — F86: CP lowers to one all-gather as well as a ring (design step 3). Exact on CP=2 and CP=4; on B200 the two cost the same, and Piper's ring saves no memory
+
+**Why.** F85 derives *which* K/V a CP region gathers. How to gather is a separate choice: n-1 neighbour hops (the ring) or one all-gather. F70 found DTensor's cost model picks yet another plan. Step 3 of the design makes the choice a directive field.
+
+**Changed.**
+- `ring_exchange` and `layout` take `decompose: "ring" | "gather"` (default ring).
+- Gather keeps the same nodes and edges. Each ring node records its step k (CP index of the region it serves).
+  - Forward: step 1 all-gathers every rank's chunk. Step k hands its consumer chunk `rank − k`, the one the ring delivers after k hops.
+  - Backward: step k adds its gradient into a per-chunk buffer and gives the region before it zero for that slot (the chunk never passed through it). Step 1 runs last: it reduce-scatters, so region 0 receives every other rank's use of its chunk.
+- Refused: chains without one step per other rank; `hoist` with gather.
+- Tests: node and edge sets equal the ring's, and step numbers are checked (`test_ring_directive.py`); `layout` + gather matches written `ring_exchange` + gather (`test_layout.py`). Suite 121 passed.
+
+**Tested on B200** (`check_cp_equivalence.py`, 3 optimizer steps, so the backward is constrained):
+- CP=2 gather matches dense within 1.7e-6.
+- CP=4 gather matches dense within 2.6e-6.
+
+**Measured** (`experiments/sweep_cp_decompose.py`: CP=4, dim 1024, 8 heads, batch 2, fp32; best of 2 interleaved runs, slowest rank):
+
+| seq (local) | ring | hoisted ring | gather |
+|---|---|---|---|
+| 8192 (2048) | 12.44 ms / 3079 MiB | 14.00 / 3079 | 12.04 / 3111 |
+| 32768 (8192) | 224.02 / 43600 | 222.13 / 43600 | 221.43 / 43728 |
+
+- Time: all three plans are within 2% of each other at 32k, and within 16% at 8k where the hoisted ring is slowest. Attention compute dominates; NVLink moves the K/V chunks almost for free.
+- Memory: gather adds only 32 and 128 MiB. Holding three more K/V chunks would cost 96 and 384 MiB, so the ring already keeps them. Each ring step saves the K and V it received for its own backward, so by the end of the forward all n chunks are resident under either plan.
+- So in Piper the ring keeps its "1/n of K/V resident" property only transiently. Ring-attention libraries get the memory saving by rotating K/V again during the backward instead of saving them. That is a lifetime decision, not a decomposition decision: it belongs to the lifetime directive (design step 4), with the same re-materialize-or-keep trade as ZeRO-3's regather (F69).
+
+**Meaning.** Layer 1 derives what is gathered. Layer 2 chooses how (`decompose`) and when (`hoist`, `distance`), and the result stays exact under every choice. On this hardware the choice does not matter, and choosing well needs a cost model with lifetime in it.

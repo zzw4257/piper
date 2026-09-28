@@ -1524,6 +1524,7 @@ def _insert_ring_exchange_comm_nodes(
     hoist: bool = False,
     distance: int = 1,
     derive_seq_dim: int | None = None,
+    decompose: str = "ring",
 ) -> None:
     """Rotate forwarded tensors one hop around the group between consecutive matched regions.
 
@@ -1564,7 +1565,18 @@ def _insert_ring_exchange_comm_nodes(
     region input is placed ``Shard(derive_seq_dim)`` and the ones DTensor must gather
     become the payload (``src/placement.py``). The ring is then that all-gather split
     into n-1 hops, one per consecutive pair of regions (log F70).
+
+    ``decompose="gather"`` lowers the same exchange as one all-gather instead of n-1
+    hops (log F86): the first ring node gathers every rank's chunk, node k hands its
+    consumer chunk ``rank - k`` from that buffer, and the backward sums each step's
+    gradient into a per-chunk buffer that the last backward node reduce-scatters. Same
+    nodes and edges, different collective: all n chunks stay resident through the
+    forward, in exchange for one collective per direction.
     """
+    if decompose not in ("ring", "gather"):
+        raise ValueError(f"ring_exchange: decompose must be 'ring' or 'gather', got {decompose!r}")
+    if decompose == "gather" and hoist:
+        raise ValueError("ring_exchange: decompose='gather' has one collective up front; hoist does not apply")
     expected = sorted(int(d) for d in devices)
     if len(set(expected)) < 2:
         raise ValueError(
@@ -1653,6 +1665,11 @@ def _insert_ring_exchange_comm_nodes(
                     )
                 idxs.append(int(o["idx"]))
             is_fwd = node.compute_subkind == "FWD"
+            # The step this node serves: the consumer's CP index going forward, the
+            # source's going backward (the chunk that region consumed).
+            step_tag = (dst_node if is_fwd else node).tag
+            if decompose == "gather" and "CP" not in step_tag:
+                raise ValueError(f"ring_exchange(decompose='gather'): region {uid} has no CP index")
             comm_uid = f"ring_exchange.{ring_idx}"
             ring_idx += 1
             dag.add_node(
@@ -1668,6 +1685,10 @@ def _insert_ring_exchange_comm_nodes(
                         "source_uid": uid,
                         "ring_tensor_idxs": sorted(set(idxs)),
                         "ring_shift": 1 if is_fwd else -1,
+                        **({"decompose": "gather", "ring_step": int(step_tag["CP"]),
+                            "ring_chain": repr(sorted((k, v) for k, v in node.tag.items()
+                                                      if k not in ("CP", "PASS")))}
+                           if decompose == "gather" else {}),
                         "bucket_key": node.node_meta.get(
                             "bucket_key", dst_node.node_meta.get("bucket_key")
                         ),
@@ -1681,6 +1702,18 @@ def _insert_ring_exchange_comm_nodes(
                 dag.add_edge(TrainingDAGEdge(
                     src_uid=comm_uid, dst_uid=dst_uid, dep_kind="data", tensor_name=e.tensor_name))
 
+    if decompose == "gather":
+        steps: dict[tuple, set] = {}
+        for n in dag.nodes.values():
+            m = n.node_meta
+            if n.node_kind == "RING_COMM" and m.get("decompose") == "gather" and m["source_uid"] in matched:
+                steps.setdefault((m["ring_chain"], n.tag.get("PASS")), set()).add(m["ring_step"])
+        want = set(range(1, len(expected)))
+        bad = {k: v for k, v in steps.items() if v != want}
+        if bad:
+            raise ValueError(
+                f"ring_exchange(decompose='gather'): each chain needs ring steps {sorted(want)} "
+                f"(one per other rank), got {bad}")
     if not hoist:
         return
     if not isinstance(distance, int) or distance < 0:
@@ -2382,7 +2415,7 @@ def _apply_layout(dag: TrainingDAG, filters: list[dict[str, Any]], devices: list
         _insert_ring_exchange_comm_nodes(
             dag, ring_filters, devices, tensors=None, comm_stream=raw.get("ring_stream", raw.get("stream")),
             hoist=bool(raw.get("hoist", False)), distance=int(raw.get("distance", 1)),
-            derive_seq_dim=ring_dims.pop())
+            derive_seq_dim=ring_dims.pop(), decompose=raw.get("decompose", "ring"))
     dag.__dict__.setdefault("layout_report", {})[axis] = report
     return report
 
@@ -2505,6 +2538,7 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
                 training_dag, filters, devices, tensors=raw.get("tensors"), comm_stream=stream,
                 hoist=bool(raw.get("hoist", False)), distance=int(raw.get("distance", 1)),
                 derive_seq_dim=(raw.get("derive") or {}).get("seq_dim"),
+                decompose=raw.get("decompose", "ring"),
             )
         elif op == "layout":
             _apply_layout(training_dag, filters, devices, raw)

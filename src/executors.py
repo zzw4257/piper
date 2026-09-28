@@ -168,6 +168,35 @@ class CommunicationExecutor:
                 work.wait()
         return recvs
 
+    def cp_rank(self) -> int:
+        return dist.get_rank(group=self.runtime.group_for("cp", self.runtime.ep_group))
+
+    def cp_size(self) -> int:
+        return dist.get_world_size(group=self.runtime.group_for("cp", self.runtime.ep_group))
+
+    def gather_chunks(self, tensors: list[torch.Tensor], stream: torch.cuda.Stream) -> list[list[torch.Tensor]]:
+        """All-gather each tensor over the cp group: result[t][j] is group rank j's chunk."""
+        group = self.runtime.group_for("cp", self.runtime.ep_group)
+        n = dist.get_world_size(group=group)
+        out = []
+        with torch.cuda.stream(stream):
+            for t in tensors:
+                parts = [torch.empty_like(t, memory_format=torch.contiguous_format) for _ in range(n)]
+                dist.all_gather(parts, t.detach().contiguous(), group=group)
+                out.append(parts)
+        return out
+
+    def scatter_sums(self, per_chunk: list[list[torch.Tensor]], stream: torch.cuda.Stream) -> list[torch.Tensor]:
+        """Reduce-scatter per-chunk partial sums: each rank gets the total for its own chunk."""
+        group = self.runtime.group_for("cp", self.runtime.ep_group)
+        out = []
+        with torch.cuda.stream(stream):
+            for parts in per_chunk:
+                r = torch.empty_like(parts[0])
+                dist.reduce_scatter(r, [p.contiguous() for p in parts], group=group)
+                out.append(r)
+        return out
+
     def all_reduce_fused(
         self,
         tensors: list[torch.Tensor],
@@ -997,9 +1026,23 @@ class DagExecutor:
                     fwd_buf = dict(self.buffers.task[fwd_pred.uid])
                     self.buffers.release(fwd_pred.uid)  # refcounted by data_succs
                     detached_outs = list(fwd_buf["detached_outs"])
-                    rotated = self.communication.ring_exchange(
-                        [detached_outs[i] for i in idxs], meta["ring_shift"], node_stream
-                    )
+                    if meta.get("decompose") == "gather":
+                        # Step k serves chunk rank-k, the one the ring would have
+                        # delivered after k hops. Step 1 gathers; the last step drops it.
+                        key = ("gather", meta["ring_chain"])
+                        if meta["ring_step"] == 1:
+                            self.buffers.task[key] = self.communication.gather_chunks(
+                                [detached_outs[i] for i in idxs], node_stream)
+                        chunks = self.buffers.task[key]
+                        n = len(chunks[0])
+                        me = self.communication.cp_rank()
+                        rotated = [c[(me - meta["ring_step"]) % n] for c in chunks]
+                        if meta["ring_step"] == n - 1:
+                            del self.buffers.task[key]
+                    else:
+                        rotated = self.communication.ring_exchange(
+                            [detached_outs[i] for i in idxs], meta["ring_shift"], node_stream
+                        )
                     for i, t in zip(idxs, rotated):
                         detached_outs[i] = t.requires_grad_(True)
                     if meta.get("hoisted"):
@@ -1034,7 +1077,26 @@ class DagExecutor:
                         f"BWD_RING_EXCHANGE tag={node_tag}: grad at ring_tensor_idxs="
                         f"{idxs} is None; the forwarded slot did not receive a gradient"
                     )
-                    rotated = self.communication.ring_exchange(parts, meta["ring_shift"], node_stream)
+                    if meta.get("decompose") == "gather":
+                        # Step k's gradient is for chunk rank-k. Park it; the region
+                        # before gets zero for that slot, since the forward did not
+                        # pass the chunk through it. Step 1 runs last: reduce-scatter,
+                        # and region 0 receives every other rank's use of its chunk.
+                        key = ("gather_grad", meta["ring_chain"])
+                        n = self.communication.cp_size()
+                        me = self.communication.cp_rank()
+                        with torch.cuda.stream(node_stream):
+                            acc = self.buffers.task.setdefault(
+                                key, [[torch.zeros_like(g) for _ in range(n)] for g in parts])
+                            for slot, g in zip(acc, parts):
+                                slot[(me - meta["ring_step"]) % n].add_(g)
+                        if meta["ring_step"] == 1:
+                            rotated = self.communication.scatter_sums(self.buffers.task.pop(key), node_stream)
+                        else:
+                            with torch.cuda.stream(node_stream):
+                                rotated = [torch.zeros_like(g) for g in parts]
+                    else:
+                        rotated = self.communication.ring_exchange(parts, meta["ring_shift"], node_stream)
                     for i, g in zip(idxs, rotated):
                         inp_grads[i] = g
                     bwd_buf["inp_grads"] = inp_grads

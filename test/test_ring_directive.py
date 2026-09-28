@@ -220,3 +220,26 @@ def test_spliced_baseline_is_unchanged_by_the_hoist_code() -> None:
         assert not n.node_meta.get("hoisted")
         assert {e.src_uid for e in dag.edges if e.dst_uid == u and e.dep_kind == "data"} \
             == {n.node_meta["source_uid"]}
+
+
+def test_gather_decomposition_keeps_the_nodes_and_numbers_the_steps() -> None:
+    """decompose=gather (log F86): same nodes and edges as the ring; each carries its step."""
+    place4 = {**_PLACE, "devices": [0, 1, 2, 3]}
+    ring = _lower([place4, _SPLIT, _ring(["k", "v"], devices=(0, 1, 2, 3))], steps=4)
+    gather = _lower([place4, _SPLIT, {**_ring(["k", "v"], devices=(0, 1, 2, 3)), "decompose": "gather"}], steps=4)
+    edges = lambda d: sorted((e.src_uid, e.dst_uid, e.dep_kind) for e in d.edges)  # noqa: E731
+    assert edges(ring) == edges(gather)
+    for u, n in gather.nodes.items():
+        if n.node_kind != "RING_COMM":
+            continue
+        src = gather.nodes[n.node_meta["source_uid"]]
+        dst = gather.nodes[next(e.dst_uid for e in gather.edges if e.src_uid == u and e.dep_kind == "data")]
+        assert n.node_meta["decompose"] == "gather"
+        assert n.node_meta["ring_step"] == (dst if n.tag["PASS"] == "F" else src).tag["CP"]
+
+
+def test_gather_needs_one_step_per_other_rank() -> None:
+    with pytest.raises(BackendCompilerFailed, match="one per other rank"):
+        _lower([_PLACE, _SPLIT, {**_ring(["k", "v"]), "decompose": "gather"}], steps=4)
+    with pytest.raises(BackendCompilerFailed, match="hoist does not apply"):
+        _lower([_PLACE, _SPLIT, {**_ring(["k", "v"]), "decompose": "gather", "hoist": True}], steps=2)
