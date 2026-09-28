@@ -4790,3 +4790,28 @@ All within 1%. Piper's own overhead on these steps is below the model's resoluti
 **F88 addendum (same night): the TP=3 slowdown was not TP.** Re-measured at batch 48 on one fixed batch (`check_vlm_tp.py --batch-size 48 --iters 8`): TP=3 404.2 ms, one GPU 739.2 ms, a 1.83x speedup, with losses within 4.5e-6. In the streaming run, TP=3's fastest step is 400 ms, but its steps spread from 554 ms (10th percentile) to 1177 ms (90th). The one-GPU and heterogeneous runs are flat (776 ± 1, 346–394). A rank that syncs 168 times per step waits on its slowest card, so a card that got busy after the pick would give exactly this; the shared host had another user's job at 99% on one card during the night. Not confirmed per card. The F88 row's 927 ms is a median under that spread, not TP's cost.
 
 **F87 addendum (same night): TP composes with DP on SmolVLM.** Mesh dp=2 × tp=3 on six B200s (`check_vlm_dp_tp.py`) against dp=2 alone. Each replica trains on alternate rows of one batch of 32; 5 Adam steps. The three TP ranks of each replica report identical losses, and they match that replica's dp=2 losses within 1.1e-5. Median step: 383.3 ms against 284.3 ms. With 16 pairs per replica, the 168 TP collectives cost more than the split compute saves (as in F87 at batch 16 on a single replica: 231 against 270 ms is the whole gain).
+
+---
+
+## 2026-09-28 — F90: under DTensor, Megatron's g comes from an operator rule; f and the DP gradient sync come from a contract at the boundary
+
+**Why.** F68 and F85 use DTensor as an oracle for which collectives a region needs. To explain that to others, it helps to know which rule produces each collective. `experiments/dtensor_walk.py` (CPU, fake 2-rank mesh, torch 2.10) walks it op by op.
+
+**Measured.**
+
+| step | placement after it | collective |
+|---|---|---|
+| x | Replicate | — |
+| up: x · W1ᵀ, W1 `Shard(0)` (colwise) | `Shard(1)`, local 4×16 | — |
+| gelu | `Shard(1)` | — |
+| down: · W2ᵀ, W2 `Shard(1)` (rowwise) | `Partial(sum)`, local 4×8 | — |
+| leave the region: `redistribute` to Replicate | Replicate | 1 all-reduce (g) |
+| backward, x a plain DTensor leaf | grad x `Partial(sum)`; grad W1 `Shard(0)`, grad W2 `Shard(1)` | **none** |
+| backward, x declared at a boundary (`from_local(x, [Replicate()])`) | grad of the local x is whole | 1 all-reduce (f) |
+| DP, batch declared whole | grad W Replicate | none |
+| DP, batch declared `Shard(0)` | grad W `Partial(sum)` | none, until declared Replicate: then 1 all-reduce (the DP sync) |
+
+- g follows from matmul's sharding rule: a row-parallel product is a partial sum, and making it whole is P → R.
+- f is not a matmul rule. Left alone, DTensor keeps the input gradient Partial for ever. f appears only because the boundary promised a replicated input, so the gradient must come back replicated (`from_local`'s backward, or `local_map`'s `in_grad_placements`). That promise is exactly the contract a Piper region needs.
+- The DP gradient sync is the same kind of contract: it appears only if the batch is declared split and the weight gradient must be whole. The second half of this is the F68 surprise, where no reduce-scatter appeared until the batch was declared `Shard(0)`.
+- This is why `src/placement.py` declares inputs with `from_local`, and records input- and parameter-gradient placements with hooks before any accumulation turns them whole.
