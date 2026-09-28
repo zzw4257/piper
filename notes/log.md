@@ -4854,3 +4854,48 @@ All within 1%. Piper's own overhead on these steps is below the model's resoluti
 - Inductor has `_micro_pipeline_tp` (async TP, off by default, compile only).
 
 These are per module, as eager hooks or compiler passes. Piper holds the same choices as fields and edges on one DAG across pipeline stages (F39, F69, F89).
+
+---
+
+## 2026-09-28 — F92: for the same sequence-split attention, DTensor lands in three different plans (one of them DeepSpeed-Ulysses), and which one it picks depends on how many GPUs each process can see
+
+**Why.** F70 saw DTensor's CP plan change with size once. This maps it. Setup: attention written with matmuls, q, k and v `Shard(seq)` on 4 ranks, forward and backward.
+- `experiments/dtensor_cp_plans.py` (CPU, fake mesh): bytes per rank computed from every placement change DTensor makes. On fake CPU groups an all-to-all runs as all-gather + chunk, so collective counts would mislead.
+- `experiments/dtensor_cp_gpu.py`: 4 B200s, real NCCL, timed.
+- Reference: the plan Piper writes. Gather K and V once, hold them, reduce-scatter dK and dV.
+
+**Three plans** (CPU sweep; batch 1, 4 heads, head dim d 16–128, tokens per rank 4–256):
+
+| plan | where | forward | backward | bytes vs gather-and-hold |
+|---|---|---|---|---|
+| gather twice | small d; mid lengths | all-gather K, V | all-to-all, all-gather K, V **again**, all-reduce | 1.47× |
+| greedy detour | d ≥ 64, short to mid lengths | all-gather K, **all-to-all the probabilities**, reduce-scatter the output | all-gather ×2, all-reduce, slices | 1.01–2.00× |
+| Ulysses | long: d=64 at 256 tokens/rank, d=128 at ≥128 | all-to-all q, k, v from sequence to heads, local attention, all-to-all back | all-to-all ×4 | **0.47×** |
+
+- **Gather twice.** A redistribution *inside* an operator is not saved for the backward: autograd keeps the operator's pre-redistribution input. So the backward gathers K and V again, which is ZeRO-3's regather by accident rather than by choice. dK and dV then go through the `Redistribute` backward rule (Partial to Replicate): an all-reduce of the whole tensor followed by a slice, where a reduce-scatter moves half the bytes.
+- **Greedy detour.** At the second matmul, moving the probabilities looks cheaper than gathering V, but it leaves the output Partial and forces a reduce-scatter. The forward alone is already costlier (240 vs 192 KiB at d=64, 32 tokens). Each operator chooses without looking ahead.
+- **Ulysses.** With enough tokens and heads divisible by 4, the matmul rule prefers splitting the batch×head dimension. DTensor rediscovers DeepSpeed-Ulysses, with half the bytes of gathering K and V.
+- The bytes ratio is not monotonic in length: at d=64 it runs 1.47, 1.21, 1.47, 2.00, 1.47, 1.47, 0.47 as tokens per rank go 4 → 256.
+
+**The plan depends on visible GPUs** (`_collective_utils.py:236`, `MeshTopoInfo`). Devices per host come from `device_count()` of the mesh's device type.
+- A process that sees 1 GPU (Ray actors, per-rank SLURM binding, or any CPU fake mesh) treats a 4-rank mesh as inter-host: bandwidth ×0.22 (19.3 against 87.7 GB/s), latency 2.7 against 0.6 µs.
+- An all-to-all is costed as an all-gather plus a penalty of 1.0 ("haven't implemented it yet").
+- On 4 B200s (batch 4, 8 heads), the same program with 4 visible GPUs per rank and with 1 picks different plans:
+
+| d, tokens/rank | 4 visible: plan, time | 1 visible: plan, time | gather-and-hold |
+|---|---|---|---|
+| 64, 16 | detour (AG×4, A2A, RS, AR), 3.34 ms | detour, 3.21 ms | 2.80 / 2.63 ms |
+| 64, 32 | detour, 3.33 ms | **Ulysses (A2A×8)**, 2.91 ms | 2.79 / 2.60 |
+| 64, 64 | gather twice (AG×4, AR), 2.96 ms | **Ulysses**, 2.90 ms | 2.78 / 2.61 |
+| 64, 128 | Ulysses, 3.08 ms | Ulysses, 2.92 ms | 2.79 / 2.59 |
+| 128, 16 | detour, 3.31 ms | **another mix (A2A×3, AG×3, RS, AR)**, 3.15 ms | 2.81 / 2.59 |
+| 128, 32 | detour, 3.31 ms | **Ulysses**, 2.90 ms | 2.78 / 2.55 |
+| 128, 64 | Ulysses, 3.04 ms | Ulysses, 2.86 ms | 2.75 / 2.57 |
+
+- At these sizes every DTensor plan is 7–22% slower than gather-and-hold: 7–8 collectives against 4, and latency dominates.
+- At large sizes (4 visible, batch 4, 8 heads) Ulysses wins: 4096 tokens/rank at d=64 is 53.0 vs 63.9 ms (0.83×), at d=128 119.4 vs 142.2 ms (0.84×); 2048 at d=128 ties (21.6 vs 21.5).
+
+**Meaning.**
+- A per-operator planner with a fixed cost table gives plans that change with sizes, with the launcher's GPU visibility, and with the backward left out of each choice.
+- Piper's side of the design keeps the plan a written, per-region choice (`decompose`, `lifetime`).
+- The Ulysses result says the candidate set should include head-parallel attention: a third `decompose` option worth adding, and the only one here that beat gather-and-hold.
