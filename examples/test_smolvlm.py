@@ -22,7 +22,7 @@ from src.compile import piper_setup
 from src.piper import piper_exec_dag, piper_flush_losses
 from src.state import piper_metadata
 
-from models.smolvlm import SmolVLM, lm_loss
+from models.smolvlm import SmolVLM, lm_loss, shard_weights
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +33,22 @@ def main(args, pg):
     b = args.batch_size
     pixel_values = (data["images"][:b].permute(0, 3, 1, 2).float() / 255.0 - 0.5) / 0.5
     input_ids, labels = data["input_ids"][:b], data["labels"][:b]
+    from src.schedule import derive_schedule_info, load_schedule_directives, mesh_coords
+    sched = derive_schedule_info(load_schedule_directives(args.schedule_directives_file),
+                                 args.schedule_directives_file)
+    place = int(os.environ.get("PIPER_DP_RANK", 0))
+    coords = mesh_coords(sched, place)
+    if args.tp > 1:
+        # every rank of the group is a TP rank, or its tp coordinate on a mesh (log F82)
+        weights = shard_weights(weights, coords.get("tp", place), args.tp)
+    if args.dp_split > 1:
+        # replica d trains on rows d, d+n, ...: its dp coordinate, or its place without a mesh
+        d = coords.get("dp", place)
+        pixel_values, input_ids, labels = (t[d::args.dp_split].contiguous() for t in (pixel_values, input_ids, labels))
 
     piper_setup(
         SmolVLM,
-        model_args=(data["image_offset"], args.dec_stages, args.vis_stages, None, args.vis_chunks),
+        model_args=(data["image_offset"], args.dec_stages, args.vis_stages, {"tp": args.tp}, args.vis_chunks),
         optim_fn=functools.partial(torch.optim.Adam, lr=args.lr),
         example_inputs=[pixel_values, input_ids],
         example_outputs=labels,
@@ -84,6 +96,8 @@ def parse_args(argv=None):
     ap.add_argument("--dec-stages", type=int, default=1)
     ap.add_argument("--vis-stages", type=int, default=1)
     ap.add_argument("--vis-chunks", type=int, default=1)
+    ap.add_argument("--tp", type=int, default=1)
+    ap.add_argument("--dp-split", type=int, default=1)
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--warmup", type=int, default=0)
     ap.add_argument("--iters", type=int, default=5)

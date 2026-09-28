@@ -1037,6 +1037,18 @@ def _boundary_info_for_edge(
         if sources is not None:
             want = ("seg", producer.node_meta.get("segment_id"), binfo["tensor_idx"])
             slots = [j for j, src in enumerate(sources) if tuple(src) == want]
+            if not slots and kind == "TP_COMM":
+                # The producer scores one output as its boundary tensor, but a transformer's
+                # pre-TP segment emits the residual and the normed value and the TP region
+                # reads only the latter. The region's gradient is partial for what it reads
+                # and needs a gradient for: that slot (log F87).
+                m = consumer.node_meta
+                slots = [j for j, src in enumerate(sources)
+                         if tuple(src[:2]) == want[:2]
+                         and getattr(m["graphargs"][m["input_idxs"][j]], "requires_grad", False)]
+                if not slots:
+                    # only values that carry no gradient (rotary tables): nothing to reduce
+                    return {**binfo, "tensor_idx": None}
             if len(slots) != 1:
                 raise ValueError(
                     f"{kind}: consumer {consumer.uid} reads output {binfo['tensor_idx']} of "
@@ -1350,6 +1362,20 @@ def _insert_tp_all_reduce_comm_nodes(
                 f"leaves it alone."
             )
 
+    # The backward half reduces one input gradient per region. Under consumer routing a
+    # region's inputs are exactly what it reads, so two that need a gradient would leave
+    # one partial sum unreduced (log F87).
+    for uid in sorted(matched):
+        m = dag.nodes[uid].node_meta
+        if dag.nodes[uid].compute_subkind != "FWD" or m.get("input_sources") is None:
+            continue
+        grads = [j for j, i in enumerate(m["input_idxs"]) if getattr(m["graphargs"][i], "requires_grad", False)]
+        if len(grads) > 1:
+            raise ValueError(
+                f"shard_tensor matched node {uid}, which reads {len(grads)} inputs that need a "
+                f"gradient (slots {grads}); one backward all-reduce per region covers one. "
+                f"Split the region so it reads one replicated activation.")
+
     def _is_boundary_activation_edge(e: TrainingDAGEdge, node: TrainingDAGNode) -> bool:
         if e.dep_kind != "data" or e.src_uid != node.uid or e.dst_uid in matched:
             return False
@@ -1402,6 +1428,8 @@ def _insert_tp_all_reduce_comm_nodes(
         for e in outgoing:
             dst_node = dag.nodes[e.dst_uid]
             binfo = _boundary_info_for_edge(dag, node, dst_node, "TP_COMM")
+            if binfo["tensor_idx"] is None:
+                continue
             comm_uid = f"tp_all_reduce.{tp_idx}"
             tp_idx += 1
             dag.add_node(

@@ -4712,3 +4712,34 @@ All within 1%. Piper's own overhead on these steps is below the model's resoluti
 - So in Piper the ring keeps its "1/n of K/V resident" property only transiently. Ring-attention libraries get the memory saving by rotating K/V again during the backward instead of saving them. That is a lifetime decision, not a decomposition decision: it belongs to the lifetime directive (design step 4), with the same re-materialize-or-keep trade as ZeRO-3's regather (F69).
 
 **Meaning.** Layer 1 derives what is gathered. Layer 2 chooses how (`decompose`) and when (`hoist`, `distance`), and the result stays exact under every choice. On this hardware the choice does not matter, and choosing well needs a cost model with lifetime in it.
+
+---
+
+## 2026-09-28 — F87: Megatron TP on every layer of the real SmolVLM. TP=3 equals one GPU within 2.7e-6; the backward all-reduce had been aimed at the residual
+
+**Why.** TP so far ran on MLP blocks and branch models (F1–F33, F76). Issue #15 is TP on real models: attention with heads, GQA, rotary tables, biases, residuals and norms between the TP regions.
+
+**Changed (model).** `SmolVLM(config={"tp": n})`:
+- Every vision and decoder attention and MLP is an annotated TP region inside its PP region.
+- Weights are in TP-local shapes. `shard_weights` slices the released weights by name: q/k/v, fc1, gate, up column-wise; out/o, fc2, down row-wise.
+- Row-parallel biases (vision `out_proj`, `fc2`) are added after the all-reduce, outside the region, so they are added once.
+- TP=3, because the heads divide by three: 12 vision, 9 query / 3 key-value in the decoder (one KV head per rank).
+- `test_smolvlm.py --tp n` slices by the rank's tp coordinate (the mesh, F82) or its place in the group. `--dp-split n` gives replica d rows d, d+n, ….
+
+**Changed (Piper).** Before this, the backward all-reduce (Megatron's f) went to the input slot matching the producer's single highest-scoring output. For a transformer's pre-TP segment that output is the residual, while the TP region reads the normed value. Under routing, F76's slot check caught it as an error. Under threading, the region's multi-output check refused it.
+- Now, when the region does not read the scored output, the slot is the input it reads from that producer and needs a gradient for (`_boundary_info_for_edge`).
+- An edge carrying only gradient-free values (the rotary cos/sin, computed once in the first decoder segment) gets no collective.
+- A TP region that reads two inputs needing a gradient is refused: one backward all-reduce covers one input.
+- `test/test_tp_transformer.py`: 8 TP regions in a 2+2-layer SmolVLM, 8 forward and 8 backward all-reduces, and each backward one on a slot that requires a gradient. Without the fix, lowering fails. Suite 122 passed.
+
+**Tested** (`experiments/check_vlm_tp.py`; three B200s, registered; batch 16, 5 Adam steps from the released weights):
+
+| run | losses | vs one GPU | median step | peak (rank 0) |
+|---|---|---|---|---|
+| one GPU | 3.83345 … 0.671414 | — | 269.5 ms | 16.8 GB |
+| TP=3, 84 regions | same | 2.7e-6 | 231.2 ms | 12.0 GB |
+| TP=3 without `shard_tensor` | diverges | 11 | 195.5 ms | 10.6 GB |
+
+- Only 1.17x on three GPUs: 168 small all-reduces per step, since every region is a boundary (F33's per-collective cost). Fusing adjacent collectives, or TP on the decoder alone, are the levers; neither is tried here.
+
+**Pending.** Mesh dp=2 × tp=3 against dp=2 alone (`experiments/check_vlm_dp_tp.py`, schedules `vlm_dp2`, `vlm_dp2_tp3`) needs six idle cards; queued.

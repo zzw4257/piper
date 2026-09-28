@@ -14,6 +14,9 @@ Simplifications that keep the math identical for the inputs used here: one
 position ids are 0..1023; the prompt template is fixed, so the 64 image tokens sit
 at one known offset and the merge is a concatenation.
 """
+import contextlib
+import re
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,41 +25,75 @@ from src.piper import annotate
 
 CFG = dict(v_width=768, v_layers=12, v_heads=12, v_mlp=3072, patch=16, image=512, scale=4,
            t_width=576, t_layers=30, t_heads=9, t_kv_heads=3, t_mlp=1536, vocab=49280,
-           rope_theta=100000.0, rms_eps=1e-5, ln_eps=1e-6)
+           rope_theta=100000.0, rms_eps=1e-5, ln_eps=1e-6, tp=1)
+
+# Megatron TP (log F87), weights in TP-local shapes as in tp_mlp.py: column-parallel
+# projections keep 1/tp of their output features (whole heads), row-parallel ones 1/tp
+# of their inputs. A row-parallel bias is added after the all-reduce, outside the region.
+_COLWISE = re.compile(r"(self_attn\.[qkv]_proj|mlp\.(fc1|gate_proj|up_proj))\.(weight|bias)$")
+_ROWWISE = re.compile(r"(self_attn\.(out_proj|o_proj)|mlp\.(fc2|down_proj))\.weight$")
+
+
+def shard_weights(weights: dict, tp_rank: int, tp: int) -> dict:
+    """Slice the released weights for one TP rank; everything else stays whole."""
+    out = dict(weights)
+    for k, w in weights.items():
+        if _COLWISE.search(k):
+            n = w.shape[0] // tp
+            out[k] = w[tp_rank * n:(tp_rank + 1) * n].contiguous()
+        elif _ROWWISE.search(k):
+            n = w.shape[1] // tp
+            out[k] = w[:, tp_rank * n:(tp_rank + 1) * n].contiguous()
+    return out
+
+
+def _tp_region(tp):
+    return annotate("TP") if tp > 1 else contextlib.nullcontext()
 
 
 class VisionAttention(nn.Module):
-    def __init__(self, width, heads):
+    def __init__(self, width, heads, tp=1):
         super().__init__()
-        self.heads = heads
-        self.q_proj = nn.Linear(width, width)
-        self.k_proj = nn.Linear(width, width)
-        self.v_proj = nn.Linear(width, width)
-        self.out_proj = nn.Linear(width, width)
+        self.heads, self.tp = heads // tp, tp
+        self.q_proj = nn.Linear(width, width // tp)
+        self.k_proj = nn.Linear(width, width // tp)
+        self.v_proj = nn.Linear(width, width // tp)
+        self.out_proj = nn.Linear(width // tp, width)
 
     def forward(self, x):
-        b, n, w = x.shape
-        split = lambda t: t.view(b, n, self.heads, w // self.heads).transpose(1, 2)  # noqa: E731
-        o = F.scaled_dot_product_attention(split(self.q_proj(x)), split(self.k_proj(x)), split(self.v_proj(x)))
-        return self.out_proj(o.transpose(1, 2).reshape(b, n, w))
+        b, n, _ = x.shape
+        split = lambda t: t.view(b, n, self.heads, -1).transpose(1, 2)  # noqa: E731
+        with _tp_region(self.tp):
+            o = F.scaled_dot_product_attention(split(self.q_proj(x)), split(self.k_proj(x)), split(self.v_proj(x)))
+            o = o.transpose(1, 2).reshape(b, n, -1)
+            if self.tp == 1:
+                return self.out_proj(o)
+            o = F.linear(o, self.out_proj.weight)
+        return o + self.out_proj.bias
 
 
 class VisionMLP(nn.Module):
-    def __init__(self, width, hidden):
+    def __init__(self, width, hidden, tp=1):
         super().__init__()
-        self.fc1 = nn.Linear(width, hidden)
-        self.fc2 = nn.Linear(hidden, width)
+        self.tp = tp
+        self.fc1 = nn.Linear(width, hidden // tp)
+        self.fc2 = nn.Linear(hidden // tp, width)
 
     def forward(self, x):
-        return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
+        with _tp_region(self.tp):
+            h = F.gelu(self.fc1(x), approximate="tanh")
+            if self.tp == 1:
+                return self.fc2(h)
+            h = F.linear(h, self.fc2.weight)
+        return h + self.fc2.bias
 
 
 class VisionLayer(nn.Module):
     def __init__(self, c):
         super().__init__()
-        self.self_attn = VisionAttention(c["v_width"], c["v_heads"])
+        self.self_attn = VisionAttention(c["v_width"], c["v_heads"], c["tp"])
         self.layer_norm1 = nn.LayerNorm(c["v_width"], eps=c["ln_eps"])
-        self.mlp = VisionMLP(c["v_width"], c["v_mlp"])
+        self.mlp = VisionMLP(c["v_width"], c["v_mlp"], c["tp"])
         self.layer_norm2 = nn.LayerNorm(c["v_width"], eps=c["ln_eps"])
 
     def forward(self, x):
@@ -138,7 +175,8 @@ def rotate_half(x):
 class TextAttention(nn.Module):
     def __init__(self, c):
         super().__init__()
-        self.heads, self.kv_heads = c["t_heads"], c["t_kv_heads"]
+        self.tp = tp = c["tp"]
+        self.heads, self.kv_heads = c["t_heads"] // tp, c["t_kv_heads"] // tp
         self.head_dim = c["t_width"] // c["t_heads"]
         self.q_proj = nn.Linear(c["t_width"], self.heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(c["t_width"], self.kv_heads * self.head_dim, bias=False)
@@ -147,25 +185,28 @@ class TextAttention(nn.Module):
 
     def forward(self, x, cos, sin):
         b, n, _ = x.shape
-        q = self.q_proj(x).view(b, n, self.heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(b, n, self.kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(b, n, self.kv_heads, self.head_dim).transpose(1, 2)
-        q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
-        rep = self.heads // self.kv_heads
-        k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
-        o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        return self.o_proj(o.transpose(1, 2).reshape(b, n, -1))
+        with _tp_region(self.tp):
+            q = self.q_proj(x).view(b, n, self.heads, self.head_dim).transpose(1, 2)
+            k = self.k_proj(x).view(b, n, self.kv_heads, self.head_dim).transpose(1, 2)
+            v = self.v_proj(x).view(b, n, self.kv_heads, self.head_dim).transpose(1, 2)
+            q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
+            rep = self.heads // self.kv_heads
+            k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
+            o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            return self.o_proj(o.transpose(1, 2).reshape(b, n, -1))
 
 
 class TextMLP(nn.Module):
     def __init__(self, c):
         super().__init__()
-        self.gate_proj = nn.Linear(c["t_width"], c["t_mlp"], bias=False)
-        self.up_proj = nn.Linear(c["t_width"], c["t_mlp"], bias=False)
-        self.down_proj = nn.Linear(c["t_mlp"], c["t_width"], bias=False)
+        self.tp = tp = c["tp"]
+        self.gate_proj = nn.Linear(c["t_width"], c["t_mlp"] // tp, bias=False)
+        self.up_proj = nn.Linear(c["t_width"], c["t_mlp"] // tp, bias=False)
+        self.down_proj = nn.Linear(c["t_mlp"] // tp, c["t_width"], bias=False)
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        with _tp_region(self.tp):
+            return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class TextLayer(nn.Module):
