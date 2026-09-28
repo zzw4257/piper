@@ -4815,3 +4815,42 @@ All within 1%. Piper's own overhead on these steps is below the model's resoluti
 - f is not a matmul rule. Left alone, DTensor keeps the input gradient Partial for ever. f appears only because the boundary promised a replicated input, so the gradient must come back replicated (`from_local`'s backward, or `local_map`'s `in_grad_placements`). That promise is exactly the contract a Piper region needs.
 - The DP gradient sync is the same kind of contract: it appears only if the batch is declared split and the weight gradient must be whole. The second half of this is the F68 surprise, where no reduce-scatter appeared until the batch was declared `Shard(0)`.
 - This is why `src/placement.py` declares inputs with `from_local`, and records input- and parameter-gradient placements with hooks before any accumulation turns them whole.
+
+---
+
+## 2026-09-28 — F91: DTensor's public APIs, measured one by one. Declarations are trusted, `redistribute` is the only mechanism, and timing and lifetime live one layer up (FSDP2, Inductor)
+
+**Why.** F68–F90 used DTensor as an oracle. The handbook described it only conceptually. These probes go through every public API against torch 2.10.0's source and docs, and count what each API issues. All run on CPU with `CommDebugMode` on a fake process group: `experiments/dtensor_api_core.py`, `dtensor_api_styles.py`, `dtensor_api_fsdp.py`.
+
+**Measured.**
+- **Constructors.**
+  - `distribute_tensor(Shard(0))`: 1 scatter (from `src_data_rank=0`).
+  - `from_local(run_check=True)`: 2 all-gathers + 1 broadcast; `run_check=False` (the default): none.
+  - `full_tensor()` of S(0): 1 all-gather.
+  - `to_local(grad_placements=...)` and `local_map(in_grad_placements=...)`: no collective, only a label. Declaring a partial gradient R gives a gradient labelled R, with no error.
+- **Placements.**
+  - `Partial(sum|avg|max|min)` → R: 1 all-reduce each; P → S(0): 1 reduce-scatter.
+  - Uneven Shard(0) of 5 rows on 2 ranks: 3 and 2 rows (`torch.chunk`; the docs call uneven sharding experimental).
+  - `MaskPartial` (public in 2.10, `placement_types.py:972`) is the vocab-parallel embedding's placement. `_StridedShard` serves FSDP2 + TP on one dimension.
+- **One operator.** `aten.mm` on a 1-D mesh offers 4 candidates: R,R→R; S(1),S(0)→P; S(0),R→S(0); R,S(1)→S(1). For inputs (R, S(1)) the zero-cost, no-redistribution one is taken.
+- **Styles** (defaults read from `parallel/style.py`: Colwise in R / out S(-1) / `use_local_output=True`; Rowwise in S(-1) / out R / True; SequenceParallel `sequence_dim=1` / False).
+  - Colwise + Rowwise on a block: forward 1 all-reduce, backward 1 all-reduce.
+  - Plus SequenceParallel on the norm, Colwise(input S(1)), Rowwise(output S(1)): forward and backward each 1 all-gather + 1 reduce-scatter.
+  - `use_local_output=False` into a residual add: `RuntimeError`, mixed Tensor and DTensor.
+  - RowwiseParallel on `nn.Embedding(100, 16)`: weight S(0) local 50×16, forward 1 all-reduce.
+  - `loss_parallel` on S(2) logits: forward 3 all-reduces, backward 1. Without it, gathering the logits is 1 all-gather of B·S·V.
+- **2-D mesh** dp=2 × tp=2, planned one axis at a time:
+  - (S0,S1) → (R,R): 2 all-gathers.
+  - (P,S1) → (R,R): 1 all-gather + 1 all-reduce.
+  - (R,S0) → (S0,R): 1 all-gather + a local slice.
+  - `mesh['tp']` of rank 0 is ranks [0,1]; `mesh['dp']` is [0,2].
+- **FSDP2** `fully_shard` (3 linear layers): parameters become DTensor S(0).
+  - `reshard_after_forward=True`: forward 3 all-gathers, backward 3 all-gathers + 3 reduce-scatters.
+  - `False`: backward 3 reduce-scatters only.
+  - The docs: `None` means True for non-root and False for root. An `int` reshards to a smaller world size, so the backward gather runs within e.g. a node.
+
+**Corrects** F89's "no DTensor counterpart" for timing and lifetime. DTensor itself has none, but the stack above it does:
+- FSDP2 has `reshard_after_forward`, `unshard` / `reshard`, and `set_modules_to_forward_prefetch` / `set_modules_to_backward_prefetch`.
+- Inductor has `_micro_pipeline_tp` (async TP, off by default, compile only).
+
+These are per module, as eager hooks or compiler passes. Piper holds the same choices as fields and edges on one DAG across pipeline stages (F39, F69, F89).
