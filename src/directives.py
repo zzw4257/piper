@@ -2268,14 +2268,16 @@ def _reject_overlapping_boundary_comm_directives(
 
 
 def _check_shared_parameters(dag: TrainingDAG) -> None:
-    """A trainable parameter read by several regions is one tensor per actor (log F80).
+    """A trainable parameter read by several regions (log F80, F83).
 
-    That holds only when every region reading it runs on the same device group and no
-    DP/ZeRO collective touches those regions; otherwise each group, or each gradient
-    reduction, would see a separate copy. Refuse those cases."""
-    users: dict[str, set[tuple]] = {}
-    synced: set[str] = set()
-    sync_kinds = {"REDUCE_COMM", "ALL_GATHER_COMM", "REDUCE_SCATTER_COMM"}
+    On one device group it is one tensor per actor. Across groups each group holds a
+    copy; the runtime all-reduces the copies' gradients before the update, the
+    cross-group sum placement would derive for a parameter replicated on two stages.
+    ZeRO keeps flat sharded buffers that neither path can alias, so it is refused.
+    """
+    users: dict[str, set[str]] = {}
+    zero: set[str] = set()
+    zero_kinds = {"ALL_GATHER_COMM", "REDUCE_SCATTER_COMM"}
     for uid, n in dag.nodes.items():
         m = n.node_meta
         if n.compute_subkind != "FWD" or "gm" not in m:
@@ -2283,22 +2285,17 @@ def _check_shared_parameters(dag: TrainingDAG) -> None:
         names = [x.name for x in m["gm"].graph.nodes if x.op == "placeholder"]
         trainable = [names[i] for i in m.get("param_idxs", [])
                      if i < len(names) and getattr(m["graphargs"][i], "requires_grad", False)]
-        near_sync = any(dag.nodes[v].node_kind in sync_kinds
+        near_zero = any(dag.nodes[v].node_kind in zero_kinds
                         for v in list(dag.succs.get(uid, ())) + list(dag.preds.get(uid, ())))
         for name in trainable:
-            users.setdefault(name, set()).add((uid, tuple(sorted(n.device or ()))))
-            if near_sync:
-                synced.add(name)
-    for name, us in users.items():
-        segs = {u.split(".split")[0] for u, _ in us}
-        if len(segs) < 2:
-            continue
-        devs = {d for _, d in us}
-        if len(devs) > 1 or name in synced:
+            users.setdefault(name, set()).add(uid.split(".split")[0])
+            if near_zero:
+                zero.add(name)
+    for name, segs in users.items():
+        if len(segs) > 1 and name in zero:
             raise ValueError(
-                f"parameter {name} is read by regions {sorted(segs)[:4]} on device groups {sorted(devs)}"
-                f"{' with a DP/ZeRO collective' if name in synced else ''}: each would train its own copy. "
-                "Keep regions that share a parameter on one device group without replicate/shard, or untie it.")
+                f"parameter {name} is read by regions {sorted(segs)[:4]} under ZeRO: its flat sharded "
+                "buffers cannot be shared. Drop ZeRO on those regions, or untie the parameter.")
 
 
 def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] | None) -> None:

@@ -154,6 +154,7 @@ class StageStore:
         self.buckets.clear()
 
     shared_params: bool = False  # some bucket borrows a parameter another bucket owns (log F80)
+    cross_rank_shared: dict = field(default_factory=dict)  # name -> (group, tensor), parameters read on several ranks (F83)
 
     def ensure_bucket(self, ubid: Any) -> BucketState:
         return self.buckets.setdefault(ubid, BucketState())

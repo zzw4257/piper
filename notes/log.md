@@ -4594,3 +4594,30 @@ All within 1%. Piper's own overhead on these steps is below the model's resoluti
 | PR #24 sync, TP × DP on the mesh | 4 | identical to unsynced |
 
 **Meaning.** The runtime change the design called riskiest is in, and backward compatible. It fixes the two concrete problems raised on #15: TP borrowing `ep_group`, and PR #24 overwriting TP shards. Heterogeneous parallelism for multimodal models (different group sizes per stage) is the next runtime step; this one keeps one group size per stage.
+
+---
+
+## 2026-09-28 — F83: a parameter read on several pipeline ranks (design step A4). Tied embeddings across stages train bit-identically to one GPU
+
+**Why.** F79/F80 refused a parameter shared across device groups: each group would train its own copy. That is issue #13 and PR #25 (tied embeddings across stages), and it is what heterogeneous data parallelism for a vision tower needs. The design says layer 1 derives a cross-group gradient sum; this builds it.
+
+**Changed.**
+- Lowering allows sharing across device groups; only ZeRO is refused (its flat sharded buffers cannot alias).
+- The backend tags every forward node with `{parameter: [pp ranks that read it]}` (`_record_cross_rank_shared_params`).
+- Actors join one group per shared parameter and per place in the stage groups at their first step. DAG loading is staggered across dp processes, so creating groups at load would deadlock.
+- Copies start from the lowest rank's values (broadcast).
+- Each update first waits for every backward, then sums each shared parameter's gradient across its readers; every copy then takes the same step.
+- `PIPER_NO_CROSS_RANK_SYNC=1` skips the sum: a negative control.
+
+**Tested.**
+- CPU: sharing across groups lowers and every forward node carries the same spec; under ZeRO it is refused. Suite 113 passed.
+- GPU (`examples/test_tied.py`, `examples/models/tied_lm.py`: vocab 4096, dim 512, 4 blocks, `logits = norm(h) @ W.T` with `W` the embedding; 3 B200, registered, released after; Adam lr 1e-3, 5 steps).
+
+| placement | losses |
+|---|---|
+| one GPU | 8.58114, 7.126997, 5.96458, 5.080126, 4.378648 |
+| embedding + blocks on GPU 0, head on GPU 1 | identical |
+| embedding, blocks, head on three GPUs | identical |
+| three GPUs, sum skipped (control) | 8.58114, 6.935624, 5.632681, 4.639113, 3.844702 |
+
+**Meaning.** Tied weights across stages (#13, #25) now work without writing the synchronization by hand. Per-region chunking (F80) plus this gives a vision tower data parallelism on its own GPUs while the decoder runs elsewhere: heterogeneous parallelism with no change to the pp × dp grid and one trace.

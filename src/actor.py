@@ -726,6 +726,10 @@ class PiperActor:
 
         self._derive_dag_bucket_modes(training_dag)
         self.runtime.initialize_streams_for_training_dag(training_dag)
+        self._cross_rank_spec = next(
+            (n.node_meta["cross_rank_shared"] for n in training_dag.nodes.values()
+             if "cross_rank_shared" in (getattr(n, "node_meta", None) or {})), {})
+        self._cross_rank_joined = False
 
         # Clear any prior module state before loading a new training DAG.
         self.stages.clear_loaded_modules()
@@ -927,7 +931,36 @@ class PiperActor:
         ex = getattr(self, "dag_executor", None) or getattr(self, "executor", None)
         return flush_pending_losses(ex) if ex is not None else []
 
+    def _join_cross_rank_shared(self) -> None:
+        """Communicators for parameters read on several pipeline ranks (log F83).
+
+        For each such parameter and each place in the stage groups, one group of the
+        ranks at that place on the reading stages. Every actor creates every group in the
+        same order, so this runs at the first step, when all actors of all dp processes
+        are live (DAG loading is staggered across dp processes). The copies start from
+        the lowest rank's values; each step their gradients are summed before the update.
+        """
+        self._cross_rank_joined = True
+        spec = getattr(self, "_cross_rank_spec", None) or {}
+        if not spec:
+            return
+        owned = self.__dict__.get("_realized_params_by_name", {})
+        shared = {}
+        for name in sorted(spec):
+            for i in range(self.runtime.dp_degree):
+                ranks = [pr + i * self.runtime.pp_degree for pr in spec[name]]
+                pg = dist.new_group(ranks=ranks, backend="nccl")
+                if self.runtime.global_rank in ranks and name in owned:
+                    t = owned[name]
+                    dist.broadcast(t.data, src=ranks[0], group=pg)
+                    shared[name] = (pg, t)
+        torch.cuda.synchronize()
+        self.stages.cross_rank_shared = shared
+        self.stages.shared_params = self.stages.shared_params or bool(shared)
+
     def run_dag(self, loss_fn=None):
+        if not getattr(self, "_cross_rank_joined", True):
+            self._join_cross_rank_shared()
         # Mark the entire iteration boundary for the NVTX timeline.
         iter_idx = getattr(self, "_iter_counter", 0)
         self._iter_counter = iter_idx + 1

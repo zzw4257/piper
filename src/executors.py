@@ -1581,6 +1581,17 @@ class DagExecutor:
         if _parts is not None:
             _parts["drain_frees"] = (time.perf_counter() - _t) * 1e6
             _parts["_t"] = time.perf_counter()
+        shared = getattr(self.stages, "cross_rank_shared", None)
+        if shared and not os.environ.get("PIPER_NO_CROSS_RANK_SYNC"):   # negative control
+            # A parameter read on several pipeline ranks: each rank holds a copy with its
+            # own readers' gradient; sum them so every copy takes the same step (log F83).
+            for evt in self.events.backward.values():
+                stream.wait_event(evt)
+            with torch.cuda.stream(stream):
+                for name in sorted(shared):
+                    pg, t = shared[name]
+                    if t.grad is not None:
+                        dist.all_reduce(t.grad, group=pg)
         if self.params.has_zero_shard_optimizers():
             self.params.step_zero_shard_optimizers(stream, self.events.reduce_scatter)
             # This path returned before the sync-mode branch below, so ZeRO-3

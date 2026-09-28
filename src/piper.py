@@ -83,6 +83,29 @@ def annotate(name: str) -> Iterator[dict[str, int]]:
 
 
 
+def _record_cross_rank_shared_params(dags: list[TrainingDAG]) -> None:
+    """Tag every forward node with {parameter: [pp ranks that read it]} for parameters read
+    on more than one rank (log F83). The runtime all-reduces their gradients across those
+    ranks; tied embeddings (issue #13) are the usual case."""
+    readers: dict[str, set[int]] = {}
+    for r, d in enumerate(dags):
+        for n in d.nodes.values():
+            m = n.node_meta
+            if n.compute_subkind != "FWD" or "gm" not in m:
+                continue
+            names = [x.name for x in m["gm"].graph.nodes if x.op == "placeholder"]
+            for i in m.get("param_idxs", []):
+                if i < len(names) and getattr(m["graphargs"][i], "requires_grad", False):
+                    readers.setdefault(names[i], set()).add(r)
+    spec = {name: sorted(rs) for name, rs in sorted(readers.items()) if len(rs) > 1}
+    if not spec:
+        return
+    for d in dags:
+        for n in d.nodes.values():
+            if n.compute_subkind == "FWD":
+                n.node_meta["cross_rank_shared"] = spec
+
+
 def _split_global_training_dag_by_pp_rank(training_dag: TrainingDAG) -> list[TrainingDAG]:
     """Split the global DAG into per-device-set disconnected DAGs."""
     # SEND/RECV pairs intentionally have no edge between them, so cross-rank
@@ -220,6 +243,7 @@ def piper(gm, example_inputs, **kwargs):
     piper_metadata.training_dag = training_dag
     per_pp_training_dags = _split_global_training_dag_by_pp_rank(training_dag)
     align_p2p_order(per_pp_training_dags)  # before any stream is serialized (log F81)
+    _record_cross_rank_shared_params(per_pp_training_dags)
     artifact_dir = getattr(piper_metadata, "artifact_dir", "out")
     for i, subdag in enumerate(per_pp_training_dags):
         zero_chains = _prune_zero_lifetime_metadata(subdag)

@@ -1,4 +1,4 @@
-"""A parameter read by several regions: one tensor on one device group, refused across groups (log F79, F80)."""
+"""A parameter read by several regions: one tensor on one device group, a gradient-summed copy per group across groups, refused under ZeRO (log F79, F80, F83)."""
 import sys
 
 import torch
@@ -38,8 +38,21 @@ def test_parameter_shared_on_one_device_group_lowers() -> None:
     assert note == "", note
 
 
-def test_parameter_shared_across_device_groups_is_refused() -> None:
-    _, _, note = p.lower(THREE_GPUS, MAKE(True))
+def test_parameter_shared_across_device_groups_is_recorded() -> None:
+    # Each group keeps a copy; the runtime sums their gradients (log F83).
+    _, per, note = p.lower(THREE_GPUS, MAKE(True))
+    assert note == "", note
+    specs = [n.node_meta.get("cross_rank_shared") for d in per for n in d.nodes.values() if n.compute_subkind == "FWD"]
+    assert specs and all(sp == specs[0] for sp in specs)
+    assert list(specs[0].values()) == [[0, 2]] and "first" in next(iter(specs[0]))
+
+
+def test_parameter_shared_under_zero_is_refused() -> None:
+    sched = ([{"op": "place", "filter": {"PP": i}, "devices": [0, 1]} for i in range(3)]
+             + [{"op": "replicate", "filter": {"PP": "*"}, "devices": [0, 1], "reduce_stream": "dp_stream",
+                 "shard_grads": True, "shard_params": True}, p.SPLIT]
+             + [{"op": "order", "filters": [[{"PP": i, "PASS": "F"}], [{"PP": i, "PASS": "B"}]]} for i in range(3)])
+    _, _, note = p.lower(sched, MAKE(True))
     assert note.startswith("backend='piper' raised"), note
 
 
