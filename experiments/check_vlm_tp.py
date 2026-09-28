@@ -15,7 +15,7 @@ from check_vlm import TOL, run  # noqa: E402
 
 def main():
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    extra = sys.argv[1:] + ["--batch-size", "16"]
+    extra = sys.argv[1:] + ([] if "--batch-size" in sys.argv else ["--batch-size", "16"])
     ref, err = run("vlm_single", extra, repo)
     if ref is None:
         print(f"vlm_single FAILED\n{err}")
