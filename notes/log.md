@@ -4621,3 +4621,33 @@ All within 1%. Piper's own overhead on these steps is below the model's resoluti
 | three GPUs, sum skipped (control) | 8.58114, 6.935624, 5.632681, 4.639113, 3.844702 |
 
 **Meaning.** Tied weights across stages (#13, #25) now work without writing the synchronization by hand. Per-region chunking (F80) plus this gives a vision tower data parallelism on its own GPUs while the decoder runs elsewhere: heterogeneous parallelism with no change to the pp × dp grid and one trace.
+
+---
+
+## 2026-09-28 — F84: heterogeneous parallelism for SmolVLM. Vision tower data-parallel on three GPUs, decoder on a fourth: 3.56x one GPU, 1.34x over the best pipeline split
+
+**Why.** SmolVLM's vision tower is 3.9x its decoder (F77). F81 balanced it by splitting the tower into three pipeline stages, which pays pipeline fill and drain. Multimodal systems instead give the encoder its own data-parallel group.
+
+**How, with no change to the pp × dp grid.**
+- The vision tower runs as three chunks (F80's `vis_chunks=3`), chunk c on GPU c; embedding and decoder on GPU 3.
+- The chunks read the same vision weights on three pipeline ranks, so F83 keeps one copy per rank and sums their gradients. That is the gradient sync of data parallelism, derived from the sharing.
+- `experiments/mk_vlm_het_schedules.py` writes the schedules; `experiments/check_vlm_het.py` runs them.
+
+**Changed on the way.**
+- Consumer routing no longer relays a model input from reader to reader: every rank has the inputs already, and relaying shipped the 48 images between the vision GPUs. Only a ring still relays (`fx.py`, `_ring_region_filters`).
+- Cross-rank sharing groups by the set of reading ranks: one communicator and one bucketed all-reduce per set, not per parameter. 198 vision parameters had made one run take 5 minutes to start.
+
+**Measured** (4 B200, cards registered and released per job; 48 image–caption pairs per step, fixed work over m microbatches; losses equal one GPU within 3.1e-6 everywhere).
+
+| m | one GPU | vision split in 3 pipeline stages | vision DP=3 + decoder | same, 1F1B |
+|---|---|---|---|---|
+| 1 | 936.6 | 742.3 | 346.9 | — |
+| 2 | 970.6 | 454.4 (1F1B) | 300.7 | **262.9** |
+| 4 | 1060.0 | 351.7 (1F1B) | 294.3 | 275.0 |
+
+- Best heterogeneous: 262.9 ms, 3.56x the one-GPU step at m=1 (936.6), and 1.34x the best pipeline split (351.7). Reproduced: 263.3 and 262.9 ms in two runs.
+- Peak memory, heterogeneous m=4 1F1B: 7.1 GB per vision GPU, 6.3 GB on the decoder GPU.
+- A first m=2 pipeline-split time of 681 ms was a shared card (a short job appeared on GPU 1); rerun 454.4.
+- The tied-embedding checks (F83) pass unchanged with the bucketed sum.
+
+**Meaning.** The encoder gets data parallelism and the decoder does not, in one Piper program: per-region chunking (F80) plus cross-rank sharing (F83). That is the heterogeneous-parallelism pattern multimodal training needs (HetPar, arXiv 2605.27678), expressed with Piper's existing regions and directives.

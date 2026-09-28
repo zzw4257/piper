@@ -945,15 +945,22 @@ class PiperActor:
         if not spec:
             return
         owned = self.__dict__.get("_realized_params_by_name", {})
-        shared = {}
+        # One communicator per set of reading ranks, not per parameter: a vision tower
+        # shared by three stages is ~200 parameters but one group (and one bucket).
+        by_ranks: dict[tuple, list[str]] = {}
         for name in sorted(spec):
+            by_ranks.setdefault(tuple(spec[name]), []).append(name)
+        shared = {}
+        for readers in sorted(by_ranks):
             for i in range(self.runtime.dp_degree):
-                ranks = [pr + i * self.runtime.pp_degree for pr in spec[name]]
+                ranks = [pr + i * self.runtime.pp_degree for pr in readers]
                 pg = dist.new_group(ranks=ranks, backend="nccl")
-                if self.runtime.global_rank in ranks and name in owned:
-                    t = owned[name]
-                    dist.broadcast(t.data, src=ranks[0], group=pg)
-                    shared[name] = (pg, t)
+                if self.runtime.global_rank in ranks:
+                    tensors = [owned[n] for n in by_ranks[readers] if n in owned]
+                    for t in tensors:
+                        dist.broadcast(t.data, src=ranks[0], group=pg)
+                    if tensors:
+                        shared[readers] = (pg, tensors)
         torch.cuda.synchronize()
         self.stages.cross_rank_shared = shared
         self.stages.shared_params = self.stages.shared_params or bool(shared)

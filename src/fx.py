@@ -529,6 +529,20 @@ def _routing_mode() -> str:
     return "thread"
 
 
+def _ring_region_filters() -> list[dict]:
+    """Filters of ``ring_exchange`` directives: regions a ring rotates values between."""
+    from .directives import _normalize_filter_spec
+    from .state import piper_metadata
+
+    out = []
+    for d in getattr(piper_metadata, "schedule_directives", None) or []:
+        if isinstance(d, dict) and d.get("op") == "ring_exchange":
+            for f in d.get("filters") or [d.get("filter") or {}]:
+                f = _normalize_filter_spec(f, d)
+                out.append({k: v for k, v in f.items() if k not in ("PASS", "MB")})
+    return out
+
+
 def _collective_region_filters() -> list[dict]:
     """Filters of ``shard_tensor``/``shard`` directives: regions whose boundary carries a collective."""
     from .directives import _normalize_filter_spec
@@ -648,6 +662,13 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
             if any(_match_filter(_tag_from_stack(segment_stacks[s]), f)
                    for f in _collective_region_filters())
         }
+        # A model input is on every rank already (routing loads it everywhere), so each
+        # reader takes it from the model; relaying it would ship it between stages for
+        # nothing. Only a ring rotates a value reader to reader (log F84).
+        ring = {
+            s for s in range(n_segs)
+            if any(_match_filter(_tag_from_stack(segment_stacks[s]), f) for f in _ring_region_filters())
+        }
         for node in nodes:
             if node not in value_seg:
                 continue
@@ -662,7 +683,7 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 supplier[(c, node)] = prev
                 if prev >= 0 and node not in seg_outputs[prev]:
                     seg_outputs[prev].append(node)
-                if c not in no_relay:
+                if c not in no_relay and (producer >= 0 or (c in ring and (prev < 0 or prev in ring))):
                     prev = c
 
     segments: list[AnnotationSegment] = []

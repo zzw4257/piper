@@ -1588,10 +1588,17 @@ class DagExecutor:
             for evt in self.events.backward.values():
                 stream.wait_event(evt)
             with torch.cuda.stream(stream):
-                for name in sorted(shared):
-                    pg, t = shared[name]
-                    if t.grad is not None:
-                        dist.all_reduce(t.grad, group=pg)
+                for key in sorted(shared):
+                    pg, tensors = shared[key]
+                    grads = [t.grad for t in tensors if t.grad is not None]
+                    if not grads:
+                        continue
+                    flat = torch.cat([g.reshape(-1) for g in grads])   # one call per group
+                    dist.all_reduce(flat, group=pg)
+                    offset = 0
+                    for g in grads:
+                        g.copy_(flat[offset:offset + g.numel()].view_as(g))
+                        offset += g.numel()
         if self.params.has_zero_shard_optimizers():
             self.params.step_zero_shard_optimizers(stream, self.events.reduce_scatter)
             # This path returned before the sync-mode branch below, so ZeRO-3
