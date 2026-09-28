@@ -129,7 +129,7 @@ def _normalize_filter_devices_directive(
 ) -> tuple[str, list[dict[str, Any]], list[int], str | None, str | None, str | None, bool, bool, int | None]:
     if isinstance(directive, dict):
         op = directive.get("op")
-        if op not in ("place", "replicate", "shard", "shard_tensor", "ring_exchange"):
+        if op not in ("place", "replicate", "shard", "shard_tensor", "ring_exchange", "layout"):
             raise ValueError(f"Unsupported directive op: {op}")
         if "filter" not in directive:
             raise ValueError(f"{op} directive requires current API field 'filter': {directive}")
@@ -145,6 +145,8 @@ def _normalize_filter_devices_directive(
                 raise ValueError(
                     f"replicate directive does not accept 'stream'; use 'gather_stream' and/or 'reduce_stream': {directive}"
                 )
+        elif op == "layout":
+            pass   # 'stream' for boundary collectives, 'reduce_stream' for gradient sync
         else:
             if gather_stream is not None or reduce_stream is not None:
                 raise ValueError(
@@ -2267,6 +2269,124 @@ def _reject_overlapping_boundary_comm_directives(
             claimed[uid] = (idx, op)
 
 
+
+def _pl_str(pl: Any) -> str:
+    return f"shard({pl.dim})" if pl.is_shard() else ("partial" if pl.is_partial() else "replicate")
+
+
+def _apply_layout(dag: TrainingDAG, filters: list[dict[str, Any]], devices: list[int], raw: dict) -> dict:
+    """Derive every boundary collective on one mesh axis from placements (log F85).
+
+    ``inputs`` places the model's runtime inputs (``"*"`` for all; ``batch`` is shorthand
+    for ``{"*": batch}``), ``params`` places parameters by module name. Placements then
+    propagate region by region, in segment order, each region's outputs becoming its
+    readers' inputs. For each matched region DTensor, on a fake mesh of the axis's size,
+    says what comes out:
+      - an output or input gradient that is a partial sum -> a boundary all-reduce
+        (what ``shard_tensor`` writes);
+      - a parameter gradient that is a partial sum -> a gradient sync (what
+        ``replicate`` writes);
+      - a region DTensor would redistribute inside, because its inputs are split along a
+        dimension it reads whole -> the inputs it gathers, carried out as a ring between
+        consecutive such regions (what ``ring_exchange`` writes).
+    The existing inserters then place the nodes, so a lowering is node for node the one
+    the written directives give. Returns what was derived, per region.
+    """
+    from .placement import derive_boundary_placements, derive_gathered_inputs, derive_split_outputs
+
+    axis = str(raw["axis"])
+    params = dict(raw.get("params") or {})
+    model_in = dict(raw.get("inputs") or {})
+    if raw.get("batch"):
+        model_in.setdefault("*", raw["batch"])
+    size = _axis_size(axis, len(devices))
+
+    fwd = [n for n in dag.nodes.values()
+           if n.node_kind == "COMPUTE" and n.compute_subkind == "FWD" and n.tag.get("MB", 0) == 0
+           and "gm" in n.node_meta]
+    fwd.sort(key=lambda n: n.node_meta.get("segment_id", 0))
+    out_pl: dict[int, list[str]] = {}
+    prev_seg = None
+    report: dict[str, dict] = {}
+    need_tp, need_reduce, ring_regions, ring_dims = False, [], [], set()
+    for n in fwd:
+        m = n.node_meta
+        seg = m.get("segment_id")
+        srcs = m.get("input_sources")
+        in_pl = {}
+        for pos in range(len(m["input_idxs"])):
+            if srcs is not None:
+                kind, s_, k = srcs[pos]
+                pl = (model_in.get(str(s_), model_in.get("*", "replicate")) if kind == "model"
+                      else (out_pl.get(s_) or [])[k] if k < len(out_pl.get(s_) or []) else "replicate")
+            elif prev_seg is None:
+                pl = model_in.get(str(pos), model_in.get("*", "replicate"))
+            else:
+                prev = out_pl.get(prev_seg) or []
+                pl = prev[pos] if pos < len(prev) else "replicate"
+            in_pl[str(pos)] = "replicate" if pl == "partial" else pl
+        prev_seg = seg
+        matched = any(_match_filter(n.tag, flt) for flt in filters)
+        n_out = len(m.get("output_names") or []) or 1
+        if not matched:
+            out_pl[seg] = ["replicate"] * n_out
+            continue
+        try:
+            d = derive_boundary_placements(m["gm"], m["graphargs"], m["input_idxs"], m["param_idxs"],
+                                           params, size, inputs=in_pl)
+        except (ValueError, RuntimeError):   # DTensor would redistribute inside, or cannot propagate
+            # DTensor cannot place this region: its inputs are split along a dimension
+            # it either flattens (a linear on [b, s, d] split by s) or reads whole
+            # (attention). Tell the two apart by where outputs move (log F85).
+            dims = {int(v[6:-1]) for v in in_pl.values() if v.startswith("shard(")}
+            if len(dims) != 1:
+                raise
+            dim = dims.pop()
+            gathered = derive_gathered_inputs(m["gm"], m["graphargs"], m["input_idxs"], dim, size)
+            split_out = derive_split_outputs(m["gm"], m["graphargs"], m["input_idxs"], dim)
+            if gathered:
+                ring_regions.append(n)
+                ring_dims.add(dim)
+                split_out = [o or f"shard({dim})" for o in split_out]
+            elif any(o is None for o in split_out):
+                raise
+            out_pl[seg] = split_out
+            # Split rows through a weight: its gradient is a partial sum across ranks.
+            if _node_has_trainable_params(dag, n):
+                need_reduce.append(n)
+            report[n.uid] = {"inputs": in_pl, "outputs": split_out, "gathers": list(gathered)}
+            continue
+        outs = [_pl_str(p) for p in d["outputs"]]
+        out_pl[seg] = outs
+        partial_io = any(p.is_partial() for p in d["outputs"]) or any(p.is_partial() for p in d["input_grads"].values())
+        partial_w = any(p.is_partial() for p in d["param_grads"].values())
+        need_tp |= partial_io
+        if partial_w:
+            need_reduce.append(n)
+        report[n.uid] = {"inputs": in_pl, "outputs": outs, "boundary_all_reduce": partial_io, "grad_sync": partial_w}
+
+    if need_reduce:
+        with_params = [n for n in fwd if any(_match_filter(n.tag, f) for f in filters) and _node_has_trainable_params(dag, n)]
+        if {n.uid for n in need_reduce} != {n.uid for n in with_params}:
+            raise NotImplementedError(
+                f"layout on axis {axis}: only some regions need a gradient sync ({[n.uid for n in need_reduce]}); "
+                "split the filter so each layout covers regions that agree")
+        _insert_reduce_comm_nodes(dag, filters, devices, comm_stream=raw.get("reduce_stream"))
+    if need_tp:
+        _insert_tp_all_reduce_comm_nodes(dag, filters, devices, comm_stream=raw.get("stream"),
+                                         params=params, axis=axis)
+    if ring_regions:
+        if len(ring_dims) != 1:
+            raise ValueError(f"layout on axis {axis}: ring regions split along several dimensions {ring_dims}")
+        ring_filters = [{k: v for k, v in n.tag.items() if k not in ("PASS", "MB")} for n in ring_regions]
+        _insert_ring_exchange_comm_nodes(
+            dag, ring_filters, devices, tensors=None, comm_stream=raw.get("ring_stream", raw.get("stream")),
+            hoist=bool(raw.get("hoist", False)), distance=int(raw.get("distance", 1)),
+            derive_seq_dim=ring_dims.pop())
+    dag.__dict__.setdefault("layout_report", {})[axis] = report
+    return report
+
+
 def _check_shared_parameters(dag: TrainingDAG) -> None:
     """A trainable parameter read by several regions (log F80, F83).
 
@@ -2386,6 +2506,8 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
                 hoist=bool(raw.get("hoist", False)), distance=int(raw.get("distance", 1)),
                 derive_seq_dim=(raw.get("derive") or {}).get("seq_dim"),
             )
+        elif op == "layout":
+            _apply_layout(training_dag, filters, devices, raw)
         elif op == "shard_tensor":
             _insert_tp_all_reduce_comm_nodes(
                 training_dag, filters, devices, comm_stream=stream, params=raw.get("params"),

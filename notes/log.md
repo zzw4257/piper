@@ -4651,3 +4651,33 @@ All within 1%. Piper's own overhead on these steps is below the model's resoluti
 - The tied-embedding checks (F83) pass unchanged with the bucketed sum.
 
 **Meaning.** The encoder gets data parallelism and the decoder does not, in one Piper program: per-region chunking (F80) plus cross-rank sharing (F83). That is the heterogeneous-parallelism pattern multimodal training needs (HetPar, arXiv 2605.27678), expressed with Piper's existing regions and directives.
+
+---
+
+## 2026-09-28 — F85: one `layout` directive derives every boundary collective from placements (design step 2). TP, DP, TP × DP and CP lower node for node as the written directives do
+
+**Why.** `shard_tensor`, `replicate` and `ring_exchange` each decide by hand where their collectives go. Step 2 of the design derives them from how tensors are split: the GSPMD-style inference Piper's paper leaves to future work (§4.2).
+
+**Changed.**
+- `{"op": "layout", "filter": ..., "devices": ..., "axis": "tp" | "dp" | "cp" | ..., "params": {module: colwise | rowwise | replicate}, "inputs": {pos | "*": "shard(d)" | "replicate"}, "batch": "shard(0)"}`.
+- Placements propagate region by region in segment order (through `input_sources` when routed); each region's outputs become its readers' inputs.
+- Per region, on a fake mesh of the axis's size:
+  - DTensor places it (`derive_boundary_placements`, now also returning parameter-gradient placements). A partial output or input gradient gets a boundary all-reduce; a partial parameter gradient gets a gradient sync.
+  - DTensor cannot place it: a linear flattening `[b, s, d]` split by `s`, or attention reading K/V whole. A perturbation rule (`derive_split_outputs`, as F70's `derive_gathered_inputs`) tells them apart: outputs that move only at the perturbed row are split, and the split can move dimension (a head split takes the sequence from dim 1 to dim 2); outputs that move elsewhere mean the region gathers its inputs, carried out as a ring. Split rows through a weight give a partial gradient, hence a gradient sync.
+- The existing inserters place the nodes, in the order the written directives would.
+- Graphs run for the perturbation on a CPU copy whose baked `device='meta'` literals read `cpu`.
+
+**Tested** (`test/test_layout.py`, CPU): per-rank DAGs compared node for node, with every node's kind, tag, devices and stream and every edge.
+
+| case | written | layout | result |
+|---|---|---|---|
+| TP=2 MLP | `shard_tensor` | `axis: tp, params: {up: colwise, down: rowwise}` | identical |
+| TP=2, derived | `shard_tensor.params` | same layout | identical |
+| DP=2 | `replicate` | `axis: dp, batch: shard(0)` | identical |
+| TP=2 × DP=2 | `mesh` + `replicate` + `shard_tensor` | `mesh` + two layouts | identical |
+| CP=2 ring with DP | `replicate` + `ring_exchange.derive` | `axis: cp, inputs: {*: shard(1)}` | identical |
+
+- Suite 118 passed. Identical DAGs execute identically, so the GPU results of the written directives carry over.
+- For CP the user states only that the model's inputs are split along the sequence. Which regions are row-local (the projections), where the split moves to dim 2 (after the head split), which regions gather K/V (the ring steps), and which weights need a gradient sync (q/o projections) are all derived.
+
+**Not yet.** One layout per axis must agree on gradient sync across its regions (mixed cases raise); EP (data-dependent routing) is not a placement; decomposition other than the ring (one all-gather) needs an activation all-gather node.

@@ -64,8 +64,9 @@ def derive_boundary_placements(
 
     ``params`` maps a module name (``"up"``) to ``"colwise"``, ``"rowwise"`` or
     ``"replicate"``; unnamed parameters are replicated. ``inputs`` maps the position
-    of a runtime input (``"0"`` is the first) to ``"replicate"`` or ``"shard(d)"``;
-    unnamed inputs are replicated. A sharded input is built from a local tensor of
+    of a runtime input (``"0"`` is the first; ``"*"`` any other) to ``"replicate"`` or
+    ``"shard(d)"``; unnamed inputs are replicated. ``param_grads`` in the result: a
+    Partial one needs the gradient sync data parallelism writes by hand (log F85). A sharded input is built from a local tensor of
     the traced shape, since the region was traced on one rank's chunk (log F76).
     Returns ``{"outputs": [...], "input_grads": {graphargs_idx: placement},
     "input_placements": {graphargs_idx: placement}}``.
@@ -78,6 +79,7 @@ def derive_boundary_placements(
     patterns = {k: re.compile(rf"(^|_)modules_{re.escape(k)}_parameters_") for k in params}
     input_grads: dict[int, Any] = {}
     input_placements: dict[int, Any] = {}
+    param_grads: dict[int, Any] = {}
     with _fake_mesh(world_size) as mesh:
         args = []
         for i, (g, name) in enumerate(zip(graphargs, names)):
@@ -89,10 +91,21 @@ def derive_boundary_placements(
                 t = distribute_tensor(torch.randn(tuple(g.shape)), mesh, [_placement(spec)])
             else:
                 pos = input_idxs.index(i) if i in input_idxs else -1
-                pl = _placement((inputs or {}).get(str(pos), "replicate"))
+                spec_in = inputs or {}
+                pl = _placement(spec_in.get(str(pos), spec_in.get("*", "replicate")))
                 input_placements[i] = pl
                 t = DTensor.from_local(torch.randn(tuple(g.shape)), mesh, [pl], run_check=False)
             args.append(t.requires_grad_(i in param_idxs or i in input_idxs))
+            if i in param_idxs:
+                # A replicated weight read by split data gets a Partial gradient; record it
+                # before accumulation, which would all-reduce it: that all-reduce is the
+                # gradient sync being derived (data parallelism), not one inside the region.
+                def _phook(grad, i=i):
+                    param_grads[i] = grad.placements[0]
+                    if not grad.placements[0].is_partial():
+                        return grad
+                    return DTensor.from_local(grad.to_local(), mesh, [Replicate()], run_check=False)
+                t.register_hook(_phook)
             if i in input_idxs:
                 # Record the input gradient as computed. Accumulating a Partial gradient into
                 # a Replicate leaf would all-reduce it, and that all-reduce is the boundary
@@ -105,7 +118,10 @@ def derive_boundary_placements(
                 t.register_hook(_hook)
         with DebugMode() as fwd:
             outs = [o for o in tree_leaves(gm(*args)) if isinstance(o, torch.Tensor)]
-        loss = sum(o.redistribute(mesh, [Replicate()]).to_local().sum() for o in outs)
+        # A split output feeds a split consumer: take its local part. Anything else is
+        # made whole, as a replicated consumer would see it.
+        loss = sum(o.to_local().sum() if o.placements[0].is_shard() else o.redistribute(mesh, [Replicate()]).to_local().sum()
+                   for o in outs)
         with DebugMode() as bwd:
             loss.backward()
         inside = [line.strip() for mode in (fwd, bwd) for line in mode.debug_string().splitlines()
@@ -120,6 +136,7 @@ def derive_boundary_placements(
             "outputs": [o.placements[0] for o in outs],
             "input_grads": input_grads,
             "input_placements": input_placements,
+            "param_grads": param_grads,
         }
 
 
@@ -175,3 +192,84 @@ def derive_gathered_inputs(
                     gathered.append(i)
                     break
     return [names[i] for i in gathered]
+
+
+def derive_split_outputs(
+    gm: torch.fx.GraphModule,
+    graphargs: list[Any],
+    input_idxs: list[int],
+    seq_dim: int,
+) -> list[str | None]:
+    """How each output of a region is split when its inputs are split along ``seq_dim``
+    (log F85), found the way F70 finds gathered inputs: perturb position 0 of every
+    split input in float64 and see where each output moves.
+
+    ``"shard(d)"``: only position 0 along output dimension d moved (the split follows the
+    rows, possibly to another dimension, as a head split moves it). ``None``: the output
+    moved elsewhere too, so the region reads other positions whole. An output that does
+    not move at all (a fresh buffer shaped like a split input) takes the dimension whose
+    size is the local sequence length; if none, ``"replicate"``.
+    """
+    gm = _on_cpu(gm)
+    torch.manual_seed(0)
+    args, local_len = [], None
+    for i, g in enumerate(graphargs):
+        if not isinstance(g, torch.Tensor):
+            args.append(g)
+            continue
+        if g.is_floating_point():
+            t = torch.randn(tuple(g.shape), dtype=torch.float64)
+        else:
+            t = torch.zeros(tuple(g.shape), dtype=g.dtype)
+        if i in input_idxs and t.dim() > seq_dim:
+            local_len = t.shape[seq_dim]
+        args.append(t)
+    with torch.no_grad():
+        base = [o for o in _leaves(gm(*args)) if isinstance(o, torch.Tensor)]
+        moved = list(args)
+        for i in input_idxs:
+            t = moved[i]
+            if isinstance(t, torch.Tensor) and t.is_floating_point() and t.dim() > seq_dim:
+                t = t.clone()
+                t.select(seq_dim, 0).add_(1.0)
+                moved[i] = t
+        pert = [o for o in _leaves(gm(*moved)) if isinstance(o, torch.Tensor)]
+    out = []
+    for a, b in zip(base, pert):
+        if not a.is_floating_point():
+            out.append("replicate")
+            continue
+        diff = (a - b).abs() > 1e-9
+        if not diff.any():
+            dims = [d for d in range(a.dim()) if a.shape[d] == local_len]
+            out.append(f"shard({dims[0]})" if dims else "replicate")
+            continue
+        found = None
+        for d in range(a.dim()):
+            others = tuple(k for k in range(a.dim()) if k != d)
+            rows = diff.any(dim=others) if others else diff
+            if rows[0] and not rows[1:].any():
+                found = d
+                break
+        out.append(f"shard({found})" if found is not None else None)
+    return out
+
+
+def _leaves(x):
+    from torch.utils._pytree import tree_leaves
+    return tree_leaves(x)
+
+
+def _on_cpu(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    """A copy of ``gm`` whose baked ``device='meta'`` literals (from ``torch.full(...,
+    device=x.device)`` at trace time) read ``cpu``, so it can run on real tensors; the
+    actor does the same for its own device (``_relocate_meta_devices``)."""
+    import copy
+    gm = copy.deepcopy(gm)
+    meta, cpu = torch.device("meta"), torch.device("cpu")
+    fix = lambda v: cpu if (isinstance(v, torch.device) and v == meta) or v == "meta" else v  # noqa: E731
+    for node in gm.graph.nodes:
+        node.args = tuple(fix(a) for a in node.args)
+        node.kwargs = {k: fix(v) for k, v in node.kwargs.items()}
+    gm.recompile()
+    return gm

@@ -87,7 +87,7 @@ def derive_schedule_info(directives: list[dict], schedule_path: str) -> dict[str
 
 def _validate_directive_shape(directive: dict, idx: int) -> None:
     op = directive.get("op")
-    if op in {"place", "replicate", "shard", "shard_tensor", "ring_exchange", "fuse_collectives", "split"}:
+    if op in {"place", "replicate", "shard", "shard_tensor", "ring_exchange", "fuse_collectives", "split", "layout"}:
         if not isinstance(directive.get("filter"), dict):
             raise ValueError(f"{op} directive[{idx}] requires object field 'filter': {directive}")
         if "filters" in directive:
