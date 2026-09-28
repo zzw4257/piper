@@ -182,3 +182,80 @@ def resolve_total_order_per_stream(dag: TrainingDAG) -> None:
                             )
                         )
                 current_uid = next_uid
+
+
+
+def align_p2p_order(dags: list) -> int:
+    """Give every pair of ranks one order for the point-to-point transfers between them.
+
+    NCCL pairs point-to-point operations between two ranks by issue order, not by name.
+    Each rank serializes its own DAG, breaking ties by uid string, so two same-shaped
+    transfers between one pair could be matched crosswise and silently swapped
+    (log F81: SmolVLM's vision chunks; the receiver ordered recv.10 before recv.8, and
+    a last-chunk-first backward received in the reverse of the send order).
+
+    Run on the per-rank DAGs before each stream is serialized. For each (sender,
+    receiver) pair, the order the sender's DAG already forces between its sends and the
+    order the receiver's forces between its recvs are merged; ties follow the sender's
+    order. Ties go to the transfer the receiver needs first (the topological level of
+    the recv's earliest consumer), then to the one the sender has first (the send's
+    level): a last-chunk-first backward then receives the last chunk first, and a
+    forward whose consumer needs all chunks at once receives them as they are produced.
+    A contradiction is an error. Both sides then get temporal edges in that order,
+    repeated until no pair changes. Returns the number of edges added.
+    """
+    import heapq
+
+    from .dag import TrainingDAGEdge
+
+    added = 0
+    for _ in range(4 * len(dags) + 4):
+        pairs: dict[tuple[int, int], list[str]] = {}
+        for r, d in enumerate(dags):
+            for uid in _serial_topological_order(d):
+                n = d.nodes[uid]
+                if n.node_kind == "SEND_COMM":
+                    pairs.setdefault((r, int(n.node_meta["peer_pp_rank"])), []).append(uid.split(".", 1)[1])
+        changed = False
+        levels = [_topological_levels(d) for d in dags]
+        for (src, dst), keys in pairs.items():
+            sd, rd = dags[src], dags[dst]
+            keys = [k for k in keys if f"recv.{k}" in rd.nodes]
+
+            def need(k):
+                cons = rd.succs.get(f"recv.{k}", set())
+                return min((levels[dst][c] for c in cons), default=levels[dst][f"recv.{k}"])
+
+            rank = {k: (need(k), levels[src][f"send.{k}"], i) for i, k in enumerate(keys)}
+            succ = {k: set() for k in keys}
+            indeg = {k: 0 for k in keys}
+            for a in keys:
+                for b in keys:
+                    if a != b and (_has_path(sd, f"send.{a}", f"send.{b}") or _has_path(rd, f"recv.{a}", f"recv.{b}")):
+                        succ[a].add(b)
+            for a in keys:
+                for b in succ[a]:
+                    indeg[b] += 1
+            heap = [(rank[k], k) for k in keys if indeg[k] == 0]
+            heapq.heapify(heap)
+            order = []
+            while heap:
+                _, k = heapq.heappop(heap)
+                order.append(k)
+                for b in succ[k]:
+                    indeg[b] -= 1
+                    if indeg[b] == 0:
+                        heapq.heappush(heap, (rank[b], b))
+            if len(order) != len(keys):
+                raise ValueError(
+                    f"ranks {src} and {dst} force opposite orders on their transfers {sorted(keys)[:6]}; "
+                    "the schedule orders the two ranks inconsistently")
+            for a, b in zip(order, order[1:]):
+                for d, u, v in ((sd, f"send.{a}", f"send.{b}"), (rd, f"recv.{a}", f"recv.{b}")):
+                    if not _has_path(d, u, v):
+                        d.add_edge(TrainingDAGEdge(src_uid=u, dst_uid=v, dep_kind="temporal", tensor_name=None))
+                        added += 1
+                        changed = True
+        if not changed:
+            return added
+    raise ValueError("point-to-point order did not settle across ranks")

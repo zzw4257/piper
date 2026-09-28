@@ -4516,3 +4516,48 @@ All within 1%. Piper's own overhead on these steps is below the model's resoluti
 - The single-GPU step times of this session are not usable: another job on the shared account started on GPUs 0/2/5/6 during the runs.
 
 **Queued** (`check_vlm.py`, H200, once NCCL is back): `vlm_4st_routed_c{4,2,8,4}_mb{2,4,1,1}` next to the uniform schedules. F79's model predicts vision 8 / decoder 2 (k=4, m=2) at 303.6 ms against 393.3 ms for the best uniform m.
+
+---
+
+## 2026-09-28 — F81: two ranks could match their point-to-point transfers crosswise and silently swap same-shaped tensors; fixed. SmolVLM on four B200s: 2.47x one GPU with the vision tower in smaller pieces than the decoder
+
+**Found.**
+- The first B200 run of F80's chunked schedules trained wrongly. With vision in 4 chunks the first loss was 5.36 instead of 3.93; with 8 chunks the first loss matched and training diverged from step 2.
+- NCCL pairs send and recv between two ranks by issue order, and each rank serializes its own DAG.
+  - Forward, rank 2 sent chunks 0..3 as `send.8..11`, but rank 3's stream serialization broke the tie by uid string and posted `recv.10, recv.11, recv.8, recv.9`.
+  - Backward, rank 3 sent `send.20..23` while rank 2, running the chunks last-first, posted `recv.23..20`.
+  - Same shapes, so no error: image features landed on the wrong captions, and gradients on the wrong chunks.
+- Earlier schedules had one transfer per pair per phase and were not exposed.
+
+**Changed** (`ordering.align_p2p_order`, run on the per-rank DAGs before any stream is serialized).
+- For each (sender, receiver) pair, merge the order the sender's DAG forces between its sends and the order the receiver's forces between its recvs.
+- Ties go to the transfer the receiver needs first (level of the recv's earliest consumer), then to the one the sender has first (level of the send).
+- Add temporal edges on both sides in that order, iterate until no pair changes. A contradiction raises.
+- `test/test_p2p_order.py` checks that both sides of every pair use one order on six schedules (SmolVLM chunked and uniform, CLIP 1F1B, TP×PP 1F1B). Suite 109 passed.
+
+**Measured** (4 B200s, cards registered with `cmu-gpu`, released after each job; SmolVLM, 32 pairs per step, fixed work; losses match one GPU within 7e-6 in every run; two batches reproduce each other within 1%).
+
+| schedule | vision pieces / decoder pieces | step ms | vs one GPU m=1 (596.0) | peak GB per rank |
+|---|---|---|---|---|
+| 2 stages, m=4, 1F1B | 4 / 4 | 557.4 | 1.07 | 11.7, 5.4 |
+| 4 stages, m=1 | 1 / 1 | 510.8 | 1.17 | 8.2, 8.1, 8.2, 10.5 |
+| 4 stages, m=2, 1F1B | 2 / 2 | 320.7 | 1.86 | 7.8, 7.8, 7.9, 7.3 |
+| 4 stages, m=4, 1F1B | 4 / 4 | 258.6 | 2.30 | 7.6, 6.2, 4.8, 5.4 |
+| 4 stages, m=8, 1F1B (first batch) | 8 / 8 | 334.5 | 1.78 | 4.6, 3.9, 3.2, 4.4 |
+| 4 stages, vision in 4 chunks, m=1 | 4 / 1 | 316.5 | 1.88 | 7.7, 7.7, 7.8, 10.5 |
+| 4 stages, vision in 8 chunks, m=1 | 8 / 1 | 293.1 | 2.03 | |
+| 4 stages, vision in 4 chunks, m=2 | 8 / 2 | 257.7 | 2.31 | |
+| **4 stages, vision in 2 chunks, m=4** | **8 / 4** | **241.4** | **2.47** | 7.6, 7.5, 7.7, 9.0 |
+
+- Balancing the encoder across three stages is the lever: two stages stay near 1.1x, four reach 2.3x.
+- Feeding the decoder fewer, larger pieces than the vision tower adds 7% over the best uniform schedule (241.4 vs 258.6). F79 predicted 1.30x from H200 profiles, where the decoder was launch-bound (65 ms at 4 samples). On B200 it is 34 ms at 4 samples, so the gain is smaller.
+- Threaded and routed take the same time (e.g. 263.4 vs 265.1 at m=4). Routing matters here for traffic, as F77 said.
+- 1F1B lowers the decoder stage's peak at m=4 from 9.0 to 5.4 GB and grades the vision stages 7.6 / 6.2 / 4.8.
+
+**F78's model on this host.**
+- Not testable. The B200 stage profile sums to 694 ms for one GPU against 596 ms measured, and 4 stages at m=1 (no overlap possible) measure 510.8.
+- The host had 87 users and load about 6; launch-bound work is sensitive to CPU contention, and the profile ran at a different moment than the runs.
+- H200 profiles do not transfer to B200 either (decoder 65 vs 34 ms at 4 samples).
+- The model stands as validated on the quiet H200 (F78, CLIP within 1%).
+
+**Also.** F76's GPU checks passed on B200. CP inside a branch: CP=2 routed vs one GPU 2.5e-6 over 5 steps, 56.3 → 35.2 ms. EP inside a branch: first loss 1.1e-7, timing not meaningful for one step.

@@ -24,6 +24,7 @@ from .directives import (
     _validate_split_backward_order_stencil,
     apply_schedule_directives,
 )
+from .ordering import align_p2p_order
 from .ordering import (
     _serial_topological_order,
     resolve_total_order_per_stream,
@@ -218,6 +219,7 @@ def piper(gm, example_inputs, **kwargs):
     )
     piper_metadata.training_dag = training_dag
     per_pp_training_dags = _split_global_training_dag_by_pp_rank(training_dag)
+    align_p2p_order(per_pp_training_dags)  # before any stream is serialized (log F81)
     artifact_dir = getattr(piper_metadata, "artifact_dir", "out")
     for i, subdag in enumerate(per_pp_training_dags):
         zero_chains = _prune_zero_lifetime_metadata(subdag)
