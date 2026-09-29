@@ -59,16 +59,18 @@ def test_replicated_parameters_need_no_collective(tmp_path) -> None:
 
 
 def test_placement_dtensor_would_silently_resplit_is_refused(tmp_path) -> None:
-    # up column-parallel, down declared whole: DTensor chunks down locally to fit, with no
-    # collective, and ends with a partial sum. Piper would run down whole, so refuse.
-    with pytest.raises(Exception, match="redistribution inside the region"):
+    # up column-parallel, down declared whole: down would read one rank's slice as if whole.
+    # Refused either way DTensor sees it: a re-split inside the region, or (deriving local
+    # between the parallel layers, log F99) a region output that is a local shard.
+    with pytest.raises(Exception, match="redistribution inside the region|local shard"):
         _lower([PLACE, {**TP_RULE, "params": {"up": "colwise", "down": "replicate"}}, _split(1)], tmp_path)
 
 
 def test_placement_needing_a_collective_inside_the_region_is_refused(tmp_path) -> None:
     # up row-parallel, down column-parallel: gelu would see a partial sum, so DTensor
-    # must all-reduce between the two layers, inside the region.
-    with pytest.raises(Exception, match="redistribution inside the region"):
+    # must all-reduce between the two layers, inside the region. With TP-local traced shapes the
+    # declaration also contradicts up's shape, which DTensor reports first (log F99).
+    with pytest.raises(Exception, match="redistribution inside the region|reduction dim"):
         _lower([PLACE, {**TP_RULE, "params": {"up": "rowwise", "down": "colwise"}}, _split(1)], tmp_path)
 
 

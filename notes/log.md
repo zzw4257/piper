@@ -5187,3 +5187,53 @@ GPU 1 also idles at 162–173 W against 137–144 W on the others.
 - Placement is not a property of the model alone: it moves with the model's balance and with the data's shape.
 - A single-GPU profile and the DAG are enough to call it (12 of 12 clean measurements within 4.1%, 9 of them within 2%).
 - For mixed-resolution data the right unit is one placement per bucket. Piper compiles one program per schedule, so this is a program per bucket sharing weights, which Piper does not do yet.
+
+---
+
+## 2026-09-29 — F99: derived placements catch five TP region mistakes that the hand-written rule trains through; making derivation work on real attention required running the region local between its parallel layers
+
+**Why.** F85 showed `layout` lowers the same DAG as the written directives. That shows it is possible, not that it is better. The claim to test: deriving placements catches mistakes that writing them does not.
+
+**The mistakes** (`experiments/tp_bug_zoo.py`, CPU; a TP=2 region between two replicated layers, written in TP-local shapes). "Rule, simulated" is what `shard_tensor`'s rule computes (all-reduce whatever leaves the region), simulated in one process in fp64 against the unsharded model:
+
+| region | `shard_tensor` | rule, simulated | `layout` |
+|---|---|---|---|
+| up (col) → gelu → down (row) | lowers | 4.2e-16 | lowers, same DAG |
+| row-parallel bias inside | lowers | 46% off | refused: forward `aten::addmm` input 0: R → P |
+| LayerNorm after the row-parallel matmul | lowers | 40% off | refused: `aten::native_layer_norm` P → R, forward and backward |
+| activation after the row-parallel matmul | lowers | 7.4% off | refused: `aten::gelu` P → R |
+| residual add inside | lowers | 98% off | refused: `aten::add` P → R |
+| region ends after the column-parallel matmul | lowers | wrong shapes | refused: the output is a local shard, not a partial sum |
+
+- Each refusal names the operator and the pass. The rule accepts all five, and training would go wrong without an error.
+
+**Getting there on a real model.** On SmolVLM's every-layer TP (F87), `layout` first failed in three ways, each a finding in itself:
+
+1. **Local shapes against global derivation.** Attention reshapes by the local head count (`view(b, n, heads_local, -1)`). Derivation treated the traced, TP-local shapes as global and split them again, so DTensor refused to split a sharded dimension.
+2. **DTensor has no CPU SDPA rule.** `aten._scaled_dot_product_flash_attention_for_cpu` has no sharding strategy; derivation runs on CPU.
+3. **The math fallback flattens (batch, heads).** DTensor refuses to flatten when the inner (head) dimension is sharded.
+
+DTensor's own TP recipe never propagates through attention either. torchtitan uses `ColwiseParallel(use_local_output=True)`, so attention runs on local tensors, and `RowwiseParallel` takes its input as `Shard(-1)`. The region between the linears is a manual region, as Piper's are.
+
+**Changed.**
+- `src/placement.py`:
+  - Derivation runs the region through an fx interpreter (`_between_linears`): DTensor up to the column-parallel layers and from the row-parallel ones; plain local tensors in between.
+  - A column layer's output is taken local, and a row layer's activation re-enters as `Shard(-1)`.
+  - A replicated value read in the local zone (rotary tables) is taken local with a Partial gradient.
+  - Parameters and inputs are built with `from_local`, so the traced shape is one rank's shard.
+  - A bias follows Megatron's convention: split with a colwise layer, whole with a rowwise one; it had crashed before (IndexError).
+  - Inputs need a gradient only if they did when traced.
+  - Refusals name operator, pass and input.
+- `src/fx.py`: TP-style `layout` regions (with `params`) join the no-relay set, as `shard_tensor` regions do. Otherwise the rotary tables were relayed through them.
+- `src/directives.py`: a region whose output is a local shard gets a plain refusal.
+
+**Tested.**
+- `experiments/layout_vlm.py` / `test/test_layout_vlm.py`: SmolVLM-256M at TP=3 and SmolVLM2-2.2B at TP=2 (two vision and two decoder layers, real widths). `layout` given only which projections are colwise and rowwise; every node and edge identical to `shard_tensor`'s (16 TP all-reduces). Derivation takes 1–2 s.
+- `test/test_tp_bug_zoo.py`: the five refusals, and that the rule accepts them.
+- The two older refusal tests now accept either message: the same mistakes, reported as a local-shard output or a shape contradiction.
+- F85's cases unchanged. Suite 133 passed.
+- Run locally (torch 2.10.0 CPU, fresh clone) while the B200 host was unreachable.
+
+**Meaning.**
+- For TP, derivation is not only equivalent to writing: it refuses the region mistakes the written rule trains through, and says which operator to move.
+- The derivation that works is the one DTensor's own recipes imply: strict at the region's two ends, local in the middle.

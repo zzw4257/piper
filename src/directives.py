@@ -1410,6 +1410,12 @@ def _insert_tp_all_reduce_comm_nodes(
             # split) needs nothing on the boundary.
             other = [pl for k, pl in d["input_grads"].items()
                      if not (pl.is_partial() or pl.is_replicate() or pl == d["input_placements"].get(k))]
+        if other and node.compute_subkind == "FWD":
+            raise ValueError(
+                f"shard_tensor(params={params}) on {node.uid}: the region's output comes out {other[0]}, "
+                f"split, not a partial sum: an all-reduce on it would add different slices together. "
+                f"End the region after a row-parallel layer, or declare the reader's input split "
+                f"(log F99; placements {d})")
         if other or len(partial) > 1:
             raise ValueError(
                 f"shard_tensor(params={params}) on {node.uid}: boundary placements "

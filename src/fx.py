@@ -544,13 +544,14 @@ def _ring_region_filters() -> list[dict]:
 
 
 def _collective_region_filters() -> list[dict]:
-    """Filters of ``shard_tensor``/``shard`` directives: regions whose boundary carries a collective."""
+    """Filters of ``shard_tensor``/``shard`` directives, and of ``layout`` with ``params`` (TP-style,
+    log F99): regions whose boundary carries a collective."""
     from .directives import _normalize_filter_spec
     from .state import piper_metadata
 
     out = []
     for d in getattr(piper_metadata, "schedule_directives", None) or []:
-        if isinstance(d, dict) and d.get("op") in ("shard_tensor", "shard"):
+        if isinstance(d, dict) and (d.get("op") in ("shard_tensor", "shard") or (d.get("op") == "layout" and d.get("params"))):
             for f in d.get("filters") or [d.get("filter") or {}]:
                 f = _normalize_filter_spec(f, d)
                 out.append({k: v for k, v in f.items() if k not in ("PASS", "MB")})

@@ -71,7 +71,7 @@ def derive_boundary_placements(
     Returns ``{"outputs": [...], "input_grads": {graphargs_idx: placement},
     "input_placements": {graphargs_idx: placement}}``.
     """
-    from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
+    from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
     from torch.utils._debug_mode import DebugMode
     from torch.utils._pytree import tree_leaves
 
@@ -80,6 +80,8 @@ def derive_boundary_placements(
     input_grads: dict[int, Any] = {}
     input_placements: dict[int, Any] = {}
     param_grads: dict[int, Any] = {}
+    col: set[str] = set()
+    row: set[str] = set()
     with _fake_mesh(world_size) as mesh:
         args = []
         for i, (g, name) in enumerate(zip(graphargs, names)):
@@ -88,14 +90,24 @@ def derive_boundary_placements(
                 continue
             if i in param_idxs:
                 spec = next((params[k] for k, p in patterns.items() if p.search(name)), "replicate")
-                t = distribute_tensor(torch.randn(tuple(g.shape)), mesh, [_placement(spec)])
+                pl = _placement(spec)
+                if g.dim() == 1 and spec in ("colwise", "rowwise"):
+                    # a bias follows its layer's output (Megatron): split with a column-parallel
+                    # layer, whole with a row-parallel one (log F99)
+                    pl = Shard(0) if spec == "colwise" else Replicate()
+                # from_local: the traced shape is one rank's shard, as Piper models are written
+                t = DTensor.from_local(torch.randn(tuple(g.shape)), mesh, [pl], run_check=False)
+                if spec in ("colwise", "rowwise"):
+                    (col if spec == "colwise" else row).add(name)
             else:
                 pos = input_idxs.index(i) if i in input_idxs else -1
                 spec_in = inputs or {}
                 pl = _placement(spec_in.get(str(pos), spec_in.get("*", "replicate")))
                 input_placements[i] = pl
                 t = DTensor.from_local(torch.randn(tuple(g.shape)), mesh, [pl], run_check=False)
-            args.append(t.requires_grad_(i in param_idxs or i in input_idxs))
+            # an input needs a gradient only if it did when traced (rotary tables do not: log F99)
+            needs = i in param_idxs or (i in input_idxs and bool(getattr(g, "requires_grad", True)))
+            args.append(t.requires_grad_(needs))
             if i in param_idxs:
                 # A replicated weight read by split data gets a Partial gradient; record it
                 # before accumulation, which would all-reduce it: that all-reduce is the
@@ -106,7 +118,7 @@ def derive_boundary_placements(
                         return grad
                     return DTensor.from_local(grad.to_local(), mesh, [Replicate()], run_check=False)
                 t.register_hook(_phook)
-            if i in input_idxs:
+            if i in input_idxs and needs:
                 # Record the input gradient as computed. Accumulating a Partial gradient into
                 # a Replicate leaf would all-reduce it, and that all-reduce is the boundary
                 # collective being derived, not one inside the region; stop it here.
@@ -117,20 +129,34 @@ def derive_boundary_placements(
                     return DTensor.from_local(grad.to_local(), mesh, [Replicate()], run_check=False)
                 t.register_hook(_hook)
         with DebugMode() as fwd:
-            outs = [o for o in tree_leaves(gm(*args)) if isinstance(o, torch.Tensor)]
+            outs = [o for o in tree_leaves(_between_linears(gm, mesh, col, row).run(*args)) if isinstance(o, torch.Tensor)]
+        if any(not isinstance(o, DTensor) for o in outs):
+            raise ValueError(
+                "the region's output is a local shard (it ends between a column- and a row-parallel "
+                "layer), not a partial sum: an all-reduce on it would add different slices together. "
+                "End the region after a row-parallel layer (log F99)")
         # A split output feeds a split consumer: take its local part. Anything else is
         # made whole, as a replicated consumer would see it.
         loss = sum(o.to_local().sum() if o.placements[0].is_shard() else o.redistribute(mesh, [Replicate()]).to_local().sum()
                    for o in outs)
         with DebugMode() as bwd:
             loss.backward()
-        inside = [line.strip() for mode in (fwd, bwd) for line in mode.debug_string().splitlines()
-                  if re.match(r"\s*redistribute_input\(\d+,", line)]
+        inside = []
+        for pass_, mode in (("forward", fwd), ("backward", bwd)):
+            op = "?"
+            for line in mode.debug_string().splitlines():
+                st = line.strip()
+                if st.startswith("aten::") and "dt:" in st:
+                    op = st.split("(")[0]
+                m = re.match(r"redistribute_input\((\d+), (.*)\)$", st)
+                if m:
+                    inside.append(f"{pass_} {op} input {m.group(1)}: {m.group(2)}")
         if inside:
             raise ValueError(
-                f"these placements need redistribution inside the region {inside}; "
-                f"split the region so every collective sits on its boundary, "
-                f"or declare the parameter the way DTensor re-split it"
+                "these placements need a redistribution inside the region, where Piper cannot put one: "
+                + "; ".join(dict.fromkeys(inside))
+                + ". Move that operator out of the region, so any collective sits on its boundary, "
+                "or declare the parameter the way DTensor re-split it"
             )
         return {
             "outputs": [o.placements[0] for o in outs],
@@ -138,6 +164,48 @@ def derive_boundary_placements(
             "input_placements": input_placements,
             "param_grads": param_grads,
         }
+
+
+def _between_linears(gm, mesh, col: set, row: set):
+    """Run a region as a TP region runs: DTensor up to the column-parallel layers and from the
+    row-parallel ones, plain local tensors in between (log F99).
+
+    Piper regions are written in TP-local shapes, as torchtitan's styles make attention run on local
+    tensors (``ColwiseParallel(use_local_output=True)``): reshapes by the local head count are
+    right on local tensors and meaningless on a global DTensor. So a column-parallel layer's output
+    is taken local, and a row-parallel layer's activation re-enters as ``Shard(-1)``. What lies
+    before the column layers and after the row layers still goes through DTensor, and that is where
+    a misplaced bias, norm, activation or residual shows up as a redistribution inside the region.
+    """
+    from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
+    from torch.utils._pytree import tree_map
+
+    def plain(x):
+        return isinstance(x, torch.Tensor) and not isinstance(x, DTensor)
+
+    class _Run(torch.fx.Interpreter):
+        def run_node(self, n):
+            if n.op not in ("call_function", "call_method", "call_module"):
+                return super().run_node(n)
+            names = {a.name for a in n.all_input_nodes}
+            args, kwargs = self.fetch_args_kwargs_from_env(n)
+            if names & row:
+                split = lambda x: DTensor.from_local(x, mesh, [Shard(x.dim() - 1)], run_check=False) if plain(x) else x  # noqa: E731
+                args, kwargs = tree_map(split, args), tree_map(split, kwargs)
+            else:
+                leaves = [x for x in list(args) + list(kwargs.values()) if isinstance(x, torch.Tensor)]
+                if any(plain(x) for x in leaves) and any(isinstance(x, DTensor) for x in leaves):
+                    # a replicated value read in the local zone (rotary tables, a mask): its gradient
+                    # from there is one rank's part of the sum
+                    local = lambda x: x.to_local(grad_placements=[Partial()]) if isinstance(x, DTensor) and all(  # noqa: E731
+                        isinstance(q, Replicate) for q in x.placements) else x
+                    args, kwargs = tree_map(local, args), tree_map(local, kwargs)
+            out = getattr(self, n.op)(n.target, args, kwargs)
+            if names & col:
+                out = tree_map(lambda x: x.to_local() if isinstance(x, DTensor) else x, out)
+            return out
+
+    return _Run(gm)
 
 
 def derive_gathered_inputs(
