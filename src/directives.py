@@ -2445,6 +2445,13 @@ def _apply_layout(dag: TrainingDAG, filters: list[dict[str, Any]], devices: list
             need_reduce.append(n)
         report[n.uid] = {"inputs": in_pl, "outputs": outs, "boundary_all_reduce": partial_io, "grad_sync": partial_w}
 
+    if size > 1 and not (need_tp or need_reduce or ring_regions):
+        # Undeclared inputs and parameters default to replicated, and then every rank computes the
+        # same thing: no collective is derived, so data-parallel ranks fed different batches would
+        # drift apart silently. Nobody asks for that with a layout (log F100).
+        raise ValueError(
+            f"layout on axis {axis} derives no communication: every rank of {devices} would compute the "
+            "same thing. Say what is split: batch/inputs (e.g. \"batch\": \"shard(0)\") or params")
     if need_reduce:
         with_params = [n for n in fwd if any(_match_filter(n.tag, f) for f in filters) and _node_has_trainable_params(dag, n)]
         if {n.uid for n in need_reduce} != {n.uid for n in with_params}:

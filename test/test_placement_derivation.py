@@ -58,6 +58,22 @@ def test_replicated_parameters_need_no_collective(tmp_path) -> None:
     assert _tp_nodes(dag) == set()
 
 
+@pytest.mark.parametrize("axis", ["dp", "cp"])
+def test_layout_that_splits_nothing_is_refused(tmp_path, axis) -> None:
+    # A data-parallel layout without "batch" used to lower with no gradient sync: ranks fed
+    # different batches would have drifted apart silently (log F100).
+    rule = {"op": "layout", "filter": {"PP": 0}, "devices": [0, 1], "axis": axis}
+    with pytest.raises(Exception, match="derives no communication"):
+        if axis == "dp":
+            _lower([PLACE, rule, _split(1)], tmp_path)
+        else:
+            _lower_ring([PLACE, rule, _split(1)], tmp_path, 2)
+    dag = (_lower([PLACE, {**rule, "batch": "shard(0)"}, _split(1)], tmp_path) if axis == "dp"
+           else _lower_ring([PLACE, {**rule, "inputs": {"*": "shard(1)"}}, _split(1)], tmp_path, 2))
+    kinds = {n.node_kind for n in dag.nodes.values()}
+    assert "REDUCE_COMM" in kinds and (axis == "dp" or "RING_COMM" in kinds)
+
+
 def test_placement_dtensor_would_silently_resplit_is_refused(tmp_path) -> None:
     # up column-parallel, down declared whole: down would read one rank's slice as if whole.
     # Refused either way DTensor sees it: a re-split inside the region, or (deriving local

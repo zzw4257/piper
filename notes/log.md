@@ -5237,3 +5237,30 @@ DTensor's own TP recipe never propagates through attention either. torchtitan us
 **Meaning.**
 - For TP, derivation is not only equivalent to writing: it refuses the region mistakes the written rule trains through, and says which operator to move.
 - The derivation that works is the one DTensor's own recipes imply: strict at the region's two ends, local in the middle.
+
+## 2026-09-29 — F100: a `layout` that declares no split lowered with no collective, so data-parallel ranks would drift apart silently; now refused
+
+**Tested.** F99 checked region mistakes. This checks declaration mistakes, on the MLP and the ring model, CPU-only (`place` on two devices, one microbatch):
+
+| schedule | before | now |
+|---|---|---|
+| DP by `replicate` | 3 grad syncs | same |
+| DP `layout`, `"batch": "shard(0)"` | 3 grad syncs | same |
+| DP `layout`, no `batch` | **no collective** | refused |
+| CP `layout`, `inputs` shard(1) | 2 ring hops + 2 grad syncs | same |
+| CP `layout`, no `inputs` | refused, with F99's wrong "local shard" message | refused, right message |
+| TP×DP, either form, no `mesh` | refused (TP cannot compose with replicate) | same |
+
+**Unexpected.**
+- An undeclared input defaults to replicated. With nothing split, DTensor rightly derives no collective. But Piper feeds each DP rank its own batch, so the lowered program has no gradient sync, and each replica trains on its own data. Nothing fails.
+- The written path has the same hole: forgetting `replicate` also drops the sync. Derivation does not create the risk. It only means a missing word now looks like a complete schedule.
+- The CP case hit F99's local-shard refusal by mistake. The stage prologue makes fresh `zeros`/`full` buffers, which read no input and come out as plain tensors.
+
+**Changed.**
+- `src/directives.py`: a `layout` on more than one device that derives no collective at all is refused, with a message saying what to declare. Every rank computing the same thing on the same data is never what a layout means.
+- `src/placement.py`: when a region reads no column-parallel layer, a plain output is a fresh buffer and is taken as Replicate. The local-shard refusal stays for regions that do read one.
+- `test/test_placement_derivation.py`: `test_layout_that_splits_nothing_is_refused[dp|cp]`, including the declared forms still lowering. Suite 135 passed. The bug zoo is unchanged.
+
+**IR/runtime assumption discovered.** A declared placement is a contract nobody checks at run time. DTensor checks a Replicate claim with `from_local(run_check=True)`, which broadcasts rank 0's tensor and compares. Piper could do the same once on step 1, on inputs declared replicated across a group larger than one. Not built, because it needs GPUs.
+
+**Open question.** Should `shard_tensor` with all-replicate `params` be refused too? It derives no collective, as the existing test asserts. It is left alone, because there the user asked for TP and got none: a visible no-op, not a silent divergence.

@@ -130,6 +130,10 @@ def derive_boundary_placements(
                 t.register_hook(_hook)
         with DebugMode() as fwd:
             outs = [o for o in tree_leaves(_between_linears(gm, mesh, col, row).run(*args)) if isinstance(o, torch.Tensor)]
+        if not col:
+            # a fresh buffer (zeros, full) reads no input: every rank makes the same one
+            outs = [o if isinstance(o, DTensor) else DTensor.from_local(torch.zeros(o.shape, dtype=o.dtype), mesh, [Replicate()], run_check=False)
+                    for o in outs]
         if any(not isinstance(o, DTensor) for o in outs):
             raise ValueError(
                 "the region's output is a local shard (it ends between a column- and a row-parallel "
