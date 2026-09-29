@@ -54,6 +54,68 @@ Distinguish throughout:
 | **F34** | `fuse_collectives` shipped: bit-identical, 12-19% where comm matters, and it does *not* cost overlap | *corrects my own hypothesis* |
 | **F35** | `GPipe+fusion` ties with `1F1B`; fusion's home is single-stage TP, where `order` buys nothing | *answers F33* |
 | **F36** | Idle cards are not a quiet machine; `comm median/min` tells you how contaminated a window is | *makes F11 checkable* |
+| **F37** | a collective's issue point is an accident of topological level |  |
+| **F38** | `replicate` emits a gradient all-reduce for regions with no parameters |  |
+| **F39** | one temporal edge gives ZeRO-3 its prefetch budget |  |
+| **F40** | ring attention matches dense attention out of band, and the backward ring is constrained |  |
+| **F41** | `ring_exchange` is numerically correct inside Piper across optimizer steps, spliced and hoisted alike |  |
+| **F42** | `prefetch_distance` changed the dispatch order and not the peak memory |  |
+| **F43** | the peak is a host-ahead-of-GPU race over deferred frees |  |
+| **F44** | a bounded buffer pool is the runtime half of the budget |  |
+| **F45** | the per-collective skew tax is a property of global synchronization, not of NCCL — and a ring confines it to one hop until the message outgrows the… |  |
+| **F46** | P1 falsified — a ring needs no issue budget, because its own data dependency is one |  |
+| **F47** | replicated on different hardware, the race-free arms reproduce exactly and the racing arms do not — so without the pool, ZeRO-3's peak memory is a … |  |
+| **F48** | with the ranks synchronized, collective cost *is* affine in bytes (421 GB/s, residual <= 11 us) |  |
+| **F49** | the additive law, proved without reference to the injected value |  |
+| **F50** | the runtime's share of a Piper iteration is a ~8 ms constant, so the GPU does 12% of the work at the sizes these experiments use and 84% at 68x the… |  |
+| **F51** | run on two machines, every structural claim reproduces and every constant lands where its mechanism says it should |  |
+| **F52** | the per-iteration constant is not Ray and not the scheduling loop — it is the segmented execution path, which costs 4.6x the host launch time of th… |  |
+| **F53** | the 4.6x host-side tax decomposed — segmentation 1.3-1.7x, FX interpretation another 1.2-1.6x, and about 1.8x that is Piper's own per-node machinery |  |
+| **F54** | F53's decomposition retracted — Piper runs codegen'd GraphModules, not an Interpreter, and with the variants interleaved only the segmentation term… |  |
+| **F55** | the executor's wrapper is thin |  |
+| **F56** | the update node is not the optimizer — it is a full `torch.cuda.synchronize()` that absorbs the whole iteration's cross-rank wait, and it forbids o… |  |
+| **F57** | `backward` costs 79 us per call plus 21 us per op, which predicts the node times from the op counts — so there is no separate Piper tax inside the … |  |
+| **F58** | forwarded boundary outputs no longer get a shadow leaf — correct, verified six ways, and with no measurable benefit |  |
+| **F59** | an iteration is 38% host dispatch, 44% blocked in the device sync, 10% idle waiting for the driver — so neither the sync nor Ray is the single bind… |  |
+| **F60** | the host-side wait at the end of a step becomes a knob, `narrow` becomes the default, and `defer` is 1.25–1.38x |  |
+| **F61** | the sync-mode win shrinks with scale, not grows — the 2.83x was a clock that stopped before the GPU did |  |
+| **F62** | the canonical machine's CUDA runtime failed, and idle utilization was the wrong signal for it |  |
+| **F63** | on a quiet machine the `order` claim does not reproduce, and its sign reverses |  |
+| **F64** | the selection prototype ranks correctly once it carries the terms this project measured | *retracted by F67* |
+| **F65** | a placement lattice with device permutation and device group predicts all 66 communication nodes in four lowerings |  |
+| **F66** | two independent branches lower as a chain |  |
+| **F67** | F64 retracted — the selection prototype was checked against F16, which F17 had already withdrawn |  |
+| **F68** | DTensor placements derive exactly the boundary collectives that shard_tensor inserts, and all of ZeRO-3's except the backward regathers, which are … |  |
+| **F69** | shard_tensor can take parameter placements and derive its collectives |  |
+| **F70** | CP's ring payload is derived instead of named |  |
+| **F71** | consumer routing unchains independent branches end to end |  |
+| **F72** | routing on a real multimodal model |  |
+| **F73** | TP inside a branch needs routing |  |
+| **F74** | routing's gain over threading is a pipeline-depth saving, 1 + (T/V)/m |  |
+| **F75** | consumer routing composes with every boundary collective |  |
+| **F76** | CP and EP inside a branch lower correctly under routing |  |
+| **F77** | a real vision-language model in Piper: SmolVLM-256M on COCO captions |  |
+| **F78** | a four-line pipeline model predicts every measured CLIP step to ±1% |  |
+| **F79** | the two modalities want different microbatch sizes (predicted 1.30x over the best single m) |  |
+| **F80** | regions on one device group can share a parameter |  |
+| **F81** | two ranks could match their point-to-point transfers crosswise and silently swap same-shaped tensors | *B200 model limit: a hot card, F94/F95* |
+| **F82** | named mesh axes (design step 1) |  |
+| **F83** | a parameter read on several pipeline ranks (design step A4) |  |
+| **F84** | heterogeneous parallelism for SmolVLM | *3.56× corrected to 2.95× by F94* |
+| **F85** | one `layout` directive derives every boundary collective from placements (design step 2) |  |
+| **F86** | CP lowers to one all-gather as well as a ring (design step 3) | *timings re-measured on healthy cards, F96* |
+| **F87** | Megatron TP on every layer of the real SmolVLM |  |
+| **F88** | 200 fine-tuning steps of SmolVLM | *TP spread: GPU 1 heat, F94* |
+| **F89** | `lifetime: refetch` makes the CP ring hold 1/n of K/V (design step 4) | *"no DTensor counterpart" for lifetime corrected by F91* |
+| **F90** | under DTensor, Megatron's g comes from an operator rule |  |
+| **F91** | DTensor's public APIs, measured one by one |  |
+| **F92** | for the same sequence-split attention, DTensor lands in three different plans (one of them DeepSpeed-Ulysses), and which one it picks depends on ho… |  |
+| **F93** | one GPU does not reproduce itself, and that sets the bar for every placement |  |
+| **F94** | physical GPU 1 on the B200 host throttles for heat |  |
+| **F95** | with a clean profile, the pipeline model picks SmolVLM's placement correctly and prices unseen placements within 1.6% (design step 5) |  |
+| **F96** | Ulysses (head-parallel CP) in Piper is EP's all-to-all plus a layout |  |
+| **F97** | SmolVLM2-2.2B on DocVQA and ChartQA |  |
+| **F98** | the best placement moves with the model and with the data |  |
 
 ---
 
