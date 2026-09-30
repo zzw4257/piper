@@ -217,7 +217,15 @@ class RuntimeState:
     def stream_id(self, node_or_stream: Any) -> str:
         if isinstance(node_or_stream, str):
             return node_or_stream
-        return str(getattr(node_or_stream, "stream", "default_stream"))
+        sid = str(getattr(node_or_stream, "stream", "default_stream"))
+        # A receive runs on a CUDA stream of its own; the DAG and its order are unchanged.
+        # dist.send makes its stream wait until the peer has received. With the receive queued
+        # behind it on one stream, two ranks that send to each other at once (1F1B's steady
+        # state: an activation forward, a gradient back) wait on each other forever, once the
+        # message is too large for NCCL to buffer (log F103).
+        if getattr(node_or_stream, "node_kind", None) == "RECV_COMM":
+            return sid + "_recv"
+        return sid
 
     def initialize_streams_for_training_dag(self, training_dag: Any) -> None:
         stream_ids = {

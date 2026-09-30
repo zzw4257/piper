@@ -1,0 +1,163 @@
+[
+ {
+  "op": "route",
+  "mode": "consumers"
+ },
+ {
+  "op": "place",
+  "filter": {
+   "PP": 0
+  },
+  "devices": [
+   0
+  ]
+ },
+ {
+  "op": "place",
+  "filter": {
+   "PP": 1
+  },
+  "devices": [
+   0
+  ]
+ },
+ {
+  "op": "place",
+  "filter": {
+   "PP": 2
+  },
+  "devices": [
+   1
+  ]
+ },
+ {
+  "op": "split",
+  "filter": {},
+  "dim_name": "MB",
+  "num_microbatches": 3
+ },
+ {
+  "op": "order",
+  "filters": [
+   [
+    {
+     "PP": 0,
+     "MB": 0,
+     "PASS": "F"
+    },
+    {
+     "PP": 1,
+     "MB": 0,
+     "PASS": "F"
+    }
+   ],
+   [
+    {
+     "PP": 0,
+     "MB": 1,
+     "PASS": "F"
+    },
+    {
+     "PP": 1,
+     "MB": 1,
+     "PASS": "F"
+    }
+   ],
+   [
+    {
+     "PP": 1,
+     "MB": 0,
+     "PASS": "B"
+    },
+    {
+     "PP": 0,
+     "MB": 0,
+     "PASS": "B"
+    }
+   ],
+   [
+    {
+     "PP": 0,
+     "MB": 2,
+     "PASS": "F"
+    },
+    {
+     "PP": 1,
+     "MB": 2,
+     "PASS": "F"
+    }
+   ],
+   [
+    {
+     "PP": 1,
+     "MB": 1,
+     "PASS": "B"
+    },
+    {
+     "PP": 0,
+     "MB": 1,
+     "PASS": "B"
+    }
+   ],
+   [
+    {
+     "PP": 1,
+     "MB": 2,
+     "PASS": "B"
+    },
+    {
+     "PP": 0,
+     "MB": 2,
+     "PASS": "B"
+    }
+   ]
+  ]
+ },
+ {
+  "op": "order",
+  "filters": [
+   [
+    {
+     "PP": 2,
+     "MB": 0,
+     "PASS": "F"
+    }
+   ],
+   [
+    {
+     "PP": 2,
+     "MB": 0,
+     "PASS": "B"
+    }
+   ],
+   [
+    {
+     "PP": 2,
+     "MB": 1,
+     "PASS": "F"
+    }
+   ],
+   [
+    {
+     "PP": 2,
+     "MB": 1,
+     "PASS": "B"
+    }
+   ],
+   [
+    {
+     "PP": 2,
+     "MB": 2,
+     "PASS": "F"
+    }
+   ],
+   [
+    {
+     "PP": 2,
+     "MB": 2,
+     "PASS": "B"
+    }
+   ]
+  ]
+ }
+]

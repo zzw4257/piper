@@ -120,6 +120,7 @@ Distinguish throughout:
 | **F100** | a `layout` that declares no split lowered with no collective; now refused |  |
 | **F101** | against plain PyTorch and DTensor: same speed, and two memory leaks found and fixed | *memory figures before F101 include one extra copy of each actor's weights* |
 | **F102** | freeing TP outputs nothing saved brings Piper's TP memory to within 1.3 GB of DTensor (opt-in) |  |
+| **F103** | against torch.distributed.pipelining, Piper's pipeline is 1% faster; its 1F1B could hang forever on large activations, fixed |  |
 
 ---
 
@@ -5352,3 +5353,46 @@ Hence the higher-order-op guard and the opt-in.
 - the consumer's input gradient is captured by an identity autograd node rather than read from a leaf's `.grad`.
 
 Then the tensor dies exactly when eager's would, whoever holds it. That changes how every backward arm finds its gradients. Argued, not built.
+
+## 2026-09-29 — F103: against torch.distributed.pipelining, Piper's two-GPU pipeline is 0.7–1% faster at the same memory; getting there found that Piper's 1F1B could hang forever, now fixed
+
+**Tested.**
+- Split: SmolVLM2 on two healthy B200s, the vision tower (with connector and text embedding) on one, the decoder on the other.
+- `experiments/pipelining_vlm2.py` makes the same split with `PipelineStage` and `ScheduleGPipe` / `Schedule1F1B`.
+  - Piper's first stage ends before the image scatter, so it sends the image features and the text embedding (71 MB).
+  - torch's sends the merged hidden state (37 MB).
+- Piper's `split` repeats the batch (F74), so torch runs `m` copies of it: the same work.
+- Schedules: `vlm2_vd_mb{3,6}_{gpipe,1f1b}.json`, orders as `build_1f1b_schedule` writes them.
+
+| batch, m | schedule | eager, 1 GPU | torch pipelining | Piper |
+|---|---|---|---|---|
+| 3, 3 | GPipe | 8977 ms | out of memory on the vision GPU | out of memory on the vision GPU |
+| 3, 3 | 1F1B | 8977 ms | 6627 ms, 143.4 / 52.2 GB | 6568 ms, 143.2 / 50.5 GB |
+| 3, 6 | 1F1B | 17945 ms | 13060 ms, 143.7 / 55.0 GB | 12923 ms, 143.2 / 50.5 GB |
+| 1, 3 | GPipe | 3196 ms | 2542 ms, 74.0 / 43.1 GB | pending (GPUs busy) |
+| 1, 3 | 1F1B | 3196 ms | 2310 ms, 53.3 / 34.5 GB | pending (GPUs busy) |
+| 1, 6 | GPipe | 6381 ms | 4748 ms, 141.3 / 66.4 GB | 4733 ms, 140.8 / 65.1 GB |
+| 1, 6 | 1F1B | 6381 ms | 4517 ms, 53.4 / 35.4 GB | 4484 ms, 53.1 / 33.9 GB |
+
+- Every loss equals eager's to six digits, as long as torch runs with `scale_grads=False`. Its default divides the gradients by `m`; Adam absorbs that except through eps, which left the losses 5e-5 off.
+- Two GPUs give 1.39–1.42× over one. The vision stage is the bottleneck and carries the memory.
+
+**Unexpected.**
+1. **Piper's 1F1B hung forever.** Both ranks sat in NCCL `SEND` until the 600 s watchdog fired.
+   - Steady-state 1F1B: stage 0 sends mb1's activations while stage 1 sends mb0's gradients back, and only then does each receive.
+   - Piper queued receives on the sends' stream (`pp_stream`), and `dist.send` makes its stream wait until the peer has received.
+2. **When the crossing hangs** (`experiments/p2p_crossing.py`, two ranks send to each other, then receive):
+   - with the receive on the send's stream, one tensor per direction always completes (64 KiB to 64 MiB), and so does 2 × 16 MiB; 2 × 64 MiB hangs;
+   - with the receive on its own stream, every case completes.
+
+   That is why no earlier 1F1B hung: F26's TP MLP moved 64 KB, and F98's decoder pair moved one 24 MB tensor each way. Here each direction moves two tensors of about 35 MB.
+3. **The first fix broke something else.** Giving `RECV_COMM` its own stream in the DAG made receives anchor to their consumers by stream. F81's alignment orders a last-chunk-first backward the other way, and ordering found a cycle (`test_p2p_order`).
+
+**Changed.**
+- `src/runtime.py`: `stream_id` puts a `RECV_COMM` node on `<stream>_recv`. The DAG, the per-stream order and the host dispatch order are unchanged; only the receive's CUDA stream differs. Consumers already wait on the receive's event.
+- `test/test_recv_stream.py`.
+- `experiments/pipelining_vlm2.py` and `experiments/p2p_crossing.py`.
+- `job.sh` refuses tags longer than 18 characters: a 24-character tag overran Ray's 107-byte socket path.
+- Suite 143 passed.
+
+**Open question.** Should Piper batch each transfer's sends and receives (`batch_isend_irecv`), as torch pipelining does? That would also remove the per-tensor host round trips; separate streams only remove the hang.
