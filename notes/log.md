@@ -5367,14 +5367,15 @@ Then the tensor dies exactly when eager's would, whoever holds it. That changes 
 | batch, m | schedule | eager, 1 GPU | torch pipelining | Piper |
 |---|---|---|---|---|
 | 3, 3 | GPipe | 8977 ms | out of memory on the vision GPU | out of memory on the vision GPU |
-| 3, 3 | 1F1B | 8977 ms | 6627 ms, 143.4 / 52.2 GB | 6568 ms, 143.2 / 50.5 GB |
+| 3, 3 | 1F1B | 8977 ms | 6627 ms, 143.4 / 52.2 GB | 6568 ms (second round 6570), 143.2 / 50.5 GB |
 | 3, 6 | 1F1B | 17945 ms | 13060 ms, 143.7 / 55.0 GB | 12923 ms, 143.2 / 50.5 GB |
-| 1, 3 | GPipe | 3196 ms | 2542 ms, 74.0 / 43.1 GB | pending (GPUs busy) |
-| 1, 3 | 1F1B | 3196 ms | 2310 ms, 53.3 / 34.5 GB | pending (GPUs busy) |
+| 1, 3 | GPipe | 3196 ms | 2542 ms, 74.0 / 43.1 GB | not run: no free GPUs overnight |
+| 1, 3 | 1F1B | 3196 ms | 2310 ms, 53.3 / 34.5 GB | not run: no free GPUs overnight |
 | 1, 6 | GPipe | 6381 ms | 4748 ms, 141.3 / 66.4 GB | 4733 ms, 140.8 / 65.1 GB |
 | 1, 6 | 1F1B | 6381 ms | 4517 ms, 53.4 / 35.4 GB | 4484 ms, 53.1 / 33.9 GB |
 
 - Every loss equals eager's to six digits, as long as torch runs with `scale_grads=False`. Its default divides the gradients by `m`; Adam absorbs that except through eps, which left the losses 5e-5 off.
+- Not run, for lack of free GPUs through the night (each job retried for 3 h): Piper at batch 1, m=3; PP2×TP2 on four GPUs against the old runtime; TP=4 for DTensor and Piper.
 - Two GPUs give 1.39–1.42× over one. The vision stage is the bottleneck and carries the memory.
 
 **Unexpected.**
