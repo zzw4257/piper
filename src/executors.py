@@ -119,13 +119,16 @@ class CommunicationExecutor:
         input_tensor: torch.Tensor,
         stream: torch.cuda.Stream,
         axis: str | None = "tp",
+        in_place: bool = False,
     ) -> torch.Tensor:
         """Sum a boundary activation (or its gradient) across the TP group.
 
-        Returns a fresh contiguous leaf rather than reducing in place: the input is
-        an entry of the producer's ``detached_outs``/``inp_grads``, which the
-        producer's own backward still reads, and an in-place op on a leaf that
-        requires grad is an autograd error.
+        Returns a fresh contiguous leaf, unless ``in_place``: then the producer's own
+        output buffer is reduced and returned. The producer keeps that buffer until its
+        backward either way, so the fresh copy was a second one of every TP output, held
+        for the whole forward (log F101). The backward reads the buffer's values only if
+        the producer saved its output (a region ending in tanh, say); the version bump
+        makes autograd refuse that case rather than use the sum as if it were the partial.
 
         # ponytail: rides on ep_group, which is idle whenever a region is TP-sharded
         # rather than EP-sharded, and is already a separate communicator from
@@ -134,6 +137,11 @@ class CommunicationExecutor:
         # TP with DP.
         """
         with torch.cuda.stream(stream):
+            if in_place and input_tensor.is_contiguous():
+                out = input_tensor.detach()
+                dist.all_reduce(out, group=self.runtime.group_for(axis, self.runtime.ep_group))
+                torch.autograd.graph.increment_version(out)
+                return input_tensor
             out = input_tensor.detach().clone(memory_format=torch.contiguous_format)
             dist.all_reduce(out, group=self.runtime.group_for(axis, self.runtime.ep_group))
         return out
@@ -957,7 +965,9 @@ class DagExecutor:
                         fusion_results[gid][meta["fusion_index"]]
                         if gid is not None
                         else self.communication.all_reduce_activation(
-                            detached_outs[tensor_idx], node_stream, axis=meta.get("axis", "tp"))
+                            detached_outs[tensor_idx], node_stream, axis=meta.get("axis", "tp"),
+                            # not a forwarded input: that buffer belongs to an upstream region
+                            in_place=fwd_buf["pre_detach_outs"][tensor_idx] is not detached_outs[tensor_idx])
                     )
                     detached_outs[tensor_idx] = reduced.requires_grad_(True)
                     fwd_buf["detached_outs"] = detached_outs

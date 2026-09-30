@@ -262,15 +262,13 @@ class PiperActor:
     def load_param_overrides(self, overrides: dict) -> None:
         """Store parameter values to use instead of random initialization.
 
-        *overrides* maps FX placeholder name -> CPU tensor. Values are moved to
-        this actor's device so ``_load_stage`` can copy them directly, mirroring
-        ``load_const_attrs``. Each rank is sent its own tensors, so a sharded
-        parameter is sliced by the caller, which is the only place that knows how
-        it is partitioned.
+        *overrides* maps FX placeholder name -> CPU tensor. They stay on the host:
+        ``_load_stage`` copies each into its parameter. Moved to the device, they were
+        a second copy of every weight, held for the whole run (log F101). Each rank is
+        sent its own tensors, so a sharded parameter is sliced by the caller, which is
+        the only place that knows how it is partitioned.
         """
-        self.model_param_overrides = {
-            k: v.to(self.runtime.device) for k, v in overrides.items()
-        }
+        self.model_param_overrides = dict(overrides)
         self.matched_param_overrides = set()
 
     def unmatched_param_overrides(self) -> list:

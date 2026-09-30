@@ -116,6 +116,9 @@ Distinguish throughout:
 | **F96** | Ulysses (head-parallel CP) in Piper is EP's all-to-all plus a layout |  |
 | **F97** | SmolVLM2-2.2B on DocVQA and ChartQA |  |
 | **F98** | the best placement moves with the model and with the data |  |
+| **F99** | derived placements catch five TP region mistakes that the hand-written rule trains through |  |
+| **F100** | a `layout` that declares no split lowered with no collective; now refused |  |
+| **F101** | against plain PyTorch and DTensor: same speed, and two memory leaks found and fixed | *memory figures before F101 include one extra copy of each actor's weights* |
 
 ---
 
@@ -5264,3 +5267,49 @@ DTensor's own TP recipe never propagates through attention either. torchtitan us
 **IR/runtime assumption discovered.** A declared placement is a contract nobody checks at run time. DTensor checks a Replicate claim with `from_local(run_check=True)`, which broadcasts rank 0's tensor and compares. Piper could do the same once on step 1, on inputs declared replicated across a group larger than one. Not built, because it needs GPUs.
 
 **Open question.** Should `shard_tensor` with all-replicate `params` be refused too? It derives no collective, as the existing test asserts. It is left alone, because there the user asked for TP and got none: a visible no-op, not a silent divergence.
+
+## 2026-09-29 — F101: against plain PyTorch and PyTorch's own TP, Piper matches or beats the speed; the memory gap was two copies Piper did not need, now removed
+
+**Tested.**
+- Setup: synthetic SmolVLM2-2.2B at DocVQA shapes (17 tiles, 1488 tokens), batch 3, two microbatches of the same batch, fp32, fused Adam on every side. Timed on healthy B200s (GPU 1 excluded), with no other process on the cards (`.gpuapps`), two rounds each.
+- Baselines:
+  - `experiments/eager_vlm2.py`: the same step in plain PyTorch.
+  - `experiments/dtensor_tp_vlm2.py`: `parallelize_module` with torchtitan's plan and no sequence parallel, launched by torchrun.
+
+| | step | peak per GPU | losses |
+|---|---|---|---|
+| eager, 1 GPU | 5987 ms | 124.7 GB | reference |
+| Piper, 1 GPU, before | 5988 ms | 134.0 GB | equal to 6 digits |
+| Piper, 1 GPU, after | 5988 ms | 125.6 GB | equal |
+| DTensor TP=2 | 3415–3420 ms | 76.7 GB | equal |
+| Piper TP=2, before | 3349–3353 ms | 98.7 GB | equal |
+| Piper TP=2, after | 3344–3345 ms | 88.4 GB | equal |
+
+Losses match to six digits. The only differences are 1e-6 in the last digit, from SDPA's nondeterministic backward (F93).
+
+**Unexpected.**
+1. **Piper held a second copy of every weight.** `load_param_overrides` moved the pushed weights to the GPU and kept them for the whole run, while `_load_stage` copied them into the real parameters. Per-phase memory showed it: Piper sat exactly 8.4 GB above eager at every phase (25.2→33.6 at step start, 123.0→131.5 after the second forward). That is one fp32 copy of 2.2B parameters. I wrote this code for Stage D2.
+2. **The forward TP all-reduce kept two copies of every TP region output.** `all_reduce_activation` cloned the partial sum before reducing it. The producer keeps its own output buffer until its backward anyway, so every TP boundary held both the partial sum and the sum.
+   - `PIPER_MEM_TRACE`: the 102 forward all-reduce nodes added 10.3 GB during the first microbatch's forward. That is exactly 27 vision layers × 2 × 171 MB plus 24 text layers × 2 × 37 MB.
+3. On speed, Piper's TP is 2% faster than DTensor's. Where that 2% comes from is not measured.
+
+**Changed.**
+- `src/actor.py`: overrides stay on the host. `_load_stage` copies each into its parameter.
+- `src/executors.py`: the forward TP all-reduce sums in place into the producer's buffer, unless that buffer is a forwarded input.
+  - The producer's backward reads the buffer only if it saved its own output (a region ending in tanh, say).
+  - A version bump makes autograd refuse that case, so it cannot silently back-propagate through the sum as if it were the partial.
+  - The backward all-reduce still copies, since the copy there is short-lived.
+- `test/test_tp_inplace_all_reduce.py` (CPU, gloo world of 1):
+  - the buffer is reduced in place;
+  - a producer that saved its output is refused;
+  - the default still copies.
+- Checks:
+  - TP MLP at TP=2 and with two stages: losses and parameter checksums are bit-identical to the old executor.
+  - SmolVLM2 TP=2: losses unchanged.
+  - Suite 138 passed.
+
+**IR/runtime assumption discovered.** Cutting autograd at every region keeps each region's output alive until that region's backward. Eager frees a tensor once nothing saved it. Piper's TP=2 is still 11.7 GB above DTensor's for this reason. The retained tensors are the TP outputs, which feed only the residual add, and the add saves nothing. Megatron meets the same thing in its pipeline schedule (`deallocate_output_tensor`).
+
+**Open question.** Could Piper free the storage of a boundary tensor that neither its producer nor its consumer saved? `saved_tensors_hooks` can tell during each forward which tensors were saved. `resize_(0)` frees the storage and keeps the shape that autograd checks. That would close most of the remaining 11.7 GB.
+
+**Correction.** Every peak-memory figure logged before this entry includes one extra copy of each actor's weights (F84, F87, F88, F89, F96, F98). Comparisons between Piper plans are unaffected, since every plan carried the copy.
