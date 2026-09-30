@@ -622,6 +622,8 @@ class PiperActor:
                 return out
 
             bucket.forward_fn = _bucket_forward_runner
+            bucket.opaque_saves = use_activation_checkpointing or any(
+                isinstance(n.target, torch._ops.HigherOrderOperator) for gm in gms for n in gm.graph.nodes)
             bucket.forward_args = realized
             bucket.param_idxs = b_param_idxs
             bucket.activation_checkpoint_subgraph_count = ac_num_subgraphs

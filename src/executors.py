@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import contextlib
 import os
 import time
 import torch
@@ -20,6 +21,59 @@ from .tasks import TaskType
 # passes the rest through. Consumer arms therefore have to treat them alike, or a
 # compute node silently falls through to the wrong inputs.
 _FWD_BOUNDARY_COMM_TASKS = (TaskType.FWD_A2A, TaskType.FWD_TP_ALL_REDUCE, TaskType.FWD_RING_EXCHANGE)
+
+# Free a TP output nothing saved once its one consumer has read it (log F102).
+_FREE_UNSAVED = os.environ.get("PIPER_FREE_UNSAVED") == "1"
+
+
+def _saved_hooks(saved: set):
+    """Record the storage of every tensor a region's autograd saves for its backward."""
+    if not _FREE_UNSAVED:
+        return contextlib.nullcontext()
+
+    def pack(t):
+        saved.add(t.untyped_storage().data_ptr())
+        return t
+
+    return torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t)
+
+
+def _free_unsaved(candidates: list, fwd_out: dict, stream) -> None:
+    """Free the storage of TP outputs that neither their producer nor their one consumer saved.
+
+    Cutting autograd at every region keeps each output until its producer's backward, which
+    needs only its shape; eager frees such a tensor as soon as it is read (a TP output feeding
+    the residual add, which saves nothing). ``resize_(0)`` frees the memory and keeps the shape
+    that autograd checks. Kept: anything saved (seen by ``_saved_hooks``), the consumer's own
+    outputs, and a storage the producer returns twice. A tensor stashed on a custom Function's
+    ctx without ``save_for_backward`` is invisible to the hooks, even after Dynamo traces it
+    (measured), so neither side may contain a higher-order op. Reading a freed storage is a
+    segfault, not an error; hence also the opt-in.
+    """
+    if fwd_out.get("opaque_saves", True):
+        return
+    keep = set(fwd_out.get("saved_storages", ()))
+    keep |= {o.untyped_storage().data_ptr() for o in fwd_out["pre_detach_outs"] if isinstance(o, torch.Tensor)}
+    for t, producer_saved, producer_outs in candidates:
+        st = t.untyped_storage()
+        ptr = st.data_ptr()
+        if ptr in keep or ptr in producer_saved:
+            continue
+        if sum(isinstance(o, torch.Tensor) and o.untyped_storage().data_ptr() == ptr for o in producer_outs) > 1:
+            continue
+        if t.is_cuda:
+            t.record_stream(stream)
+        st.resize_(0)
+
+
+def _free_candidate(p, buf: dict, meta: dict):
+    """The TP output a forward all-reduce node carries, if it may be freed after its consumer."""
+    if (not _FREE_UNSAVED or p.task_type != TaskType.FWD_TP_ALL_REDUCE
+            or meta.get("fusion_group") is not None or len(getattr(p, "data_succs", ())) != 1):
+        return None
+    if buf.get("opaque_saves", True):
+        return None
+    return (buf["detached_outs"][meta["tp_tensor_idx"]], buf.get("saved_storages", ()), buf["pre_detach_outs"])
 _BWD_BOUNDARY_COMM_TASKS = (TaskType.BWD_A2A, TaskType.BWD_TP_ALL_REDUCE, TaskType.BWD_RING_EXCHANGE)
 
 
@@ -390,7 +444,8 @@ class ComputeExecutor:
         fwd_inputs = [fwd_args[i] for i in input_idxs]
         inp_with_grad = [t for t in fwd_inputs if t is not None and t.requires_grad]
 
-        with torch.cuda.stream(compute_stream):
+        saved: set = set()
+        with torch.cuda.stream(compute_stream), _saved_hooks(saved):
             output = fwd_fn(fwd_args)
 
         for i in input_idxs:
@@ -409,6 +464,8 @@ class ComputeExecutor:
             "send_output": output,
             "inp_with_grad": inp_with_grad,
             "fwd_inputs": fwd_inputs,
+            "saved_storages": saved,
+            "opaque_saves": bucket.opaque_saves,
         }
 
     def backward(
@@ -1213,6 +1270,7 @@ class DagExecutor:
                     srcs = self._node_meta(node)["input_sources"]
                     vals: list = [None] * len(srcs)
                     ring_slots: list = []
+                    free_cands: list = []
                     for p in node.data_preds:
                         pm = self._node_meta(p)
                         if p.task_type == TaskType.RECV:
@@ -1244,6 +1302,9 @@ class DagExecutor:
                                 for j, (kind, s_, k) in enumerate(srcs):
                                     if kind == "seg" and s_ == seg:
                                         vals[j] = outs[k]
+                            cand = _free_candidate(p, self.buffers.task[p.uid], pm)
+                            if cand is not None:
+                                free_cands.append(cand)
                             self.buffers.release(p.uid)
                         else:
                             raise NotImplementedError(
@@ -1262,6 +1323,8 @@ class DagExecutor:
                     self._wait_for_all_gather(node)
                     _t0 = time.perf_counter()
                     fwd_out = self.compute.forward(ubid, vals, node_stream)
+                    if free_cands:
+                        _free_unsaved(free_cands, fwd_out, node_stream)
                     _inner(node.uid, _t0)
                     fwd_out["routed"] = True
                     self.buffers.task[node.uid] = fwd_out
@@ -1314,8 +1377,13 @@ class DagExecutor:
                              if p.task_type == TaskType.FWD
                              or p.task_type in _FWD_BOUNDARY_COMM_TASKS), None
                         )
+                    free_cands = []
                     if fwd_data_pred is not None:
                         input_tensors = list(self.buffers.task[fwd_data_pred.uid]["detached_outs"])
+                        cand = _free_candidate(fwd_data_pred, self.buffers.task[fwd_data_pred.uid],
+                                               self._node_meta(fwd_data_pred))
+                        if cand is not None:
+                            free_cands.append(cand)
                         self.buffers.release(fwd_data_pred.uid)
                         for p in hoisted_preds:
                             pm = self._node_meta(p)
@@ -1342,6 +1410,8 @@ class DagExecutor:
 
                     _t0 = time.perf_counter()
                     fwd_out = self.compute.forward(ubid, input_tensors, node_stream)
+                    if free_cands:
+                        _free_unsaved(free_cands, fwd_out, node_stream)
                     _inner(node.uid, _t0)
                     self.buffers.task[node.uid] = fwd_out
                     fwd_key = (node.node_meta.get("bucket_key"), node.uid)

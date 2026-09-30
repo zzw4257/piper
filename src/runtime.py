@@ -105,6 +105,9 @@ class BucketState:
     """Loaded runtime state for one globally unique compute bucket."""
 
     forward_fn: Any = None
+    # a higher-order op (a custom autograd.Function, checkpointing) may keep a tensor
+    # that saved-tensor hooks never see; such a region's boundaries are never freed (log F102)
+    opaque_saves: bool = True
     forward_args: list[Any] = field(default_factory=list)
     forward_input_meta: list[Any] = field(default_factory=list)
     input_idxs: list[int] = field(default_factory=list)

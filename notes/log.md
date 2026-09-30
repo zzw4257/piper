@@ -119,6 +119,7 @@ Distinguish throughout:
 | **F99** | derived placements catch five TP region mistakes that the hand-written rule trains through |  |
 | **F100** | a `layout` that declares no split lowered with no collective; now refused |  |
 | **F101** | against plain PyTorch and DTensor: same speed, and two memory leaks found and fixed | *memory figures before F101 include one extra copy of each actor's weights* |
+| **F102** | freeing TP outputs nothing saved brings Piper's TP memory to within 1.3 GB of DTensor (opt-in) |  |
 
 ---
 
@@ -5313,3 +5314,41 @@ Losses match to six digits. The only differences are 1e-6 in the last digit, fro
 **Open question.** Could Piper free the storage of a boundary tensor that neither its producer nor its consumer saved? `saved_tensors_hooks` can tell during each forward which tensors were saved. `resize_(0)` frees the storage and keeps the shape that autograd checks. That would close most of the remaining 11.7 GB.
 
 **Correction.** Every peak-memory figure logged before this entry includes one extra copy of each actor's weights (F84, F87, F88, F89, F96, F98). Comparisons between Piper plans are unaffected, since every plan carried the copy.
+
+## 2026-09-29 — F102: freeing boundary tensors nothing saved brings Piper's TP=2 to 78.0 GB against DTensor's 76.7, at the same speed; opt-in, because what the hooks cannot see would crash
+
+**Tested.** F101's open question: SmolVLM2 TP=2, same setup, with `PIPER_FREE_UNSAVED=1`.
+
+| Piper TP=2 | step | peak per GPU |
+|---|---|---|
+| after F101 | 3342–3345 ms | 88.4 GB |
+| freeing unsaved TP outputs | 3341–3343 ms | 78.0 GB |
+| DTensor TP=2 (F101) | 3415–3420 ms | 76.7 GB |
+
+- Losses are unchanged, again apart from last-digit SDPA noise.
+- TP MLP at TP=2 and with two stages: bit-identical with the flag on.
+- The in-place all-reduce from F101 is on by default, so it was checked bitwise against the old executor on four cards too: PP2×TP2 and TP2×DP2 give identical losses and parameter checksums on every rank.
+
+**Changed.** `src/executors.py`, all behind the flag:
+- Each region's forward runs under `saved_tensors_hooks`, which record the storage of every tensor autograd saves.
+- A forward TP all-reduce output with one consumer is freed with `resize_(0)` right after that consumer's forward, unless one of these holds:
+  - the consumer saved it;
+  - the producer saved it;
+  - the consumer returned it;
+  - the producer returned that storage twice.
+- The producer's backward needs only the output's shape, which `resize_(0)` keeps.
+
+Regions containing a higher-order op, or using activation checkpointing, are never freed (`BucketState.opaque_saves`, set at load). `test/test_tp_inplace_all_reduce.py` covers each keep rule and the backward still running. Suite 142 passed.
+
+**Unexpected.**
+- A custom `autograd.Function` that stashes a tensor on `ctx` without `save_for_backward` is invisible to the hooks. That stays true after Dynamo traces it into `autograd_function_apply` (measured).
+- Reading a freed storage is a segfault, not a Python error (measured on CPU).
+- Storage use counts do not help either: a `ctx` attribute holding the same tensor object does not raise them (measured).
+
+Hence the higher-order-op guard and the opt-in.
+
+**IR/runtime assumption discovered.** The remaining 11.7 GB of F101 was the region cut itself: each region output was kept for its producer's backward. The safe general form keeps neither the output nor the consumer's leaf:
+- the producer's backward is driven from a `GradientEdge`;
+- the consumer's input gradient is captured by an identity autograd node rather than read from a leaf's `.grad`.
+
+Then the tensor dies exactly when eager's would, whoever holds it. That changes how every backward arm finds its gradients. Argued, not built.
