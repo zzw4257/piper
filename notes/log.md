@@ -5394,5 +5394,6 @@ Then the tensor dies exactly when eager's would, whoever holds it. That changes 
 - `experiments/pipelining_vlm2.py` and `experiments/p2p_crossing.py`.
 - `job.sh` refuses tags longer than 18 characters: a 24-character tag overran Ray's 107-byte socket path.
 - Suite 143 passed.
+- Two-stage TP MLP on two GPUs, 1F1B, 4 microbatches, 8 MB per transfer, against the runtime before this change (`b2ec816`): all 12 losses and both ranks' fp64 parameter checksums bit-identical (`pp2new` / `pp2old`, 30 Sep 00:14).
 
 **Open question.** Should Piper batch each transfer's sends and receives (`batch_isend_irecv`), as torch pipelining does? That would also remove the per-tensor host round trips; separate streams only remove the hang.
